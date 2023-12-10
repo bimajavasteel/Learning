@@ -21,7 +21,7 @@ def get_face_enhancer() -> Any:
 
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
-            model_path = resolve_relative_path('../models/GFPGANv1.3.pth')
+            model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
             # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
             FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
     return FACE_ENHANCER
@@ -43,7 +43,7 @@ def clear_face_enhancer() -> None:
 
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth'])
+    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'])
     return True
 
 
@@ -60,8 +60,8 @@ def post_process() -> None:
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
-    padding_x = int((end_x - start_x) * 0.1)
-    padding_y = int((end_y - start_y) * 0.1)
+    padding_x = int((end_x - start_x) * 0.2)
+    padding_y = int((end_y - start_y) * 0.2)
     start_x = max(0, start_x - padding_x)
     start_y = max(0, start_y - padding_y)
     end_x = max(0, end_x + padding_x)
