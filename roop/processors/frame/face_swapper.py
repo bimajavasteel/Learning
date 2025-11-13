@@ -34,7 +34,7 @@ def clear_face_swapper() -> None:
 
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, ['https://huggingface.co/Patil/inswapper/blob/b42a98c26a499719a2ea9e29995162244c550d6f/blendswap_256.onnx'])
+    conditional_download(download_directory_path, ['https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx'])
     return True
 
 
