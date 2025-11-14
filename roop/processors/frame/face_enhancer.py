@@ -59,21 +59,41 @@ def post_process() -> None:
 
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
+    frame_height, frame_width = temp_frame.shape[:2]
     start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
-    padding_x = int((end_x - start_x) * 0.2)
-    padding_y = int((end_y - start_y) * 0.2)
+    
+    # Hitung ukuran wajah
+    face_w, face_h = end_x - start_x, end_y - start_y
+    if face_w <= 0 or face_h <= 0:
+        return temp_frame
+
+    # Padding adaptif (minimal 10%, maksimal 30% tergantung ukuran)
+    pad_ratio = max(0.1, min(0.3, 100 / max(face_w, face_h)))
+    padding_x = int(face_w * pad_ratio)
+    padding_y = int(face_h * pad_ratio)
+    
+    # Pastikan tidak melebihi batas frame
     start_x = max(0, start_x - padding_x)
     start_y = max(0, start_y - padding_y)
-    end_x = max(0, end_x + padding_x)
-    end_y = max(0, end_y + padding_y)
+    end_x = min(frame_width, end_x + padding_x)
+    end_y = min(frame_height, end_y + padding_y)
+    
     temp_face = temp_frame[start_y:end_y, start_x:end_x]
-    if temp_face.size:
-        with THREAD_SEMAPHORE:
-            _, _, temp_face = get_face_enhancer().enhance(
+    if temp_face.size == 0:
+        return temp_frame
+
+    with THREAD_SEMAPHORE:
+        try:
+            _, _, enhanced_face = get_face_enhancer().enhance(
                 temp_face,
                 paste_back=True
             )
-        temp_frame[start_y:end_y, start_x:end_x] = temp_face
+            # Pastikan ukuran cocok (karena kadang enhancer ubah resolusi)
+            if enhanced_face.shape == temp_face.shape:
+                temp_frame[start_y:end_y, start_x:end_x] = enhanced_face
+        except Exception as e:
+            print(f"[WARNING] Enhance face failed: {e}")
+    
     return temp_frame
 
 
