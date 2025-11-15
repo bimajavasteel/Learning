@@ -46,13 +46,13 @@ def get_face_enhancer() -> Any:
 
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
-            model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
+            model_path = 'gfpgan/weights/GFPGANv1.4.pth'  # ✅ Path baru
             bg_upsampler = set_realesrgan()
             FACE_ENHANCER = GFPGANer(
                 model_path=model_path,
                 upscale=1,
                 device=get_device(),
-                model_rootpath=resolve_relative_path('../models'),  # ✅ Fix issue #399
+                model_rootpath='gfpgan/weights',  # ✅ Sesuai issue #399
                 use_parse=True,  # ✅ Detail lebih natural
                 bg_upsampler=bg_upsampler  # ✅ Background tajam
             )
@@ -74,7 +74,7 @@ def clear_face_enhancer() -> None:
 
 
 def pre_check() -> bool:
-    download_directory_path = resolve_relative_path('../models')
+    download_directory_path = 'gfpgan/weights'  # ✅ Ubah ke folder baru
     conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth'])
     return True
 
