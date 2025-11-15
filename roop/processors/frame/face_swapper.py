@@ -64,22 +64,12 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
     if roop.globals.many_faces:
         many_faces = get_many_faces(temp_frame)
         if many_faces:
-            # Gunakan salinan untuk hindari overwrite berantai
-            result_frame = temp_frame.copy()
             for target_face in many_faces:
-                swapped = swap_face(source_face, target_face, temp_frame)
-                # Ambil hanya area wajah yang di-swap
-                bbox = target_face['bbox']
-                x1, y1, x2, y2 = map(int, bbox)
-                # Pastikan koordinat dalam batas frame
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(temp_frame.shape[1], x2), min(temp_frame.shape[0], y2)
-                result_frame[y1:y2, x1:x2] = swapped[y1:y2, x1:x2]
-            return result_frame
+                temp_frame = swap_face(source_face, target_face, temp_frame)
     else:
         target_face = find_similar_face(temp_frame, reference_face)
         if target_face:
-            return swap_face(source_face, target_face, temp_frame)
+            temp_frame = swap_face(source_face, target_face, temp_frame)
     return temp_frame
 
 
@@ -104,22 +94,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     if not roop.globals.many_faces and not get_face_reference():
-        # Cari frame dengan wajah terbesar & jelas di 30 frame pertama
-        best_frame_path = temp_frame_paths[0]
-        best_face_size = 0
-        search_limit = min(30, len(temp_frame_paths))
-
-        for i in range(search_limit):
-            test_frame = cv2.imread(temp_frame_paths[i])
-            face = get_one_face(test_frame)
-            if face is not None:
-                bbox = face['bbox']
-                face_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-                if face_area > best_face_size:
-                    best_face_size = face_area
-                    best_frame_path = temp_frame_paths[i]
-
-        reference_face = get_one_face(cv2.imread(best_frame_path), roop.globals.reference_face_position)
+        reference_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
+        reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
         set_face_reference(reference_face)
-    
     roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
