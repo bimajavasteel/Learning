@@ -2,6 +2,7 @@ from typing import Any, List, Callable
 import cv2
 import threading
 from gfpgan.utils import GFPGANer
+import torch  # Tambahkan ini untuk cek CUDA
 
 import roop.globals
 import roop.processors.frame.core
@@ -10,10 +11,34 @@ from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
+# --- Tambahkan ini untuk RealESRGAN ---
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from basicsr.utils.realesrgan_utils import RealESRGANer
+
 FACE_ENHANCER = None
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-ENHANCER'
+
+
+def set_realesrgan():
+    use_half = False
+    if torch.cuda.is_available():
+        no_half_gpu_list = ['1650', '1660']
+        if not any(gpu in torch.cuda.get_device_name(0) for gpu in no_half_gpu_list):
+            use_half = True
+
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+    upsampler = RealESRGANer(
+        scale=2,
+        model_path="https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/RealESRGAN_x2plus.pth",
+        model=model,
+        tile=400,
+        tile_pad=40,
+        pre_pad=0,
+        half=use_half
+    )
+    return upsampler
 
 
 def get_face_enhancer() -> Any:
@@ -22,8 +47,15 @@ def get_face_enhancer() -> Any:
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
             model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
-            # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
-            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
+            bg_upsampler = set_realesrgan()
+            FACE_ENHANCER = GFPGANer(
+                model_path=model_path,
+                upscale=1,
+                device=get_device(),
+                model_rootpath=resolve_relative_path('../models'),  # ✅ Fix issue #399
+                use_parse=True,  # ✅ Detail lebih natural
+                bg_upsampler=bg_upsampler  # ✅ Background tajam
+            )
     return FACE_ENHANCER
 
 
