@@ -1,43 +1,27 @@
 import threading
 import numpy
-import opennsfw2
 from PIL import Image
 from keras import Model
 
 from roop.typing import Frame
 
-PREDICTOR = None
-THREAD_LOCK = threading.Lock()
-MAX_PROBABILITY = 0.85
+# --- NSFW DETECTION DIBUANG ---
+# Semua fungsi dan variabel NSFW dihapus
+# Tidak ada lagi ketergantungan pada opennsfw2
 
-
-def get_predictor() -> Model:
-    global PREDICTOR
-
-    with THREAD_LOCK:
-        if PREDICTOR is None:
-            PREDICTOR = opennsfw2.make_open_nsfw_model()
-    return PREDICTOR
-
-
-def clear_predictor() -> None:
-    global PREDICTOR
-
-    PREDICTOR = None
-
-
+# Fungsi placeholder: selalu return False (tidak pernah blokir frame)
 def predict_frame(target_frame: Frame) -> bool:
-    image = Image.fromarray(target_frame)
-    image = opennsfw2.preprocess_image(image, opennsfw2.Preprocessing.YAHOO)
-    views = numpy.expand_dims(image, axis=0)
-    _, probability = get_predictor().predict(views)[0]
-    return probability > MAX_PROBABILITY
-
+    return False  # Selalu aman, tidak ada filter NSFW
 
 def predict_image(target_path: str) -> bool:
-    return opennsfw2.predict_image(target_path) > MAX_PROBABILITY
-
+    return False  # Selalu aman
 
 def predict_video(target_path: str) -> bool:
-    _, probabilities = opennsfw2.predict_video_frames(video_path=target_path, frame_interval=100)
-    return any(probability > MAX_PROBABILITY for probability in probabilities)
+    return False  # Selalu aman
+
+# Jika ada fungsi lain yang butuh predictor, kita buang saja
+def get_predictor():
+    raise NotImplementedError("NSFW detection has been removed.")
+
+def clear_predictor():
+    pass  # Tidak perlu clear apa-apa
