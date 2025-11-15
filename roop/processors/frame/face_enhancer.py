@@ -23,7 +23,7 @@ def get_face_enhancer() -> Any:
         if FACE_ENHANCER is None:
             model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
             # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
-            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=2, device=get_device())
+            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
     return FACE_ENHANCER
 
 
@@ -43,7 +43,7 @@ def clear_face_enhancer() -> None:
 
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.5/GFPGANv1.4.pth'])
+    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth'])
     return True
 
 
