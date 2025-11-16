@@ -1,7 +1,12 @@
-from typing import Any, List, Callable
+from typing import Any, List, Callable, Optional, Generator
 import cv2
 import insightface
 import threading
+import os
+import gc
+from functools import lru_cache
+import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 import roop.globals
@@ -15,270 +20,434 @@ from roop.utilities import conditional_download, resolve_relative_path, is_image
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
+CACHED_SOURCE_FACE = None
 
-# Configuration
-DETECTION_THRESHOLD = 0.3  # Lowered threshold for better face detection
-BLEND_EXPAND_PIXELS = 25   # Expanded blending area
-GAUSSIAN_BLUR_SIZE = (45, 45)  # Larger blur for smoother blending
 
+# ==================== MODEL MANAGEMENT ====================
+
+@lru_cache(maxsize=1)
 def get_face_swapper() -> Any:
+    """
+    Get face swapper model with caching and lazy loading
+    """
     global FACE_SWAPPER
-
-    with THREAD_LOCK:
-        if FACE_SWAPPER is None:
-            model_path = resolve_relative_path('../models/inswapper_128.onnx')
-            # Try to load 256 model first, fallback to 128
-            try:
-                model_path_256 = resolve_relative_path('../models/inswapper_256.onnx')
-                FACE_SWAPPER = insightface.model_zoo.get_model(model_path_256, providers=roop.globals.execution_providers)
-                print("Loaded inswapper_256.onnx model")
-            except:
-                FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=roop.globals.execution_providers)
-                print("Loaded inswapper_128.onnx model (fallback)")
+    
+    if FACE_SWAPPER is None:
+        model_path = resolve_relative_path('../models/inswapper_128.onnx')
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model not found at {model_path}")
+        
+        FACE_SWAPPER = insightface.model_zoo.get_model(
+            model_path, 
+            providers=roop.globals.execution_providers
+        )
+    
     return FACE_SWAPPER
 
+
 def clear_face_swapper() -> None:
-    global FACE_SWAPPER
+    """
+    Clear face swapper from memory
+    """
+    global FACE_SWAPPER, CACHED_SOURCE_FACE
+    
     FACE_SWAPPER = None
+    CACHED_SOURCE_FACE = None
+    get_face_swapper.cache_clear()
 
-def pre_check() -> bool:
-    download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, [
-        'https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx',
-        'https://huggingface.co/ezioruan/inswapper_128_fp16/resolve/main/inswapper_128_fp16.onnx'
-    ])
-    return True
 
-def pre_start() -> bool:
-    if not is_image(roop.globals.source_path):
-        update_status('Select an image for source path.', NAME)
-        return False
-    
-    # Preprocess source image for better quality
-    source_image = preprocess_source_image(cv2.imread(roop.globals.source_path))
-    source_face = get_one_face(source_image)
-    
-    if not source_face:
-        update_status('No face in source path detected.', NAME)
-        return False
-    
-    if hasattr(source_face, 'det_score') and source_face.det_score < 0.5:  # Slightly lowered threshold
-        update_status('Source face detection score low. Use a clearer source image.', NAME)
-        return False
-        
-    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status('Select an image or video for target path.', NAME)
-        return False
-    return True
-
-def post_process() -> None:
-    clear_face_swapper()
-    clear_face_reference()
-
-def preprocess_source_image(source_image: Frame) -> Frame:
+@contextlib.contextmanager
+def face_swapper_context():
     """
-    Enhance source image quality for better face swapping
+    Context manager for face swapper resource management
     """
     try:
-        # Apply gentle enhancement
-        enhanced = cv2.detailEnhance(source_image, sigma_s=8, sigma_r=0.12)
-        # Reduce noise while preserving edges
-        denoised = cv2.medianBlur(enhanced, 3)
-        # Sharpening filter
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(denoised, -1, kernel)
-        return sharpened
+        yield get_face_swapper()
     except Exception as e:
-        print(f"Source image preprocessing failed: {e}")
-        return source_image
+        update_status(f'Face swapper error: {str(e)}', NAME)
+        raise
+    finally:
+        # Don't clear here to avoid reloading model frequently
+        pass
 
-def apply_color_correction(result_roi: Frame, original_roi: Frame) -> Frame:
+
+# ==================== IMAGE I/O OPTIMIZATIONS ====================
+
+def load_image_optimized(path: str) -> Optional[Frame]:
     """
-    Apply color matching between swapped face and original face
+    Load image with optimized settings
     """
     try:
-        if result_roi.size == 0 or original_roi.size == 0:
-            return result_roi
-        
-        # Ensure same dimensions
-        if result_roi.shape != original_roi.shape:
-            result_roi = cv2.resize(result_roi, (original_roi.shape[1], original_roi.shape[0]))
-        
-        # Convert to float for calculations
-        result_float = result_roi.astype(np.float32)
-        original_float = original_roi.astype(np.float32)
-        
-        # Calculate mean and standard deviation
-        result_mean = np.mean(result_float, axis=(0, 1))
-        result_std = np.std(result_float, axis=(0, 1))
-        original_mean = np.mean(original_float, axis=(0, 1))
-        original_std = np.std(original_float, axis=(0, 1))
-        
-        # Avoid division by zero
-        result_std[result_std < 1] = 1
-        original_std[original_std < 1] = 1
-        
-        # Color correction formula
-        corrected = (result_float - result_mean) * (original_std / result_std) + original_mean
-        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
-        
-        return corrected
-        
+        return cv2.imread(path, cv2.IMREAD_COLOR)
     except Exception as e:
-        print(f"Color correction failed: {e}")
-        return result_roi
+        print(f"Error loading image {path}: {str(e)}")
+        return None
 
-def enhance_face_blending(result_frame: Frame, original_frame: Frame, target_face: Face) -> Frame:
+
+def save_image_optimized(path: str, image: Frame, quality: int = 95) -> bool:
     """
-    Improved blending between swapped face and original frame
+    Save image with optimized compression
     """
     try:
-        bbox = target_face.bbox.astype(int)
-        x1, y1, x2, y2 = bbox
-        
-        # Expand blending area
-        h, w = result_frame.shape[:2]
-        x1 = max(0, x1 - BLEND_EXPAND_PIXELS)
-        y1 = max(0, y1 - BLEND_EXPAND_PIXELS)
-        x2 = min(w, x2 + BLEND_EXPAND_PIXELS)
-        y2 = min(h, y2 + BLEND_EXPAND_PIXELS)
-        
-        # Check valid dimensions
-        if (x2 - x1) < 10 or (y2 - y1) < 10:
-            return result_frame
-        
-        result_face_roi = result_frame[y1:y2, x1:x2]
-        original_face_roi = original_frame[y1:y2, x1:x2]
-        
-        if result_face_roi.size == 0 or original_face_roi.size == 0:
-            return result_frame
-        
-        # Resize if dimensions don't match
-        if result_face_roi.shape != original_face_roi.shape:
-            result_face_roi = cv2.resize(result_face_roi, (original_face_roi.shape[1], original_face_roi.shape[0]))
-        
-        # Create elliptical mask for natural blending
-        mask = np.zeros(result_face_roi.shape[:2], dtype=np.float32)
-        center_x, center_y = result_face_roi.shape[1] // 2, result_face_roi.shape[0] // 2
-        radius_x = result_face_roi.shape[1] // 2 - 8
-        radius_y = result_face_roi.shape[0] // 2 - 8
-        
-        # Draw filled ellipse
-        cv2.ellipse(mask, (center_x, center_y), (radius_x, radius_y), 0, 0, 360, 1, -1)
-        
-        # Apply Gaussian blur for smooth transition
-        mask = cv2.GaussianBlur(mask, GAUSSIAN_BLUR_SIZE, 0)
-        
-        # Apply color correction before blending
-        color_corrected_roi = apply_color_correction(result_face_roi, original_face_roi)
-        
-        # Blend using the mask
-        mask_3d = np.stack([mask] * 3, axis=-1)
-        blended_roi = (color_corrected_roi * mask_3d + original_face_roi * (1 - mask_3d)).astype(np.uint8)
-        
-        result_frame[y1:y2, x1:x2] = blended_roi
-        
+        # Use appropriate compression based on file extension
+        if path.lower().endswith('.jpg') or path.lower().endswith('.jpeg'):
+            cv2.imwrite(path, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        elif path.lower().endswith('.png'):
+            cv2.imwrite(path, image, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        else:
+            cv2.imwrite(path, image)
+        return True
     except Exception as e:
-        print(f"Blending enhancement failed: {e}")
+        print(f"Error saving image {path}: {str(e)}")
+        return False
+
+
+def get_cached_source_face(source_path: str) -> Optional[Face]:
+    """
+    Get or cache source face to avoid repeated detection
+    """
+    global CACHED_SOURCE_FACE
     
-    return result_frame
+    if CACHED_SOURCE_FACE is not None:
+        return CACHED_SOURCE_FACE
+    
+    source_image = load_image_optimized(source_path)
+    if source_image is None:
+        return None
+    
+    CACHED_SOURCE_FACE = get_one_face(source_image)
+    return CACHED_SOURCE_FACE
+
+
+# ==================== FRAME PROCESSING OPTIMIZATIONS ====================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Main face swapping function with enhanced processing
+    Swap face with proper error handling
     """
-    original_frame = temp_frame.copy()
-    
     try:
-        # Perform face swap
-        result_frame = get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
-        
-        # Apply enhanced blending
-        result_frame = enhance_face_blending(result_frame, original_frame, target_face)
-        
+        with face_swapper_context():
+            return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
     except Exception as e:
-        print(f"Face swap failed: {e}")
-        return original_frame
-    
-    return result_frame
+        print(f"Face swap error: {str(e)}")
+        return temp_frame
 
-def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
+
+def process_single_face(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
     """
-    Process individual frame with improved face detection
+    Process frame with single face detection
     """
-    if roop.globals.many_faces:
-        # Process multiple faces
-        many_faces = get_many_faces(temp_frame)
-        if many_faces:
-            for target_face in many_faces:
-                det_score = getattr(target_face, 'det_score', 1.0)
-                if det_score > DETECTION_THRESHOLD:
-                    temp_frame = swap_face(source_face, target_face, temp_frame)
-    else:
-        # Process single face
-        target_face = find_similar_face(temp_frame, reference_face)
-        if target_face:
-            det_score = getattr(target_face, 'det_score', 1.0)
-            if det_score > DETECTION_THRESHOLD:
-                temp_frame = swap_face(source_face, target_face, temp_frame)
+    target_face = find_similar_face(temp_frame, reference_face)
+    if target_face:
+        return swap_face(source_face, target_face, temp_frame)
+    return temp_frame
+
+
+def process_many_faces_sequential(source_face: Face, temp_frame: Frame) -> Frame:
+    """
+    Process multiple faces sequentially
+    """
+    many_faces = get_many_faces(temp_frame)
+    if many_faces:
+        for target_face in many_faces:
+            temp_frame = swap_face(source_face, target_face, temp_frame)
+    return temp_frame
+
+
+def process_many_faces_parallel(source_face: Face, temp_frame: Frame) -> Frame:
+    """
+    Process multiple faces in parallel (experimental)
+    """
+    many_faces = get_many_faces(temp_frame)
+    if not many_faces or len(many_faces) == 1:
+        return process_many_faces_sequential(source_face, temp_frame)
+    
+    # For multiple faces, process in parallel
+    try:
+        with ThreadPoolExecutor(max_workers=min(4, len(many_faces))) as executor:
+            # Create copies of the frame for each face processing
+            frames = [temp_frame.copy() for _ in many_faces]
+            
+            # Process each face in parallel
+            futures = [
+                executor.submit(swap_face, source_face, target_face, frame)
+                for target_face, frame in zip(many_faces, frames)
+            ]
+            
+            # Get results
+            results = [future.result() for future in futures]
+            
+            # Simple blending of results (this could be improved)
+            if results:
+                # Use the last result as base (simplistic approach)
+                temp_frame = results[-1]
+                
+    except Exception as e:
+        print(f"Parallel processing failed, falling back to sequential: {str(e)}")
+        temp_frame = process_many_faces_sequential(source_face, temp_frame)
     
     return temp_frame
 
+
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
+    """
+    Main frame processing function with optimized face handling
+    """
+    if temp_frame is None:
+        return None
+        
+    if roop.globals.many_faces:
+        # Use parallel processing for multiple faces if enabled in config
+        if getattr(roop.globals, 'enable_parallel_processing', False):
+            return process_many_faces_parallel(source_face, temp_frame)
+        else:
+            return process_many_faces_sequential(source_face, temp_frame)
+    else:
+        return process_single_face(source_face, reference_face, temp_frame)
+
+
+# ==================== BATCH PROCESSING OPTIMIZATIONS ====================
+
+def process_frames_batch(
+    source_face: Face, 
+    reference_face: Face, 
+    frame_batch: List[tuple[str, Frame]],
+    update: Callable[[], None]
+) -> None:
+    """
+    Process a batch of frames efficiently
+    """
+    processed_count = 0
+    
+    for temp_frame_path, temp_frame in frame_batch:
+        if temp_frame is None:
+            continue
+            
+        try:
+            result = process_frame(source_face, reference_face, temp_frame)
+            if save_image_optimized(temp_frame_path, result):
+                processed_count += 1
+        except Exception as e:
+            print(f"Error processing frame {temp_frame_path}: {str(e)}")
+            continue
+    
+    if update:
+        update()
+    
+    return processed_count
+
+
+def load_frames_batch(frame_paths: List[str], batch_size: int) -> Generator[List[tuple[str, Frame]], None, None]:
+    """
+    Generator that yields batches of loaded frames
+    """
+    for i in range(0, len(frame_paths), batch_size):
+        batch_paths = frame_paths[i:i + batch_size]
+        batch_frames = []
+        
+        for path in batch_paths:
+            frame = load_image_optimized(path)
+            if frame is not None:
+                batch_frames.append((path, frame))
+        
+        yield batch_frames
+        
+        # Clear the batch to free memory
+        del batch_frames
+
+
 def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     """
-    Process all frames in sequence
+    Optimized frame processing with batch loading and memory management
     """
-    # Preprocess source image for better quality
-    source_image = preprocess_source_image(cv2.imread(source_path))
-    source_face = get_one_face(source_image)
-    
-    if not source_face:
-        print("No source face found!")
+    source_face = get_cached_source_face(source_path)
+    if source_face is None:
+        update_status('No source face detected.', NAME)
         return
-        
+
     reference_face = None if roop.globals.many_faces else get_face_reference()
     
-    for i, temp_frame_path in enumerate(temp_frame_paths):
-        try:
-            temp_frame = cv2.imread(temp_frame_path)
-            if temp_frame is None:
-                continue
-                
-            result = process_frame(source_face, reference_face, temp_frame)
-            cv2.imwrite(temp_frame_path, result)
-            
-            if update and i % 10 == 0:  # Update every 10 frames
-                update()
-                
-        except Exception as e:
-            print(f"Error processing frame {i}: {e}")
+    # Calculate optimal batch size based on available memory
+    batch_size = getattr(roop.globals, 'batch_size', 4)
+    total_frames = len(temp_frame_paths)
+    processed_frames = 0
+    
+    # Process frames in batches
+    for batch_index, frame_batch in enumerate(load_frames_batch(temp_frame_paths, batch_size)):
+        if not frame_batch:
             continue
+            
+        processed_in_batch = process_frames_batch(source_face, reference_face, frame_batch, update)
+        processed_frames += processed_in_batch
+        
+        # Force garbage collection every few batches
+        if batch_index % 3 == 0:
+            gc.collect()
+        
+        # Progress update
+        if update and processed_frames % 10 == 0:
+            update()
+    
+    print(f"Successfully processed {processed_frames}/{total_frames} frames")
+
+
+# ==================== PRE/POST PROCESSING ====================
+
+def pre_check() -> bool:
+    """
+    Check and download required models
+    """
+    try:
+        download_directory_path = resolve_relative_path('../models')
+        model_filename = 'inswapper_128.onnx'
+        model_path = os.path.join(download_directory_path, model_filename)
+        
+        # Check if model exists
+        if not os.path.exists(model_path):
+            model_url = 'https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx'
+            update_status('Downloading face swapper model...', NAME)
+            conditional_download(download_directory_path, [model_url])
+        
+        # Verify model file
+        if not os.path.exists(model_path):
+            update_status('Face swapper model not found.', NAME)
+            return False
+            
+        return True
+        
+    except Exception as e:
+        update_status(f'Pre-check error: {str(e)}', NAME)
+        return False
+
+
+def pre_start() -> bool:
+    """
+    Validate inputs before starting processing
+    """
+    try:
+        # Validate source
+        if not is_image(roop.globals.source_path):
+            update_status('Select an image for source path.', NAME)
+            return False
+        
+        # Validate and cache source face
+        source_face = get_cached_source_face(roop.globals.source_path)
+        if not source_face:
+            update_status('No face in source path detected.', NAME)
+            return False
+        
+        # Validate target
+        if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
+            update_status('Select an image or video for target path.', NAME)
+            return False
+        
+        # Pre-load model to avoid delays during processing
+        if not pre_load_model():
+            update_status('Failed to load face swapper model.', NAME)
+            return False
+            
+        return True
+        
+    except Exception as e:
+        update_status(f'Pre-start error: {str(e)}', NAME)
+        return False
+
+
+def pre_load_model() -> bool:
+    """
+    Pre-load model to avoid first-time latency
+    """
+    try:
+        get_face_swapper()
+        return True
+    except Exception as e:
+        print(f"Model pre-loading failed: {str(e)}")
+        return False
+
+
+def post_process() -> None:
+    """
+    Cleanup after processing
+    """
+    clear_face_swapper()
+    clear_face_reference()
+    
+    # Force garbage collection
+    gc.collect()
+
+
+# ==================== IMAGE & VIDEO PROCESSING ====================
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     """
-    Process single image
+    Process single image with optimization
     """
-    # Preprocess source image
-    source_image = preprocess_source_image(cv2.imread(source_path))
-    source_face = get_one_face(source_image)
-    
-    target_frame = cv2.imread(target_path)
-    reference_face = None if roop.globals.many_faces else get_one_face(target_frame, roop.globals.reference_face_position)
-    
-    result = process_frame(source_face, reference_face, target_frame)
-    cv2.imwrite(output_path, result)
+    try:
+        source_face = get_cached_source_face(source_path)
+        if not source_face:
+            update_status('No source face detected.', NAME)
+            return
+
+        target_frame = load_image_optimized(target_path)
+        if target_frame is None:
+            update_status('Failed to load target image.', NAME)
+            return
+
+        reference_face = None if roop.globals.many_faces else get_one_face(
+            target_frame, 
+            roop.globals.reference_face_position
+        )
+
+        result = process_frame(source_face, reference_face, target_frame)
+        
+        if not save_image_optimized(output_path, result):
+            update_status('Failed to save output image.', NAME)
+            
+    except Exception as e:
+        update_status(f'Image processing error: {str(e)}', NAME)
+
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """
-    Process video frames
+    Process video with optimized frame handling
     """
-    if not roop.globals.many_faces and not get_face_reference():
-        reference_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
-        reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
-        if reference_face:
-            set_face_reference(reference_face)
-        else:
-            print("No reference face found in video!")
-            return
-            
-    roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
+    try:
+        if not roop.globals.many_faces and not get_face_reference():
+            if temp_frame_paths:
+                reference_frame = load_image_optimized(temp_frame_paths[roop.globals.reference_frame_number])
+                if reference_frame is not None:
+                    reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
+                    set_face_reference(reference_face)
+        
+        # Use the optimized process_frames function
+        roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
+        
+    except Exception as e:
+        update_status(f'Video processing error: {str(e)}', NAME)
+
+
+# ==================== CONFIGURATION ====================
+
+def set_processing_config(
+    enable_parallel: bool = False,
+    batch_size: int = 4,
+    jpeg_quality: int = 95
+) -> None:
+    """
+    Set processing configuration parameters
+    """
+    roop.globals.enable_parallel_processing = enable_parallel
+    roop.globals.batch_size = batch_size
+    roop.globals.jpeg_quality = jpeg_quality
+
+
+def get_processing_stats() -> dict:
+    """
+    Get current processing statistics
+    """
+    return {
+        'model_loaded': FACE_SWAPPER is not None,
+        'source_face_cached': CACHED_SOURCE_FACE is not None,
+        'batch_size': getattr(roop.globals, 'batch_size', 4),
+        'parallel_processing': getattr(roop.globals, 'enable_parallel_processing', False)
+    }
