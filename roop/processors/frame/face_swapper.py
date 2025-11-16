@@ -18,15 +18,6 @@ FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
-# Enhanced configuration
-ENHANCE_CONFIG = {
-    'blend_ratio': 0.7,
-    'color_correction_strength': 0.8,
-    'sharpness_enhance': 1.2,
-    'smooth_edges': True,
-    'adaptive_lighting': True
-}
-
 
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
@@ -68,239 +59,130 @@ def post_process() -> None:
     clear_face_reference()
 
 
-def adaptive_color_correction(source_face: Face, target_face: Face, swapped_face: Frame, target_frame: Frame) -> Frame:
-    """
-    Advanced color correction to match lighting conditions between source and target
-    """
-    try:
-        # Extract face regions for color analysis
-        source_region = extract_face_region(source_face, cv2.imread(roop.globals.source_path))
-        target_region = extract_face_region(target_face, target_frame)
-        
-        if source_region is not None and target_region is not None:
-            # Calculate mean colors for simple color matching
-            source_mean = np.mean(source_region, axis=(0, 1))
-            target_mean = np.mean(target_region, axis=(0, 1))
-            swapped_mean = np.mean(swapped_face, axis=(0, 1))
-            
-            # Calculate color adjustment ratios
-            color_ratio = target_mean / (source_mean + 1e-6)
-            color_ratio = np.clip(color_ratio, 0.8, 1.2)
-            
-            # Apply color correction
-            corrected_face = np.clip(swapped_face.astype(np.float32) * color_ratio, 0, 255).astype(np.uint8)
-            
-            # Blend with original for natural look
-            blend_ratio = 0.6
-            swapped_face = cv2.addWeighted(swapped_face, 1 - blend_ratio, corrected_face, blend_ratio, 0)
-        
-        # Additional brightness and contrast matching
-        swapped_face = match_brightness_contrast(swapped_face, target_region)
-        
-    except Exception as e:
-        print(f"Color correction error: {e}")
-        # Return original if correction fails
-        pass
-    
-    return swapped_face
-
-
-def extract_face_region(face: Face, frame: Frame) -> Optional[Frame]:
-    """Extract the face region from frame"""
-    if face is None or frame is None:
+def ensure_frame_format(frame: Any) -> Optional[Frame]:
+    """Ensure the frame is in correct numpy array format"""
+    if frame is None:
         return None
     
-    try:
-        x1, y1, x2, y2 = map(int, face.bbox)
-        # Expand the region slightly for better color analysis
-        margin = 5
-        h, w = frame.shape[:2]
-        x1 = max(0, x1 - margin)
-        y1 = max(0, y1 - margin)
-        x2 = min(w, x2 + margin)
-        y2 = min(h, y2 + margin)
-        
-        face_region = frame[y1:y2, x1:x2]
-        
-        # Check if region is valid
-        if face_region.size == 0 or face_region.shape[0] == 0 or face_region.shape[1] == 0:
-            return None
-            
-        return face_region
-    except Exception as e:
-        print(f"Error extracting face region: {e}")
-        return None
-
-
-def match_brightness_contrast(source_face: Frame, target_region: Optional[Frame]) -> Frame:
-    """Match brightness and contrast between source and target"""
-    if target_region is None or target_region.size == 0:
-        return source_face
+    # If it's already a numpy array with correct shape
+    if isinstance(frame, np.ndarray) and len(frame.shape) == 3:
+        return frame
     
+    # If it's a tuple (likely from face swapper), convert to numpy array
+    if isinstance(frame, tuple):
+        try:
+            # Try to convert tuple to numpy array
+            frame_array = np.array(frame)
+            if frame_array.size > 0:
+                return frame_array
+        except:
+            pass
+    
+    return None
+
+
+def simple_color_correction(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    """Simple and robust color correction"""
     try:
-        # Convert to LAB color space for better brightness matching
-        source_lab = cv2.cvtColor(source_face, cv2.COLOR_BGR2LAB)
+        if target_face is None:
+            return swapped_face
+        
+        # Extract target face region for color reference
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        h, w = target_frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        target_region = target_frame[y1:y2, x1:x2]
+        
+        if target_region.size == 0 or swapped_face.size == 0:
+            return swapped_face
+        
+        # Resize swapped face to match target region if needed
+        if swapped_face.shape != target_region.shape:
+            swapped_face = cv2.resize(swapped_face, (target_region.shape[1], target_region.shape[0]))
+        
+        # Convert to LAB color space for better color matching
+        swapped_lab = cv2.cvtColor(swapped_face, cv2.COLOR_BGR2LAB)
         target_lab = cv2.cvtColor(target_region, cv2.COLOR_BGR2LAB)
         
-        # Calculate mean and std for L channel (lightness)
-        source_l_mean, source_l_std = np.mean(source_lab[:,:,0]), np.std(source_lab[:,:,0])
-        target_l_mean, target_l_std = np.mean(target_lab[:,:,0]), np.std(target_lab[:,:,0])
+        # Calculate mean and standard deviation for each channel
+        swapped_mean, swapped_std = np.mean(swapped_lab, axis=(0,1)), np.std(swapped_lab, axis=(0,1))
+        target_mean, target_std = np.mean(target_lab, axis=(0,1)), np.std(target_lab, axis=(0,1))
         
-        # Adjust brightness and contrast
-        source_lab[:,:,0] = np.clip(
-            (source_lab[:,:,0] - source_l_mean) * (target_l_std / (source_l_std + 1e-6)) + target_l_mean,
-            0, 255
-        )
+        # Avoid division by zero
+        swapped_std = np.where(swapped_std == 0, 1, swapped_std)
+        target_std = np.where(target_std == 0, 1, target_std)
         
-        # Convert back to BGR
-        result = cv2.cvtColor(source_lab, cv2.COLOR_LAB2BGR)
-        return result
+        # Color correction
+        corrected_lab = np.zeros_like(swapped_lab)
+        for i in range(3):
+            corrected_lab[:,:,i] = (swapped_lab[:,:,i] - swapped_mean[i]) * (target_std[i] / swapped_std[i]) + target_mean[i]
+        
+        corrected_lab = np.clip(corrected_lab, 0, 255).astype(np.uint8)
+        corrected_face = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+        
+        # Blend with original for natural look
+        blend_ratio = 0.7
+        result_face = cv2.addWeighted(swapped_face, 1 - blend_ratio, corrected_face, blend_ratio, 0)
+        
+        return result_face
         
     except Exception as e:
-        print(f"Brightness matching error: {e}")
-        return source_face
+        print(f"Simple color correction error: {e}")
+        return swapped_face
 
 
-def create_enhanced_mask(face: Face, frame_shape: Tuple[int, int]) -> np.ndarray:
-    """Create enhanced mask with smooth edges and proper feathering"""
+def create_smooth_mask(face: Face, frame_shape: Tuple[int, int]) -> np.ndarray:
+    """Create smooth mask for blending"""
     mask = np.zeros(frame_shape[:2], dtype=np.float32)
     
     try:
-        if hasattr(face, 'kps') and face.kps is not None:
-            # Use facial landmarks for precise masking
-            landmarks = face.kps.astype(np.int32)
-            
-            # Create convex hull from landmarks
-            hull = cv2.convexHull(landmarks)
-            cv2.fillConvexPoly(mask, hull, 1.0)
-            
-            # Apply Gaussian blur for smooth edges
-            mask = cv2.GaussianBlur(mask, (15, 15), 0)
-            
-            # Enhance mask with morphological operations
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            
-            # Final smoothing
-            mask = cv2.GaussianBlur(mask, (7, 7), 0)
-        else:
-            # Fallback to bbox-based mask
-            x1, y1, x2, y2 = map(int, face.bbox)
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-            radius = min(x2 - x1, y2 - y1) // 2
-            
-            cv2.circle(mask, (center_x, center_y), radius, 1.0, -1)
-            mask = cv2.GaussianBlur(mask, (25, 25), 0)
-    
+        x1, y1, x2, y2 = map(int, face.bbox)
+        
+        # Create elliptical mask
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        width = x2 - x1
+        height = y2 - y1
+        
+        # Create ellipse
+        cv2.ellipse(mask, (center_x, center_y), (width//2, height//2), 0, 0, 360, 1.0, -1)
+        
+        # Apply Gaussian blur for smooth edges
+        mask = cv2.GaussianBlur(mask, (25, 25), 0)
+        
+        return np.clip(mask, 0, 1)
+        
     except Exception as e:
         print(f"Mask creation error: {e}")
-        # Fallback: create simple rectangular mask
+        # Fallback to simple rectangular mask
         x1, y1, x2, y2 = map(int, face.bbox)
         mask[y1:y2, x1:x2] = 1.0
         mask = cv2.GaussianBlur(mask, (51, 51), 0)
-    
-    return np.clip(mask, 0, 1)
-
-
-def pyramid_blending(src: Frame, dst: Frame, mask: np.ndarray, levels: int = 4) -> Frame:
-    """Multi-resolution pyramid blending for seamless integration"""
-    try:
-        # Ensure all inputs have same dimensions
-        if src.shape != dst.shape:
-            src = cv2.resize(src, (dst.shape[1], dst.shape[0]))
-        if mask.shape != src.shape[:2]:
-            mask = cv2.resize(mask, (src.shape[1], src.shape[0]))
-        
-        # Convert to float for processing
-        src = src.astype(np.float32)
-        dst = dst.astype(np.float32)
-        mask = mask.astype(np.float32)
-        
-        # Generate Gaussian pyramid for mask
-        G_mask = mask.copy()
-        gp_mask = [G_mask]
-        for i in range(levels):
-            G_mask = cv2.pyrDown(G_mask)
-            gp_mask.append(G_mask)
-        
-        # Generate Laplacian pyramid for source
-        G_src = src.copy()
-        gp_src = [G_src]
-        for i in range(levels):
-            G_src = cv2.pyrDown(G_src)
-            gp_src.append(G_src)
-        
-        lp_src = [gp_src[levels]]
-        for i in range(levels, 0, -1):
-            GE = cv2.pyrUp(gp_src[i])
-            GE = cv2.resize(GE, (gp_src[i-1].shape[1], gp_src[i-1].shape[0]))
-            L = cv2.subtract(gp_src[i-1], GE)
-            lp_src.append(L)
-        
-        # Generate Laplacian pyramid for destination
-        G_dst = dst.copy()
-        gp_dst = [G_dst]
-        for i in range(levels):
-            G_dst = cv2.pyrDown(G_dst)
-            gp_dst.append(G_dst)
-        
-        lp_dst = [gp_dst[levels]]
-        for i in range(levels, 0, -1):
-            GE = cv2.pyrUp(gp_dst[i])
-            GE = cv2.resize(GE, (gp_dst[i-1].shape[1], gp_dst[i-1].shape[0]))
-            L = cv2.subtract(gp_dst[i-1], GE)
-            lp_dst.append(L)
-        
-        # Blend pyramids
-        LS = []
-        for la, lb, gm in zip(lp_src, lp_dst, gp_mask[::-1]):
-            # Resize mask to match pyramid level
-            gm_resized = cv2.resize(gm, (la.shape[1], la.shape[0]))
-            gm_3d = np.stack([gm_resized] * 3, axis=-1) if len(la.shape) == 3 else gm_resized
-            ls = la * gm_3d + lb * (1.0 - gm_3d)
-            LS.append(ls)
-        
-        # Reconstruct
-        ls_ = LS[0]
-        for i in range(1, len(LS)):
-            ls_ = cv2.pyrUp(ls_)
-            ls_ = cv2.resize(ls_, (LS[i].shape[1], LS[i].shape[0]))
-            ls_ = cv2.add(ls_, LS[i])
-        
-        return np.clip(ls_, 0, 255).astype(np.uint8)
-        
-    except Exception as e:
-        print(f"Pyramid blending error: {e}")
-        # Fallback to simple blending
-        mask_3d = np.stack([mask] * 3, axis=-1)
-        return (src * mask_3d + dst * (1 - mask_3d)).astype(np.uint8)
+        return mask
 
 
 def enhance_face_quality(face: Frame) -> Frame:
-    """Enhance face quality with sharpening and noise reduction"""
+    """Simple face quality enhancement"""
     try:
-        # Ensure input is valid
-        if face is None or face.size == 0:
+        if face is None:
             return face
             
-        # Convert to float for processing
-        face_float = face.astype(np.float32)
-        
-        # Mild sharpening kernel
+        # Ensure it's a numpy array
+        face_array = ensure_frame_format(face)
+        if face_array is None:
+            return face
+            
+        # Mild sharpening
         kernel = np.array([[-1, -1, -1],
                           [-1,  9, -1],
-                          [-1, -1, -1]]) * 0.3
+                          [-1, -1, -1]]) * 0.2
         
-        # Apply sharpening
-        sharpened = cv2.filter2D(face_float, -1, kernel)
-        
-        # Blend with original
-        alpha = 0.3
-        enhanced_face = cv2.addWeighted(face_float, 1 - alpha, sharpened, alpha, 0)
+        sharpened = cv2.filter2D(face_array, -1, kernel)
         
         # Mild bilateral filter for noise reduction
-        denoised = cv2.bilateralFilter(enhanced_face.astype(np.uint8), 3, 25, 25)
+        denoised = cv2.bilateralFilter(sharpened, 5, 25, 25)
         
         return denoised
         
@@ -309,65 +191,103 @@ def enhance_face_quality(face: Frame) -> Frame:
         return face
 
 
-def advanced_face_blending(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
-    """
-    Advanced blending with edge-aware processing and texture preservation
-    """
-    if target_face is None:
-        return swapped_face
-    
+def seamless_blending(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    """Use OpenCV's seamlessClone for better blending"""
     try:
+        if target_face is None:
+            return target_frame
+            
         x1, y1, x2, y2 = map(int, target_face.bbox)
-        
-        # Ensure coordinates are within frame bounds
         h, w = target_frame.shape[:2]
+        
+        # Ensure coordinates are within bounds
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         
-        # Create improved mask
-        mask = create_enhanced_mask(target_face, target_frame.shape)
+        # Ensure swapped face has correct size
+        face_height, face_width = y2 - y1, x2 - x1
+        if swapped_face.shape[0] != face_height or swapped_face.shape[1] != face_width:
+            swapped_face = cv2.resize(swapped_face, (face_width, face_height))
         
-        # Extract regions
-        result = target_frame.copy()
-        face_region = result[y1:y2, x1:x2]
+        # Create mask
+        mask = 255 * np.ones(swapped_face.shape, swapped_face.dtype)
         
-        # Resize swapped face to match target region
-        if face_region.shape[:2] != swapped_face.shape[:2]:
-            swapped_face_resized = cv2.resize(swapped_face, (face_region.shape[1], face_region.shape[0]))
-        else:
-            swapped_face_resized = swapped_face
+        # Get center point for blending
+        center = ((x1 + x2) // 2, (y1 + y2) // 2)
         
-        # Extract mask region
+        # Use seamless clone for natural blending
+        result = cv2.seamlessClone(swapped_face, target_frame, mask, center, cv2.NORMAL_CLONE)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Seamless blending error: {e}")
+        # Fallback to simple blending
+        return simple_blending(swapped_face, target_frame, target_face)
+
+
+def simple_blending(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    """Simple alpha blending fallback"""
+    try:
+        if target_face is None:
+            return target_frame
+            
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        h, w = target_frame.shape[:2]
+        
+        # Ensure coordinates are within bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        # Ensure swapped face has correct size
+        face_height, face_width = y2 - y1, x2 - x1
+        if swapped_face.shape[0] != face_height or swapped_face.shape[1] != face_width:
+            swapped_face = cv2.resize(swapped_face, (face_width, face_height))
+        
+        # Create smooth mask
+        mask = create_smooth_mask(target_face, target_frame.shape)
         mask_region = mask[y1:y2, x1:x2]
         
-        # Apply pyramid blending
-        blended_face = pyramid_blending(swapped_face_resized, face_region, mask_region)
+        # Ensure mask has correct dimensions
+        if mask_region.shape != swapped_face.shape[:2]:
+            mask_region = cv2.resize(mask_region, (swapped_face.shape[1], swapped_face.shape[0]))
         
-        # Apply the blended result
+        # Create 3-channel mask
+        mask_3d = np.stack([mask_region] * 3, axis=-1)
+        
+        # Blend
+        result = target_frame.copy()
+        face_region = result[y1:y2, x1:x2]
+        blended_face = (swapped_face * mask_3d + face_region * (1 - mask_3d)).astype(np.uint8)
         result[y1:y2, x1:x2] = blended_face
         
         return result
         
     except Exception as e:
-        print(f"Advanced blending error: {e}")
-        # Fallback to simple replacement
+        print(f"Simple blending error: {e}")
         return target_frame
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    """Enhanced face swapping with improved blending and color correction"""
+    """Robust face swapping with error handling"""
     try:
         # Get basic face swap
-        swapped_frame = get_face_swapper().get(temp_frame, target_face, source_face, paste_back=False)
+        swapped_result = get_face_swapper().get(temp_frame, target_face, source_face, paste_back=False)
         
-        # Apply advanced color correction
-        swapped_frame = adaptive_color_correction(source_face, target_face, swapped_frame, temp_frame)
+        # Ensure proper format
+        swapped_frame = ensure_frame_format(swapped_result)
+        if swapped_frame is None:
+            # Fallback to original method
+            return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
+        
+        # Apply color correction
+        swapped_frame = simple_color_correction(swapped_frame, temp_frame, target_face)
         
         # Enhance face quality
         swapped_frame = enhance_face_quality(swapped_frame)
         
-        # Apply advanced blending
-        result_frame = advanced_face_blending(swapped_frame, temp_frame, target_face)
+        # Apply blending
+        result_frame = seamless_blending(swapped_frame, temp_frame, target_face)
         
         return result_frame
         
