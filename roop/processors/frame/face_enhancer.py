@@ -80,6 +80,7 @@ def perform_warmup_inference(face_enhancer: Any) -> None:
     try:
         print("Performing GPU warm-up inference...")
         # Create a dummy image for warm-up
+        import numpy as np
         dummy_image = np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8)
         with THREAD_SEMAPHORE:
             face_enhancer.enhance(dummy_image, paste_back=True)
@@ -341,16 +342,3 @@ def optimize_for_high_vram() -> None:
         'memory_efficient': False
     })
     print("High VRAM optimization applied")
-
-# Initialize numpy for warm-up (added at the end to avoid import issues)
-try:
-    import numpy as np
-except ImportError:
-    print("Warning: numpy not available, some optimizations may be disabled")
-    # Create a simple fallback
-    class SimpleNP:
-        @staticmethod
-        def random.randint(low, high, size, dtype):
-            return [[[123, 123, 123] for _ in range(size[1])] for _ in range(size[0])]
-    
-    np = SimpleNP()
