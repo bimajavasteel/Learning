@@ -439,3 +439,79 @@ def post_process() -> None:
     clear_face_swapper()
     clear_face_reference()
     clear_gpu_memory()
+
+# ---------------------------------------------------------
+# FIX: Compatibility layer for ROOP core
+# Required by frame processor interface
+# ---------------------------------------------------------
+
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
+    """ROOP-compatible single frame processor"""
+    try:
+        if roop.globals.many_faces:
+            many = get_many_faces(temp_frame)
+            if many:
+                for tf in many:
+                    temp_frame = swap_face_pipeline(source_face, tf, temp_frame)
+        else:
+            if reference_face is None:
+                target_face = find_similar_face(temp_frame, None)
+            else:
+                target_face = find_similar_face(temp_frame, reference_face)
+
+            if target_face:
+                temp_frame = swap_face_pipeline(source_face, target_face, temp_frame)
+
+        return temp_frame
+
+    except Exception as e:
+        print(f"[process_frame] error: {e}")
+        return temp_frame
+
+
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    """ROOP-compatible multi-frame processor"""
+    try:
+        source_img = cv2.imread(source_path)
+        source_face = get_one_face(source_img)
+        reference_face = get_face_reference() if not roop.globals.many_faces else None
+
+        for frame_path in temp_frame_paths:
+            frame = cv2.imread(frame_path)
+            if frame is None:
+                print(f"[process_frames] cannot read: {frame_path}")
+                continue
+
+            result = process_frame(source_face, reference_face, frame)
+            cv2.imwrite(frame_path, result)
+
+            if update:
+                update()
+
+    except Exception as e:
+        print(f"[process_frames] fatal: {e}")
+    finally:
+        clear_gpu_memory()
+
+
+def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
+    """ROOP-compatible video processor"""
+    try:
+        if not roop.globals.many_faces and not get_face_reference():
+            if temp_frame_paths:
+            # refresh reference face
+                ref_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
+                if ref_frame is not None:
+                    ref_face = get_one_face(ref_frame)
+                    if ref_face is not None:
+                        set_face_reference(ref_face)
+
+        # ROOP's master pipeline
+        roop.processors.frame.core.process_video(
+            source_path, temp_frame_paths, process_frames
+        )
+
+    except Exception as e:
+        print(f"[process_video] error: {e}")
+    finally:
+        clear_gpu_memory()
