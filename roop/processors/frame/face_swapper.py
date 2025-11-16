@@ -25,7 +25,7 @@ from roop.utilities import conditional_download, resolve_relative_path, is_image
 # Global variables
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-SWAPPER'
+NAME = 'ROOP.FACE_SWAPPER'
 GPU_MEMORY_MANAGER = None
 ASYNC_PROCESSOR = None
 
