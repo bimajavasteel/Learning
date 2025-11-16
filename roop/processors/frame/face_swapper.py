@@ -1,31 +1,12 @@
-# hybrid-swapper-optimized.py
 from typing import Any, List, Callable, Tuple, Optional
 import cv2
 import insightface
 import threading
 import numpy as np
+from scipy import ndimage
 import os
 import gc
-import time
-import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Optional libs
-try:
-    import onnxruntime as ort
-    ONNXRUNTIME_AVAILABLE = True
-except Exception:
-    ort = None
-    ONNXRUNTIME_AVAILABLE = False
-
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except Exception:
-    torch = None
-    TORCH_AVAILABLE = False
-
-# ROOP integration
 import roop.globals
 import roop.processors.frame.core
 from roop.core import update_status
@@ -34,394 +15,112 @@ from roop.face_reference import get_face_reference, set_face_reference, clear_fa
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-# Global
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-SWAPPER-HYBRID'
+NAME = 'ROOP.FACE-SWAPPER'
 
-# --- Config tunable (ubah sesuai GPU/keperluan) ---
-GPU_CONFIG = {
-    'prefer_onnx_cuda': True,
-    'gpu_mem_limit_bytes': 6 * 1024**3,   # 6GB default (sesuaikan)
-    'max_workers_high_vram': 4,
-    'max_workers_low_vram': 1,
-    'batch_size_high_vram': 8,
-    'batch_size_low_vram': 4,
-    'memory_clear_interval': 25,
-    'enable_tf32': True,    # gunakan jika PyTorch tersedia & Ampere+
-    'warmup': True,
-}
+# Try import onnxruntime dengan error handling
+try:
+    import onnxruntime as ort
+    ONNXRUNTIME_AVAILABLE = True
+except ImportError:
+    print("ONNX Runtime not available, using default providers")
+    ONNXRUNTIME_AVAILABLE = False
+    ort = None
 
-# --- Utility: safe GPU memory cleanup ---
+# Try import torch dengan error handling  
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    print("PyTorch not available, skipping torch optimizations")
+    TORCH_AVAILABLE = False
+    torch = None
+
+
 def clear_gpu_memory():
-    """Clear GPU memory and force GC - safe to call periodically."""
+    """Clear GPU memory secara eksplisit"""
     try:
+        # Clear CUDA memory jika torch tersedia
         if TORCH_AVAILABLE and torch.cuda.is_available():
             torch.cuda.empty_cache()
-            # synchronize can help ensure memory is freed
-            try:
-                torch.cuda.synchronize()
-            except Exception:
-                pass
+            torch.cuda.synchronize()
+        
+        # Clear general garbage collection
         gc.collect()
+            
     except Exception as e:
-        print(f"[clear_gpu_memory] warning: {e}")
+        print(f"GPU memory clear warning: {e}")
 
-# --- Device/Providers detection and model loader ---
-def detect_providers():
-    """Return a list of providers for onnxruntime / insightface model load."""
-    if ONNXRUNTIME_AVAILABLE and GPU_CONFIG.get('prefer_onnx_cuda', True):
-        try:
-            provs = ort.get_available_providers()
-            if 'CUDAExecutionProvider' in provs:
-                cuda_opts = {
-                    'device_id': 0,
-                    'arena_extend_strategy': 'kSameAsRequested',
-                    'gpu_mem_limit': GPU_CONFIG['gpu_mem_limit_bytes'],
-                    'cudnn_conv_algo_search': 'DEFAULT',
-                }
-                return [('CUDAExecutionProvider', cuda_opts)]
-            # fallback to CPU provider if no CUDA
-            return ['CPUExecutionProvider']
-        except Exception as e:
-            print(f"[detect_providers] ONNX provider detection error: {e}")
-    # Fallback to whatever roop provides (compatibility)
-    return roop.globals.execution_providers
 
 def get_face_swapper() -> Any:
-    """Load face swapper model with robust provider handling and fallbacks."""
     global FACE_SWAPPER
+
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
             model_path = resolve_relative_path('../models/inswapper_128.onnx')
+            
+            # Cek jika file model ada
             if not os.path.exists(model_path):
                 raise FileNotFoundError(f"Model file not found: {model_path}")
-            providers = detect_providers()
+            
+            # Optimasi provider settings untuk GPU dengan error handling
+            providers = []
+            
+            if ONNXRUNTIME_AVAILABLE:
+                try:
+                    available_providers = ort.get_available_providers()
+                    
+                    if 'CUDAExecutionProvider' in available_providers:
+                        providers = [
+                            ('CUDAExecutionProvider', {
+                                'device_id': 0,
+                                'arena_extend_strategy': 'kSameAsRequested',
+                                'gpu_mem_limit': 4 * 1024 * 1024 * 1024,  # 4GB limit
+                                'cudnn_conv_algo_search': 'HEURISTIC',
+                            })
+                        ]
+                        print("Using CUDAExecutionProvider for GPU acceleration")
+                    else:
+                        providers = ['CPUExecutionProvider']
+                        print("Using CPUExecutionProvider (CUDA not available)")
+                        
+                except Exception as e:
+                    print(f"Error configuring providers: {e}, using default")
+                    providers = roop.globals.execution_providers
+            else:
+                # Fallback ke providers dari globals
+                providers = roop.globals.execution_providers
+                print(f"Using providers from globals: {providers}")
+                
             try:
                 FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=providers)
-                print("[get_face_swapper] loaded with providers:", providers)
+                print("Face swapper model loaded successfully")
             except Exception as e:
-                print(f"[get_face_swapper] primary load failed: {e}, trying CPU fallback")
+                print(f"Error loading face swapper model: {e}")
+                # Fallback ke CPU saja
                 try:
-                    FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=['CPUExecutionProvider'])
-                    print("[get_face_swapper] loaded with CPU fallback")
-                except Exception as e2:
-                    print(f"[get_face_swapper] CPU fallback failed: {e2}")
-                    raise e2
-            # Optional warm-up
-            if GPU_CONFIG.get('warmup', True):
-                try:
-                    warmup_input = np.zeros((128,128,3), dtype=np.uint8)
-                    # call minimal get to init kernels (paste_back False to save mem)
-                    FACE_SWAPPER.get(warmup_input, None, None, paste_back=False)
-                    print("[get_face_swapper] warmup done")
-                except Exception as e:
-                    print(f"[get_face_swapper] warmup failed: {e}")
+                    providers = ['CPUExecutionProvider']
+                    FACE_SWAPPER = insightface.model_zoo.get_model(model_path, providers=providers)
+                    print("Face swapper model loaded with CPU fallback")
+                except Exception as fallback_error:
+                    print(f"Critical error loading model: {fallback_error}")
+                    raise fallback_error
+                    
     return FACE_SWAPPER
 
-def clear_face_swapper():
+
+def clear_face_swapper() -> None:
     global FACE_SWAPPER
     FACE_SWAPPER = None
     clear_gpu_memory()
 
-# --- Frame helpers ---
-def ensure_frame_format(frame: Any) -> Optional[Frame]:
-    if frame is None:
-        return None
-    if isinstance(frame, np.ndarray) and frame.ndim == 3:
-        return frame
-    if isinstance(frame, tuple) or isinstance(frame, list):
-        try:
-            arr = np.array(frame)
-            if arr.size > 0 and arr.ndim >= 3:
-                return arr
-        except Exception:
-            pass
-    return None
 
-# --- Color correction (hybrid LAB + per-channel fallback) ---
-def color_correction_hybrid(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
-    """Combine LAB stats matching with per-channel fallback for robust mapping."""
-    try:
-        if target_face is None:
-            return swapped_face
-        x1, y1, x2, y2 = map(int, target_face.bbox)
-        h, w = target_frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return swapped_face
-        target_region = target_frame[y1:y2, x1:x2]
-        if target_region.size == 0 or swapped_face.size == 0:
-            return swapped_face
-        # Resize swapped face to match target region
-        if swapped_face.shape[:2] != target_region.shape[:2]:
-            swapped_face = cv2.resize(swapped_face, (target_region.shape[1], target_region.shape[0]))
-        # Try LAB-based correction
-        try:
-            swapped_lab = cv2.cvtColor(swapped_face, cv2.COLOR_BGR2LAB).astype(np.float32)
-            target_lab = cv2.cvtColor(target_region, cv2.COLOR_BGR2LAB).astype(np.float32)
-            s_mean, s_std = swapped_lab.mean(axis=(0,1)), swapped_lab.std(axis=(0,1))
-            t_mean, t_std = target_lab.mean(axis=(0,1)), target_lab.std(axis=(0,1))
-            s_std = np.where(s_std == 0, 1.0, s_std)
-            t_std = np.where(t_std == 0, 1.0, t_std)
-            corrected = (swapped_lab - s_mean) * (t_std / s_std) + t_mean
-            corrected = np.clip(corrected, 0, 255).astype(np.uint8)
-            corrected_face = cv2.cvtColor(corrected, cv2.COLOR_LAB2BGR)
-            # Blend to keep naturalness
-            blend_ratio = 0.5
-            result_face = cv2.addWeighted(swapped_face, 1 - blend_ratio, corrected_face, blend_ratio, 0)
-            return result_face
-        except Exception as e:
-            # Fallback: per-channel mean/std correction (RGB)
-            sf = swapped_face.astype(np.float32)
-            tf = target_region.astype(np.float32)
-            for c in range(3):
-                s_mean, s_std = sf[:,:,c].mean(), sf[:,:,c].std()
-                t_mean, t_std = tf[:,:,c].mean(), tf[:,:,c].std()
-                if s_std > 1 and t_std > 1:
-                    sf[:,:,c] = (sf[:,:,c] - s_mean) * (t_std / max(s_std,1e-6)) + t_mean
-                else:
-                    sf[:,:,c] += (t_mean - s_mean) * 0.3
-            result_face = np.clip(sf, 0, 255).astype(np.uint8)
-            return result_face
-    except Exception as e:
-        print(f"[color_correction_hybrid] error: {e}")
-        return swapped_face
-
-# --- Mask creation (robust & adaptive) ---
-def create_adaptive_mask(face: Face, frame_shape: Tuple[int,int]) -> np.ndarray:
-    """Create an elliptical mask with dynamic kernel for smooth blending."""
-    try:
-        mask = np.zeros(frame_shape[:2], dtype=np.float32)
-        x1, y1, x2, y2 = map(int, face.bbox)
-        h, w = frame_shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        if x2 <= x1 or y2 <= y1:
-            return mask
-        cx, cy = (x1+x2)//2, (y1+y2)//2
-        width, height = x2-x1, y2-y1
-        # ellipse
-        cv2.ellipse(mask, (cx, cy), (max(1,width//2), max(1,height//2)), 0, 0, 360, 1.0, -1)
-        # gaussian blur kernel adaptive
-        k = max(15, min(width, height)//8)
-        if k % 2 == 0:
-            k += 1
-        k = min(k, 81)
-        mask = cv2.GaussianBlur(mask, (k,k), 0)
-        return np.clip(mask, 0.0, 1.0)
-    except Exception as e:
-        print(f"[create_adaptive_mask] error: {e}")
-        # fallback simple rectangle
-        mask = np.zeros(frame_shape[:2], dtype=np.float32)
-        try:
-            x1, y1, x2, y2 = map(int, face.bbox)
-            mask[y1:y2, x1:x2] = 1.0
-            mask = cv2.GaussianBlur(mask, (51,51), 0)
-            return np.clip(mask,0,1)
-        except:
-            return np.zeros(frame_shape[:2], dtype=np.float32)
-
-# --- Face quality enhancement (light & fast) ---
-def enhance_face_quality_fast(face: Frame) -> Frame:
-    try:
-        if face is None:
-            return face
-        arr = ensure_frame_format(face)
-        if arr is None:
-            return face
-        # mild unsharp mask (fast)
-        blurred = cv2.GaussianBlur(arr, (0,0), 1.0)
-        sharpened = cv2.addWeighted(arr, 1.4, blurred, -0.4, 0)
-        # fast bilateral denoise with small params
-        denoised = cv2.bilateralFilter(sharpened, 3, 20, 20)
-        return denoised
-    except Exception as e:
-        print(f"[enhance_face_quality_fast] {e}")
-        return face
-
-# --- Blending: optimized alpha blending with seamless fallback ---
-def optimized_blend(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
-    try:
-        if target_face is None:
-            return target_frame
-        x1, y1, x2, y2 = map(int, target_face.bbox)
-        h, w = target_frame.shape[:2]
-        x1, y1 = max(0,x1), max(0,y1)
-        x2, y2 = min(w,x2), min(h,y2)
-        if x2 <= x1 or y2 <= y1:
-            return target_frame
-        face_h, face_w = y2-y1, x2-x1
-        if swapped_face.shape[:2] != (face_h, face_w):
-            swapped_face = cv2.resize(swapped_face, (face_w, face_h))
-        # try seamlessClone first (usually best)
-        try:
-            mask = 255 * np.ones(swapped_face.shape, swapped_face.dtype)
-            center = ((x1+x2)//2, (y1+y2)//2)
-            return cv2.seamlessClone(swapped_face, target_frame, mask, center, cv2.NORMAL_CLONE)
-        except Exception:
-            # fallback to alpha blending with adaptive mask
-            mask = create_adaptive_mask(target_face, target_frame.shape)
-            mask_region = mask[y1:y2, x1:x2]
-            if mask_region.shape != swapped_face.shape[:2]:
-                mask_region = cv2.resize(mask_region, (swapped_face.shape[1], swapped_face.shape[0]))
-            mask3 = np.stack([mask_region]*3, axis=-1)
-            region = target_frame[y1:y2, x1:x2].astype(np.float32)
-            blended = swapped_face.astype(np.float32) * mask3 + region * (1 - mask3)
-            out = target_frame.copy()
-            out[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
-            return out
-    except Exception as e:
-        print(f"[optimized_blend] error: {e}")
-        return target_frame
-
-# --- Single-frame swap pipeline ---
-def swap_face_pipeline(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    try:
-        face_swapper = get_face_swapper()
-        # get swapped face (paste_back False to get face image and let us blend)
-        swapped_result = face_swapper.get(temp_frame, target_face, source_face, paste_back=False)
-        swapped_frame = ensure_frame_format(swapped_result)
-        if swapped_frame is None:
-            # fallback to paste_back True single call
-            return face_swapper.get(temp_frame, target_face, source_face, paste_back=True)
-        # color correct
-        swapped_frame = color_correction_hybrid(swapped_frame, temp_frame, target_face)
-        # enhance
-        swapped_frame = enhance_face_quality_fast(swapped_frame)
-        # blend
-        result = optimized_blend(swapped_frame, temp_frame, target_face)
-        return result
-    except Exception as e:
-        print(f"[swap_face_pipeline] error: {e}")
-        try:
-            return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
-        except Exception as e2:
-            print(f"[swap_face_pipeline] fallback error: {e2}")
-            return temp_frame
-
-# --- Batch / frames processing (dynamic batch size + memory management) ---
-def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-    """Main entrypoint: processes list of frame file paths with hybrid optimizations."""
-    try:
-        # get source face once
-        src_img = cv2.imread(source_path)
-        source_face = get_one_face(src_img)
-        if source_face is None:
-            print("[process_frames] no source face detected")
-            return
-        total = len(temp_frame_paths)
-        if total == 0:
-            return
-        # choose parallelism based on GPU presence
-        gpu_available = TORCH_AVAILABLE and torch.cuda.is_available()
-        max_workers = GPU_CONFIG['max_workers_high_vram'] if gpu_available else GPU_CONFIG['max_workers_low_vram']
-        batch_size = GPU_CONFIG['batch_size_high_vram'] if gpu_available else GPU_CONFIG['batch_size_low_vram']
-        memory_clear_interval = GPU_CONFIG['memory_clear_interval']
-
-        print(f"[process_frames] total={total}, gpu={gpu_available}, max_workers={max_workers}, batch_size={batch_size}")
-
-        processed = 0
-        for i in range(0, total, batch_size):
-            batch = temp_frame_paths[i:i+batch_size]
-            # Use threaded workers but limit concurrency to avoid OOM
-            with ThreadPoolExecutor(max_workers=max_workers) as exe:
-                futures = {exe.submit(_process_single_path, p, source_face): p for p in batch}
-                for fut in as_completed(futures):
-                    p = futures[fut]
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        print(f"[process_frames] error processing {p}: {e}")
-                    processed += 1
-                    if update:
-                        update()
-            # periodic memory clear
-            if processed % memory_clear_interval == 0:
-                clear_gpu_memory()
-                print(f"[process_frames] processed {processed}/{total} - memory cleared")
-        print(f"[process_frames] completed {processed}/{total}")
-    except Exception as e:
-        print(f"[process_frames] critical error: {e}")
-    finally:
-        clear_gpu_memory()
-
-def _process_single_path(path: str, source_face: Face) -> None:
-    try:
-        if not os.path.exists(path):
-            print(f"[worker] missing frame: {path}")
-            return
-        frame = cv2.imread(path)
-        if frame is None:
-            print(f"[worker] cannot read: {path}")
-            return
-        if roop.globals.many_faces:
-            many = get_many_faces(frame)
-            if many:
-                for tface in many:
-                    frame = swap_face_pipeline(source_face, tface, frame)
-        else:
-            ref = get_face_reference()
-            if ref is None:
-                # find similar face on-the-fly
-                target_face = find_similar_face(frame, None)
-            else:
-                target_face = find_similar_face(frame, ref)
-            if target_face:
-                frame = swap_face_pipeline(source_face, target_face, frame)
-        cv2.imwrite(path, frame)
-    except Exception as e:
-        print(f"[_process_single_path] error: {e}")
-
-# --- Image / Video helpers for compatibility ---
-def process_image(source_path: str, target_path: str, output_path: str) -> None:
-    try:
-        src_face = get_one_face(cv2.imread(source_path))
-        if src_face is None:
-            print("[process_image] no source face")
-            return
-        frame = cv2.imread(target_path)
-        if frame is None:
-            print("[process_image] cannot read target")
-            return
-        if roop.globals.many_faces:
-            many = get_many_faces(frame)
-            if many:
-                for t in many:
-                    frame = swap_face_pipeline(src_face, t, frame)
-        else:
-            ref = get_face_reference()
-            target_face = find_similar_face(frame, ref)
-            if target_face:
-                frame = swap_face_pipeline(src_face, target_face, frame)
-        cv2.imwrite(output_path, frame)
-        print(f"[process_image] saved {output_path}")
-    except Exception as e:
-        print(f"[process_image] error: {e}")
-    finally:
-        clear_gpu_memory()
-
-def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
-    try:
-        if not roop.globals.many_faces and not get_face_reference():
-            if temp_frame_paths and roop.globals.reference_frame_number < len(temp_frame_paths):
-                reference_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
-                if reference_frame is not None:
-                    reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
-                    if reference_face is not None:
-                        set_face_reference(reference_face)
-        roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
-    except Exception as e:
-        print(f"[process_video] error: {e}")
-    finally:
-        clear_gpu_memory()
-
-# --- Pre/post checks ---
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
     conditional_download(download_directory_path, ['https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx'])
     return True
+
 
 def pre_start() -> bool:
     if not is_image(roop.globals.source_path):
@@ -435,83 +134,422 @@ def pre_start() -> bool:
         return False
     return True
 
+
 def post_process() -> None:
     clear_face_swapper()
     clear_face_reference()
     clear_gpu_memory()
 
-# ---------------------------------------------------------
-# FIX: Compatibility layer for ROOP core
-# Required by frame processor interface
-# ---------------------------------------------------------
 
-def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
-    """ROOP-compatible single frame processor"""
+def ensure_frame_format(frame: Any) -> Optional[Frame]:
+    """Ensure the frame is in correct numpy array format"""
+    if frame is None:
+        return None
+    
+    # If it's already a numpy array with correct shape
+    if isinstance(frame, np.ndarray) and len(frame.shape) == 3:
+        return frame
+    
+    # If it's a tuple (likely from face swapper), convert to numpy array
+    if isinstance(frame, tuple):
+        try:
+            # Try to convert tuple to numpy array
+            frame_array = np.array(frame)
+            if frame_array.size > 0:
+                return frame_array
+        except:
+            pass
+    
+    return None
+
+
+def optimized_color_correction(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    """Color correction yang lebih efisien untuk GPU"""
+    try:
+        if target_face is None:
+            return swapped_face
+        
+        # Extract target face region untuk color reference
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        h, w = target_frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        # Cek jika region valid
+        if x2 <= x1 or y2 <= y1:
+            return swapped_face
+            
+        target_region = target_frame[y1:y2, x1:x2]
+        
+        if target_region.size == 0 or swapped_face.size == 0:
+            return swapped_face
+        
+        # Resize swapped face untuk match target region jika diperlukan
+        if swapped_face.shape[:2] != target_region.shape[:2]:
+            swapped_face = cv2.resize(swapped_face, (target_region.shape[1], target_region.shape[0]))
+        
+        # Simple color matching yang robust
+        swapped_face_float = swapped_face.astype(np.float32)
+        target_region_float = target_region.astype(np.float32)
+        
+        # Match color statistics per channel
+        for channel in range(3):
+            swapped_mean = np.mean(swapped_face_float[:,:,channel])
+            target_mean = np.mean(target_region_float[:,:,channel])
+            swapped_std = np.std(swapped_face_float[:,:,channel])
+            target_std = np.std(target_region_float[:,:,channel])
+            
+            # Avoid division by zero
+            if swapped_std > 1.0 and target_std > 1.0:
+                swapped_face_float[:,:,channel] = (
+                    (swapped_face_float[:,:,channel] - swapped_mean) * 
+                    (target_std / swapped_std) + target_mean
+                )
+            else:
+                # Simple mean matching
+                swapped_face_float[:,:,channel] += (target_mean - swapped_mean) * 0.3
+        
+        result_face = np.clip(swapped_face_float, 0, 255).astype(np.uint8)
+        
+        # Mild blending dengan original
+        blend_ratio = 0.3
+        result_face = cv2.addWeighted(swapped_face, 1 - blend_ratio, result_face, blend_ratio, 0)
+        
+        return result_face
+        
+    except Exception as e:
+        print(f"Optimized color correction error: {e}")
+        return swapped_face
+
+
+def create_optimized_mask(face: Face, frame_shape: Tuple[int, int]) -> np.ndarray:
+    """Create optimized mask untuk blending"""
+    try:
+        mask = np.zeros(frame_shape[:2], dtype=np.float32)
+        
+        x1, y1, x2, y2 = map(int, face.bbox)
+        
+        # Pastikan coordinates dalam bounds
+        h, w = frame_shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return mask
+            
+        # Create elliptical mask
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        width = x2 - x1
+        height = y2 - y1
+        
+        # Create ellipse dengan parameter yang optimal
+        cv2.ellipse(mask, (center_x, center_y), (width//2, height//2), 0, 0, 360, 1.0, -1)
+        
+        # Apply Gaussian blur untuk smooth edges
+        kernel_size = max(15, min(width, height) // 10)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel_size = min(kernel_size, 51)  # Batasi maximum size
+        
+        mask = cv2.GaussianBlur(mask, (kernel_size, kernel_size), 0)
+        
+        return np.clip(mask, 0, 1)
+        
+    except Exception as e:
+        print(f"Optimized mask creation error: {e}")
+        # Fallback ke simple rectangular mask
+        try:
+            mask = np.zeros(frame_shape[:2], dtype=np.float32)
+            x1, y1, x2, y2 = map(int, face.bbox)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(frame_shape[1], x2), min(frame_shape[0], y2)
+            mask[y1:y2, x1:x2] = 1.0
+            mask = cv2.GaussianBlur(mask, (51, 51), 0)
+            return mask
+        except:
+            return np.zeros(frame_shape[:2], dtype=np.float32)
+
+
+def enhance_face_quality(face: Frame) -> Frame:
+    """Simple face quality enhancement yang dioptimalkan"""
+    try:
+        if face is None:
+            return face
+            
+        # Ensure it's a numpy array
+        face_array = ensure_frame_format(face)
+        if face_array is None:
+            return face
+            
+        # Mild sharpening
+        kernel = np.array([[0, -0.25, 0],
+                          [-0.25,  2, -0.25],
+                          [0, -0.25, 0]])
+        
+        sharpened = cv2.filter2D(face_array, -1, kernel)
+        
+        # Mild bilateral filter untuk noise reduction
+        denoised = cv2.bilateralFilter(sharpened, 3, 15, 15)
+        
+        return denoised
+        
+    except Exception as e:
+        print(f"Face enhancement error: {e}")
+        return face
+
+
+def optimized_seamless_blending(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    """Optimized seamless blending dengan fallback"""
+    try:
+        if target_face is None:
+            return target_frame
+            
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        h, w = target_frame.shape[:2]
+        
+        # Ensure coordinates are within bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return target_frame
+        
+        # Ensure swapped face has correct size
+        face_height, face_width = y2 - y1, x2 - x1
+        if swapped_face.shape[0] != face_height or swapped_face.shape[1] != face_width:
+            swapped_face = cv2.resize(swapped_face, (face_width, face_height))
+        
+        # Coba seamless clone terlebih dahulu
+        try:
+            mask = 255 * np.ones(swapped_face.shape, swapped_face.dtype)
+            center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            result = cv2.seamlessClone(swapped_face, target_frame, mask, center, cv2.NORMAL_CLONE)
+            return result
+        except Exception as seamless_error:
+            print(f"Seamless clone failed, using alpha blending: {seamless_error}")
+            return optimized_alpha_blending(swapped_face, target_frame, target_face)
+        
+    except Exception as e:
+        print(f"Optimized seamless blending error: {e}")
+        return optimized_alpha_blending(swapped_face, target_frame, target_face)
+
+
+def optimized_alpha_blending(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    """Optimized alpha blending dengan memory efficiency"""
+    try:
+        if target_face is None:
+            return target_frame
+            
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        h, w = target_frame.shape[:2]
+        
+        # Ensure coordinates are within bounds
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return target_frame
+        
+        # Ensure swapped face has correct size
+        face_height, face_width = y2 - y1, x2 - x1
+        if swapped_face.shape[0] != face_height or swapped_face.shape[1] != face_width:
+            swapped_face = cv2.resize(swapped_face, (face_width, face_height))
+        
+        # Create optimized mask
+        mask = create_optimized_mask(target_face, target_frame.shape)
+        mask_region = mask[y1:y2, x1:x2]
+        
+        # Ensure mask has correct dimensions
+        if mask_region.shape != swapped_face.shape[:2]:
+            mask_region = cv2.resize(mask_region, (swapped_face.shape[1], swapped_face.shape[0]))
+        
+        # Optimized blending dengan operasi numpy
+        result = target_frame.copy()
+        face_region = result[y1:y2, x1:x2]
+        
+        # Create 3-channel mask
+        mask_3d = np.stack([mask_region] * 3, axis=-1)
+        
+        # Blend operation
+        blended_face = (swapped_face.astype(np.float32) * mask_3d + 
+                       face_region.astype(np.float32) * (1 - mask_3d))
+        
+        result[y1:y2, x1:x2] = np.clip(blended_face, 0, 255).astype(np.uint8)
+        
+        return result
+        
+    except Exception as e:
+        print(f"Optimized alpha blending error: {e}")
+        return target_frame
+
+
+def swap_face_optimized(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
+    """Optimized face swapping dengan GPU efficiency"""
+    try:
+        # Get face swapper instance
+        face_swapper = get_face_swapper()
+        
+        # Get basic face swap
+        swapped_result = face_swapper.get(temp_frame, target_face, source_face, paste_back=False)
+        
+        # Ensure proper format
+        swapped_frame = ensure_frame_format(swapped_result)
+        if swapped_frame is None:
+            # Fallback ke original method
+            return face_swapper.get(temp_frame, target_face, source_face, paste_back=True)
+        
+        # Apply optimized color correction
+        swapped_frame = optimized_color_correction(swapped_frame, temp_frame, target_face)
+        
+        # Enhance face quality
+        swapped_frame = enhance_face_quality(swapped_frame)
+        
+        # Apply optimized blending
+        result_frame = optimized_seamless_blending(swapped_frame, temp_frame, target_face)
+        
+        return result_frame
+        
+    except Exception as e:
+        print(f"Optimized face swap error: {e}")
+        # Fallback ke original face swapper
+        try:
+            return get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
+        except Exception as fallback_error:
+            print(f"Critical face swap error: {fallback_error}")
+            return temp_frame
+
+
+def process_frame_batch(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
+    """Process frame dengan batch optimization untuk multiple faces"""
     try:
         if roop.globals.many_faces:
-            many = get_many_faces(temp_frame)
-            if many:
-                for tf in many:
-                    temp_frame = swap_face_pipeline(source_face, tf, temp_frame)
+            many_faces = get_many_faces(temp_frame)
+            if many_faces:
+                # Process semua wajah
+                for target_face in many_faces:
+                    temp_frame = swap_face_optimized(source_face, target_face, temp_frame)
         else:
-            if reference_face is None:
-                target_face = find_similar_face(temp_frame, None)
-            else:
-                target_face = find_similar_face(temp_frame, reference_face)
-
+            target_face = find_similar_face(temp_frame, reference_face)
             if target_face:
-                temp_frame = swap_face_pipeline(source_face, target_face, temp_frame)
-
+                temp_frame = swap_face_optimized(source_face, target_face, temp_frame)
         return temp_frame
-
     except Exception as e:
-        print(f"[process_frame] error: {e}")
+        print(f"Process frame batch error: {e}")
         return temp_frame
 
 
-def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-    """ROOP-compatible multi-frame processor"""
+def process_frames_optimized(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    """Process multiple frames dengan memory management yang lebih baik"""
     try:
-        source_img = cv2.imread(source_path)
-        source_face = get_one_face(source_img)
-        reference_face = get_face_reference() if not roop.globals.many_faces else None
-
-        for frame_path in temp_frame_paths:
-            frame = cv2.imread(frame_path)
-            if frame is None:
-                print(f"[process_frames] cannot read: {frame_path}")
+        source_face = get_one_face(cv2.imread(source_path))
+        if source_face is None:
+            print("No source face detected")
+            return
+            
+        reference_face = None if roop.globals.many_faces else get_face_reference()
+        
+        total_frames = len(temp_frame_paths)
+        print(f"Processing {total_frames} frames with optimized GPU pipeline")
+        
+        # Dynamic batch size
+        if total_frames > 100:
+            batch_size = 10
+            memory_clear_interval = 25
+        elif total_frames > 50:
+            batch_size = 8
+            memory_clear_interval = 20
+        else:
+            batch_size = 5
+            memory_clear_interval = 10
+        
+        processed_count = 0
+        
+        for i in range(0, total_frames, batch_size):
+            batch_paths = temp_frame_paths[i:i + batch_size]
+            
+            try:
+                for temp_frame_path in batch_paths:
+                    if not os.path.exists(temp_frame_path):
+                        print(f"Frame not found: {temp_frame_path}")
+                        continue
+                        
+                    temp_frame = cv2.imread(temp_frame_path)
+                    if temp_frame is not None:
+                        result = process_frame_batch(source_face, reference_face, temp_frame)
+                        cv2.imwrite(temp_frame_path, result)
+                        processed_count += 1
+                    
+                    if update:
+                        update()
+                
+                # Clear memory secara berkala
+                if processed_count % memory_clear_interval == 0:
+                    clear_gpu_memory()
+                    print(f"Processed {processed_count}/{total_frames} frames - Memory cleared")
+                    
+            except Exception as e:
+                print(f"Error processing batch starting at {i}: {e}")
                 continue
-
-            result = process_frame(source_face, reference_face, frame)
-            cv2.imwrite(frame_path, result)
-
-            if update:
-                update()
-
+                
+        print(f"Completed processing {processed_count}/{total_frames} frames")
+                
     except Exception as e:
-        print(f"[process_frames] fatal: {e}")
+        print(f"Process frames optimized error: {e}")
     finally:
         clear_gpu_memory()
+
+
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
+    """Process single image dengan optimized face swapping"""
+    try:
+        source_face = get_one_face(cv2.imread(source_path))
+        if source_face is None:
+            print("No face found in source image")
+            return
+            
+        target_frame = cv2.imread(target_path)
+        if target_frame is None:
+            print("Cannot read target image")
+            return
+            
+        reference_face = None if roop.globals.many_faces else get_one_face(target_frame, roop.globals.reference_face_position)
+        result = process_frame_batch(source_face, reference_face, target_frame)
+        cv2.imwrite(output_path, result)
+        print(f"Image processed and saved to: {output_path}")
+    except Exception as e:
+        print(f"Process image error: {e}")
 
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
-    """ROOP-compatible video processor"""
+    """Process video dengan optimasi GPU"""
     try:
         if not roop.globals.many_faces and not get_face_reference():
-            if temp_frame_paths:
-            # refresh reference face
-                ref_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
-                if ref_frame is not None:
-                    ref_face = get_one_face(ref_frame)
-                    if ref_face is not None:
-                        set_face_reference(ref_face)
-
-        # ROOP's master pipeline
-        roop.processors.frame.core.process_video(
-            source_path, temp_frame_paths, process_frames
-        )
-
+            if temp_frame_paths and roop.globals.reference_frame_number < len(temp_frame_paths):
+                reference_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
+                if reference_frame is not None:
+                    reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
+                    if reference_face is not None:
+                        set_face_reference(reference_face)
+                    else:
+                        print("No reference face found in reference frame")
+                else:
+                    print("Cannot read reference frame")
+        
+        # Gunakan fungsi optimized
+        roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames_optimized)
     except Exception as e:
-        print(f"[process_video] error: {e}")
+        print(f"Process video error: {e}")
     finally:
         clear_gpu_memory()
+
+
+# Backward compatibility functions
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
+    """Alias untuk compatibility"""
+    return process_frame_batch(source_face, reference_face, temp_frame)
+
+
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    """Alias untuk compatibility"""
+    process_frames_optimized(source_path, temp_frame_paths, update)
