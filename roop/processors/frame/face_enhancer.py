@@ -1,7 +1,9 @@
 from typing import Any, List, Callable
 import cv2
 import threading
-from gfpgan.utils import GFPGANer
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from codeformer.codeformer_arch import CodeFormer
 
 import roop.globals
 import roop.processors.frame.core
@@ -13,19 +15,12 @@ from roop.utilities import conditional_download, resolve_relative_path, is_image
 FACE_ENHANCER = None
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-ENHANCER'
+NAME = 'ROOP.CODEFORMER-TENSORCORE'
 
 
-def get_face_enhancer() -> Any:
-    global FACE_ENHANCER
-
-    with THREAD_LOCK:
-        if FACE_ENHANCER is None:
-            model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
-            # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
-            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
-    return FACE_ENHANCER
-
+# =============================
+#  GPU OPTIMIZATION DETECTOR
+# =============================
 
 def get_device() -> str:
     if 'CUDAExecutionProvider' in roop.globals.execution_providers:
@@ -35,15 +30,56 @@ def get_device() -> str:
     return 'cpu'
 
 
-def clear_face_enhancer() -> None:
+def gpu_info():
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        return name
+    return "CPU"
+
+
+# =============================
+#  LOAD CODEFORMER ON TENSORCORE
+# =============================
+
+def get_face_enhancer() -> Any:
     global FACE_ENHANCER
 
+    with THREAD_LOCK:
+        if FACE_ENHANCER is None:
+            model_path = resolve_relative_path('../models/codeformer.pth')
+            device = get_device()
+
+            net = CodeFormer()
+            ckpt = torch.load(model_path, map_location=device)
+            net.load_state_dict(ckpt['params_ema'], strict=True)
+
+            # FP16 → SUPER FAST untuk T4 / L4 / A100
+            net = net.half().to(device)
+
+            # A100 bisa compile → boost speed 20–40%
+            if "A100" in gpu_info():
+                net = torch.compile(net, mode="reduce-overhead")
+
+            net.eval()
+            FACE_ENHANCER = net
+
+    return FACE_ENHANCER
+
+
+# =============================
+#  PREP & UTILITY
+# =============================
+
+def clear_face_enhancer() -> None:
+    global FACE_ENHANCER
     FACE_ENHANCER = None
 
 
 def pre_check() -> bool:
-    download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth'])
+    conditional_download(
+        resolve_relative_path('../models'),
+        ["https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth"]
+    )
     return True
 
 
@@ -54,70 +90,81 @@ def pre_start() -> bool:
     return True
 
 
-def post_process() -> None:
-    clear_face_enhancer()
-
+# =============================
+#  FACE ENHANCEMENT CORE
+# =============================
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    frame_height, frame_width = temp_frame.shape[:2]
-    start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
-    
-    # Hitung ukuran wajah
-    face_w, face_h = end_x - start_x, end_y - start_y
-    if face_w <= 0 or face_h <= 0:
+    h, w = temp_frame.shape[:2]
+    x1, y1, x2, y2 = map(int, target_face['bbox'])
+
+    fw, fh = x2 - x1, y2 - y1
+    if fw <= 0 or fh <= 0:
         return temp_frame
 
-    # Padding adaptif (minimal 10%, maksimal 30% tergantung ukuran)
-    pad_ratio = max(0.1, min(0.3, 100 / max(face_w, face_h)))
-    padding_x = int(face_w * pad_ratio)
-    padding_y = int(face_h * pad_ratio)
-    
-    # Pastikan tidak melebihi batas frame
-    start_x = max(0, start_x - padding_x)
-    start_y = max(0, start_y - padding_y)
-    end_x = min(frame_width, end_x + padding_x)
-    end_y = min(frame_height, end_y + padding_y)
-    
-    temp_face = temp_frame[start_y:end_y, start_x:end_x]
-    if temp_face.size == 0:
+    pad = max(0.12, min(0.32, 100 / max(fw, fh)))
+    px, py = int(fw * pad), int(fh * pad)
+
+    x1, y1 = max(0, x1 - px), max(0, y1 - py)
+    x2, y2 = min(w, x2 + px), min(h, y2 + py)
+
+    crop = temp_frame[y1:y2, x1:x2]
+    if crop.size == 0:
         return temp_frame
 
-    with THREAD_SEMAPHORE:
-        try:
-            _, _, enhanced_face = get_face_enhancer().enhance(
-                temp_face,
-                paste_back=True
-            )
-            # Pastikan ukuran cocok (karena kadang enhancer ubah resolusi)
-            if enhanced_face.shape == temp_face.shape:
-                temp_frame[start_y:end_y, start_x:end_x] = enhanced_face
-        except Exception as e:
-            print(f"[WARNING] Enhance face failed: {e}")
-    
+    device = get_device()
+    net = get_face_enhancer()
+
+    try:
+        with THREAD_SEMAPHORE:
+
+            img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            img = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+            img = img.unsqueeze(0).to(device)
+
+            # FP16 autocast → super fast on T4/L4/A100
+            img = img.half()
+
+            with torch.cuda.amp.autocast(enabled=True):
+
+                out = net(img, w=0.65)[0]
+                out = out.clamp(0, 1)
+
+            out_np = (out.squeeze().permute(1, 2, 0).cpu().float().numpy() * 255).astype("uint8")
+            out_np = cv2.cvtColor(out_np, cv2.COLOR_RGB2BGR)
+
+            if out_np.shape == crop.shape:
+                temp_frame[y1:y2, x1:x2] = out_np
+
+    except Exception as e:
+        print("[CodeFormer ERROR]", e)
+
     return temp_frame
 
+
+# =============================
+#  MAIN PIPELINE
+# =============================
 
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
-    many_faces = get_many_faces(temp_frame)
-    if many_faces:
-        for target_face in many_faces:
-            temp_frame = enhance_face(target_face, temp_frame)
+    for face in get_many_faces(temp_frame):
+        temp_frame = enhance_face(face, temp_frame)
     return temp_frame
 
 
-def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-    for temp_frame_path in temp_frame_paths:
-        temp_frame = cv2.imread(temp_frame_path)
-        result = process_frame(None, None, temp_frame)
-        cv2.imwrite(temp_frame_path, result)
+def process_frames(source_path: str, paths: List[str], update: Callable[[], None]) -> None:
+    for p in paths:
+        frame = cv2.imread(p)
+        frame = process_frame(None, None, frame)
+        cv2.imwrite(p, frame)
         if update:
             update()
 
 
-def process_image(source_path: str, target_path: str, output_path: str) -> None:
-    target_frame = cv2.imread(target_path)
-    result = process_frame(None, None, target_frame)
-    cv2.imwrite(output_path, result)
+def process_image(source_path: str, target_path: str, output: str) -> None:
+    img = cv2.imread(target_path)
+    img = process_frame(None, None, img)
+    cv2.imwrite(output, img)
 
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
