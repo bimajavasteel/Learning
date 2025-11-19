@@ -18,11 +18,4 @@ tensorflow==2.13.0
 opennsfw2==0.10.2
 protobuf==4.23.4
 tqdm==4.65.0
-
-# HAPUS GFPGAN dan tambah CodeFormer dependencies:
-torch>=1.13.0
-torchvision>=0.14.0
-# basicsr dan facexlib sudah ada, tapi perlu versi yang kompatibel
-basicsr>=1.4.2
-facexlib>=0.3.0
-realesrgan>=0.3.0
+gfpgan==1.3.8
