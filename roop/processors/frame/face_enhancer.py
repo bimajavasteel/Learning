@@ -1,11 +1,8 @@
 from typing import Any, List, Callable
 import cv2
 import threading
-import torch
-import numpy as np
-
-from codeformer.codeformer_arch import CodeFormer
-from basicsr.utils import img2tensor, tensor2img
+from basicsr.utils.download_util import load_file_from_url
+from codeformer_app import CodeFormerEnhancer
 
 import roop.globals
 import roop.processors.frame.core
@@ -15,118 +12,175 @@ from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
 FACE_ENHANCER = None
-THREAD_LOCK = threading.Lock()
 THREAD_SEMAPHORE = threading.Semaphore()
-NAME = "ROOP.CODEFORMER"
+THREAD_LOCK = threading.Lock()
+NAME = 'ROOP.FACE-ENHANCER'
 
+# CodeFormer enhancer class
+class CodeFormerEnhancer:
+    def __init__(self, model_path: str, device: str = 'cuda'):
+        self.model_path = model_path
+        self.device = device
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load CodeFormer model"""
+        try:
+            from codeformer import CodeFormer
+            self.model = CodeFormer(
+                model_path=self.model_path,
+                upscale=1,
+                bg_upsampler=None,
+                face_upsample=True,
+                device=self.device
+            )
+        except Exception as e:
+            print(f"Error loading CodeFormer model: {e}")
+            self.model = None
+    
+    def enhance(self, image, paste_back: bool = True):
+        """
+        Enhance face using CodeFormer
+        Returns: (cropped_face, restored_face, enhanced_face)
+        """
+        if self.model is None:
+            return None, None, image
+        
+        try:
+            # CodeFormer returns (restored_img, cropped_faces, restored_faces)
+            restored_img, _, restored_faces = self.model.enhance(
+                image,
+                has_aligned=False,
+                only_center_face=False,
+                draw_box=False,
+                fidelity_weight=0.5  # Balance between quality and fidelity
+            )
+            
+            if restored_img is not None:
+                return None, None, restored_img
+            return None, None, image
+        except Exception as e:
+            print(f"CodeFormer enhancement error: {e}")
+            return None, None, image
 
-def get_device():
-    if 'CUDAExecutionProvider' in roop.globals.execution_providers:
-        return "cuda"
-    return "cpu"
-
-
-def get_face_enhancer():
+def get_face_enhancer() -> Any:
     global FACE_ENHANCER
+
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
-            model_path = resolve_relative_path("../models/codeformer.pth")
-            device = get_device()
-
-            net = CodeFormer(dim_emb=512, codebook_size=1024)
-            ckpt = torch.load(model_path, map_location=device)
-            net.load_state_dict(ckpt["params_ema"])
-            net.to(device)
-            net.eval()
-
-            FACE_ENHANCER = net
+            model_path = resolve_relative_path('../models/codeformer.pth')
+            # Download model if not exists
+            if not os.path.exists(model_path):
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                load_file_from_url(
+                    url='https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth',
+                    model_dir=os.path.dirname(model_path),
+                    file_name='codeformer.pth'
+                )
+            FACE_ENHANCER = CodeFormerEnhancer(model_path=model_path, device=get_device())
     return FACE_ENHANCER
 
 
-def clear_face_enhancer():
+def get_device() -> str:
+    if 'CUDAExecutionProvider' in roop.globals.execution_providers:
+        return 'cuda'
+    if 'CoreMLExecutionProvider' in roop.globals.execution_providers:
+        return 'mps'
+    return 'cpu'
+
+
+def clear_face_enhancer() -> None:
     global FACE_ENHANCER
+
     FACE_ENHANCER = None
 
 
-def pre_check():
-    conditional_download(
-        resolve_relative_path("../models"),
-        ["https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth"]
-    )
+def pre_check() -> bool:
+    download_directory_path = resolve_relative_path('../models')
+    conditional_download(download_directory_path, [
+        'https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth'
+    ])
     return True
 
 
-def pre_start():
+def pre_start() -> bool:
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status("Select an image or video for target path.", NAME)
+        update_status('Select an image or video for target path.', NAME)
         return False
     return True
 
 
-def enhance_face(target_face: Face, temp_frame: Frame):
-    h, w = temp_frame.shape[:2]
-    x1, y1, x2, y2 = map(int, target_face["bbox"])
+def post_process() -> None:
+    clear_face_enhancer()
 
-    fw, fh = x2 - x1, y2 - y1
-    if fw <= 0 or fh <= 0:
+
+def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
+    frame_height, frame_width = temp_frame.shape[:2]
+    start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
+    
+    # Hitung ukuran wajah
+    face_w, face_h = end_x - start_x, end_y - start_y
+    if face_w <= 0 or face_h <= 0:
         return temp_frame
 
-    pad = max(0.10, min(0.30, 100 / max(fw, fh)))
-    px, py = int(fw * pad), int(fh * pad)
-
-    x1 = max(0, x1 - px)
-    y1 = max(0, y1 - py)
-    x2 = min(w, x2 + px)
-    y2 = min(h, y2 + py)
-
-    crop = temp_frame[y1:y2, x1:x2]
-    if crop.size == 0:
+    # Padding adaptif (minimal 10%, maksimal 30% tergantung ukuran)
+    pad_ratio = max(0.1, min(0.3, 100 / max(face_w, face_h)))
+    padding_x = int(face_w * pad_ratio)
+    padding_y = int(face_h * pad_ratio)
+    
+    # Pastikan tidak melebihi batas frame
+    start_x = max(0, start_x - padding_x)
+    start_y = max(0, start_y - padding_y)
+    end_x = min(frame_width, end_x + padding_x)
+    end_y = min(frame_height, end_y + padding_y)
+    
+    temp_face = temp_frame[start_y:end_y, start_x:end_x]
+    if temp_face.size == 0:
         return temp_frame
 
-    device = get_device()
-
-    try:
-        with THREAD_SEMAPHORE:
-            net = get_face_enhancer()
-
-            img = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            tensor = img2tensor(img / 255.0).float().unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                output = net(tensor, w=0.65)[0]
-
-            result = tensor2img(output.cpu().clamp(0, 1))
-            result = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
-
-            if result.shape == crop.shape:
-                temp_frame[y1:y2, x1:x2] = result
-
-    except Exception as e:
-        print("[CodeFormer ERROR]", e)
-
+    with THREAD_SEMAPHORE:
+        try:
+            # CodeFormer enhancement
+            _, _, enhanced_face = get_face_enhancer().enhance(
+                temp_face,
+                paste_back=True
+            )
+            
+            # Ensure the enhanced face has proper size
+            if enhanced_face is not None and enhanced_face.size > 0:
+                if enhanced_face.shape != temp_face.shape:
+                    enhanced_face = cv2.resize(enhanced_face, (temp_face.shape[1], temp_face.shape[0]))
+                
+                temp_frame[start_y:end_y, start_x:end_x] = enhanced_face
+        except Exception as e:
+            print(f"[WARNING] CodeFormer enhance face failed: {e}")
+    
     return temp_frame
 
 
-def process_frame(source_face, reference_face, frame):
-    for face in get_many_faces(frame):
-        frame = enhance_face(face, frame)
-    return frame
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
+    many_faces = get_many_faces(temp_frame)
+    if many_faces:
+        for target_face in many_faces:
+            temp_frame = enhance_face(target_face, temp_frame)
+    return temp_frame
 
 
-def process_frames(src, paths, update):
-    for p in paths:
-        frame = cv2.imread(p)
-        frame = process_frame(None, None, frame)
-        cv2.imwrite(p, frame)
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    for temp_frame_path in temp_frame_paths:
+        temp_frame = cv2.imread(temp_frame_path)
+        result = process_frame(None, None, temp_frame)
+        cv2.imwrite(temp_frame_path, result)
         if update:
             update()
 
 
-def process_image(src, target, out):
-    frame = cv2.imread(target)
-    frame = process_frame(None, None, frame)
-    cv2.imwrite(out, frame)
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
+    target_frame = cv2.imread(target_path)
+    result = process_frame(None, None, target_frame)
+    cv2.imwrite(output_path, result)
 
 
-def process_video(src, frame_paths):
-    roop.processors.frame.core.process_video(src, frame_paths, process_frames)
+def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
+    roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
