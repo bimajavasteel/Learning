@@ -7,6 +7,7 @@ import time
 
 import roop.globals
 import roop.processors.frame.core
+from roop.core import update_status
 from roop.face_analyser import get_one_face, get_many_faces, find_similar_face
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
@@ -112,11 +113,8 @@ def pre_check() -> bool:
 
 
 def pre_start() -> bool:
-    from roop.core import update_status   # moved to inside function
-
     if not is_image(roop.globals.source_path):
         update_status('Select an image for source path.', NAME)
-
         return False
     elif not get_one_face(cv2.imread(roop.globals.source_path)):
         update_status('No face in source path detected.', NAME)
