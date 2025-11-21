@@ -1,124 +1,240 @@
-from typing import Any, List, Callable
+"""
+Custom Face Enhancer untuk Roop Mod — versi lengkap sesuai permintaan terbaru
+Menggunakan pipeline:
+1. Landmark Extraction → 2d106det.onnx (ambil 5 landmark dari 106)
+2. Face Warping → similarity transform
+3. Mask Generation → faceparser_fp16.onnx + occluder.onnx
+4. Pre-processing → normalisasi matematis
+5. Post-processing → denormalisasi matematis
+6. Face Pasting → inverse transform
+7. Blending → alpha blending
+
+File ini ditempatkan pada: roop/processors/frame/face_enhancer_custom.py
+"""
+
+import os
 import cv2
+import numpy as np
+import onnxruntime as ort
 import threading
-from gfpgan.utils import GFPGANer
+from typing import Any, Optional, Tuple, List
 
 import roop.globals
-import roop.processors.frame.core
-from roop.core import update_status
 from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
-from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+from roop.utilities import resolve_relative_path, is_image, is_video
+from roop.core import update_status
+import roop.processors.frame.core
 
-FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-ENHANCER'
+THREAD_SEMAPHORE = threading.Semaphore()
+NAME = "ROOP.FACE-ENHANCER-CUSTOM"
 
+# Model registry
+models = {
+    "landmark": None,      # 2d106det.onnx
+    "parser": None,        # faceparser_fp16.onnx
+    "occluder": None,      # occluder.onnx
+}
 
-def get_face_enhancer() -> Any:
-    global FACE_ENHANCER
+def get_providers():
+    return roop.globals.execution_providers
 
+def load_onnx(name: str, filename: str):
+    path = resolve_relative_path(f"../models/{filename}")
+    if not os.path.exists(path):
+        print(f"[WARNING] Model {filename} tidak ditemukan")
+        return None
+    try:
+        return ort.InferenceSession(path, providers=get_providers())
+    except Exception as e:
+        print(f"[ERROR] Gagal load {filename}: {e}")
+        return None
+
+# ---------------- LOADER ----------------
+def load_models():
     with THREAD_LOCK:
-        if FACE_ENHANCER is None:
-            model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
-            # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
-            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
-    return FACE_ENHANCER
+        if models["landmark"] is None:
+            models["landmark"] = load_onnx("landmark", "2d106det.onnx")
+        if models["parser"] is None:
+            models["parser"] = load_onnx("parser", "faceparser_fp16.onnx")
+        if models["occluder"] is None:
+            models["occluder"] = load_onnx("occluder", "occluder.onnx")
 
+# ---------------- ONNX UTILS ----------------
+def preprocess(image: np.ndarray, size=(192,192)):
+    img = cv2.resize(image, size)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2,0,1))[None]
+    return img
 
-def get_device() -> str:
-    if 'CUDAExecutionProvider' in roop.globals.execution_providers:
-        return 'cuda'
-    if 'CoreMLExecutionProvider' in roop.globals.execution_providers:
-        return 'mps'
-    return 'cpu'
+def postprocess(img: np.ndarray):
+    img = img.clip(0,1)
+    img = (img * 255).astype(np.uint8)
+    return img
 
+# ---------------- LANDMARK EXTRACTION 106 → 5 ----------------
+def extract_5_landmarks(face_img: np.ndarray) -> Optional[np.ndarray]:
+    sess = models["landmark"]
+    if sess is None:
+        return None
+    inp = preprocess(face_img, (192,192))
+    out = sess.run(None, {sess.get_inputs()[0].name: inp})[0]
+    pts = out.reshape(-1,2)  # 106 landmarks
 
-def clear_face_enhancer() -> None:
-    global FACE_ENHANCER
+    # Ambil 5 landmark standard InsightFace
+    # (approx mapping index — bisa berbeda antar dataset)
+    idx = [33, 46, 62, 76, 90]  # contoh index approx (mata kiri, mata kanan, hidung, mulut kiri, mulut kanan)
+    return pts[idx]
 
-    FACE_ENHANCER = None
+# ---------------- FACE WARPING ----------------
+def align_face(frame: np.ndarray, box, landmarks):
+    x1,y1,x2,y2 = box
+    face = frame[y1:y2, x1:x2]
+    if landmarks is None:
+        return face, None
 
+    # template 5 landmark (InsightFace)
+    template = np.array([
+        [38.2946, 51.6963],
+        [73.5318, 51.5014],
+        [56.0252, 71.7366],
+        [41.5493, 92.3655],
+        [70.7299, 92.2041]
+    ], dtype=np.float32)
 
-def pre_check() -> bool:
-    download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth'])
-    return True
+    scale = (x2-x1) / 112
+    T = template * scale
 
+    M = cv2.estimateAffinePartial2D(landmarks, T, method=cv2.LMEDS)[0]
+    warped = cv2.warpAffine(face, M, (int(T[:,0].max()), int(T[:,1].max())))
+    return warped, M
 
-def pre_start() -> bool:
-    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status('Select an image or video for target path.', NAME)
-        return False
-    return True
+# ---------------- MASK GENERATION ----------------
+def generate_mask(face_img: np.ndarray):
+    parser = models["parser"]
+    occluder = models["occluder"]
+    h,w = face_img.shape[:2]
 
+    # face parser mask
+    mask = np.ones((h,w), dtype=np.float32)
+    if parser:
+        inp = preprocess(face_img, (256,256))
+        out = parser.run(None, {parser.get_inputs()[0].name: inp})[0]
+        out = np.argmax(out[0], axis=0)
+        mask = cv2.resize(out.astype(np.float32), (w,h))
+        mask = (mask > 0).astype(np.float32)
 
-def post_process() -> None:
-    clear_face_enhancer()
+    # occluder mask
+    if occluder:
+        inp = preprocess(face_img, (256,256))
+        occ = occluder.run(None, {occluder.get_inputs()[0].name: inp})[0][0]
+        occ = cv2.resize(occ, (w,h))
+        mask *= (occ < 0.5).astype(np.float32)
 
+    mask = cv2.GaussianBlur(mask, (25,25), 5)
+    return np.clip(mask,0,1)
 
-def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    frame_height, frame_width = temp_frame.shape[:2]
-    start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
-    
-    # Hitung ukuran wajah
-    face_w, face_h = end_x - start_x, end_y - start_y
-    if face_w <= 0 or face_h <= 0:
-        return temp_frame
+# ---------------- PRE / POST PROCESS ----------------
+def normalize(img: np.ndarray):
+    return img.astype(np.float32) / 255.0
 
-    # Padding adaptif (minimal 10%, maksimal 30% tergantung ukuran)
-    pad_ratio = max(0.1, min(0.3, 100 / max(face_w, face_h)))
-    padding_x = int(face_w * pad_ratio)
-    padding_y = int(face_h * pad_ratio)
-    
-    # Pastikan tidak melebihi batas frame
-    start_x = max(0, start_x - padding_x)
-    start_y = max(0, start_y - padding_y)
-    end_x = min(frame_width, end_x + padding_x)
-    end_y = min(frame_height, end_y + padding_y)
-    
-    temp_face = temp_frame[start_y:end_y, start_x:end_x]
-    if temp_face.size == 0:
-        return temp_frame
+def denormalize(img: np.ndarray):
+    return (img * 255).clip(0,255).astype(np.uint8)
+
+# ---------------- FACE PASTING + INVERSE WARP ----------------
+def paste_back(frame, warped_result, box, M, mask):
+    if M is None:
+        return frame
+    x1,y1,x2,y2 = box
+
+    inv_M = cv2.invertAffineTransform(M)
+    h = y2-y1
+    w = x2-x1
+
+    restored = cv2.warpAffine(warped_result, inv_M, (w,h))
+    mask_resized = cv2.resize(mask, (w,h))
+    mask_3 = np.stack([mask_resized]*3, axis=-1)
+
+    region = frame[y1:y2, x1:x2]
+    blended = restored * mask_3 + region * (1-mask_3)
+    frame[y1:y2, x1:x2] = blended.astype(np.uint8)
+    return frame
+
+# ---------------- MAIN ENHANCE ----------------
+def enhance_face(target_face: Face, frame: Frame) -> Frame:
+    x1,y1,x2,y2 = map(int, target_face['bbox'])
+    face_patch = frame[y1:y2, x1:x2]
 
     with THREAD_SEMAPHORE:
-        try:
-            _, _, enhanced_face = get_face_enhancer().enhance(
-                temp_face,
-                paste_back=True
-            )
-            # Pastikan ukuran cocok (karena kadang enhancer ubah resolusi)
-            if enhanced_face.shape == temp_face.shape:
-                temp_frame[start_y:end_y, start_x:end_x] = enhanced_face
-        except Exception as e:
-            print(f"[WARNING] Enhance face failed: {e}")
-    
-    return temp_frame
+        # 1) landmark
+        lm = extract_5_landmarks(face_patch)
+
+        # 2) warp
+        warped, M = align_face(frame, (x1,y1,x2,y2), lm)
+        if warped is None:
+            return frame
+
+        # 3) mask
+        mask = generate_mask(warped)
+
+        # 4) preprocess
+        warped_norm = normalize(warped)
+
+        # (NO GPEN — hanya simple sharpening)
+        kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
+        enhanced = cv2.filter2D((warped_norm*255).astype(np.uint8), -1, kernel)
+
+        # 5) postprocess
+        enhanced_denorm = denormalize(enhanced.astype(np.float32)/255.0)
+
+        # 6 + 7) paste + blend
+        frame = paste_back(frame, enhanced_denorm, (x1,y1,x2,y2), M, mask)
+
+    return frame
+
+# ---------------- HOOKS ----------------
+def process_frame(source_face, reference_face, frame: Frame) -> Frame:
+    faces = get_many_faces(frame)
+    if faces:
+        for f in faces:
+            frame = enhance_face(f, frame)
+    return frame
 
 
-def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
-    many_faces = get_many_faces(temp_frame)
-    if many_faces:
-        for target_face in many_faces:
-            temp_frame = enhance_face(target_face, temp_frame)
-    return temp_frame
-
-
-def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-    for temp_frame_path in temp_frame_paths:
-        temp_frame = cv2.imread(temp_frame_path)
-        result = process_frame(None, None, temp_frame)
-        cv2.imwrite(temp_frame_path, result)
+def process_frames(source_path: str, temp_frames: List[str], update):
+    load_models()
+    for p in temp_frames:
+        img = cv2.imread(p)
+        if img is None:
+            continue
+        res = process_frame(None, None, img)
+        cv2.imwrite(p, res)
         if update:
             update()
 
 
-def process_image(source_path: str, target_path: str, output_path: str) -> None:
-    target_frame = cv2.imread(target_path)
-    result = process_frame(None, None, target_frame)
-    cv2.imwrite(output_path, result)
+def process_image(source_path, target_path, output_path):
+    load_models()
+    img = cv2.imread(target_path)
+    res = process_frame(None, None, img)
+    cv2.imwrite(output_path, res)
 
 
-def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
-    roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
+def process_video(source_path, temp_frames):
+    load_models()
+    roop.processors.frame.core.process_video(source_path, temp_frames, process_frames)
+
+
+def pre_start():
+    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
+        update_status("Select target image/video", NAME)
+        return False
+    return True
+
+
+def post_process():
+    for k in models.keys(): models[k] = None
+
+__all__ = ["pre_start","pre_process","process_frame","process_frames","process_image","process_video","post_process"]
