@@ -27,7 +27,7 @@ def get_face_analyser() -> Any:
                 name="buffalo_l", providers=providers
             )
             FACE_ANALYSER.prepare(
-                ctx_id=roop.globals.gpu_id if roop.globals.gpu_id is not None else 0,
+                ctx_id=0,
                 det_size=(640, 640)
             )
         return FACE_ANALYSER
