@@ -73,21 +73,35 @@ def post_process() -> None:
 def _has_valid_face(faces: List[Face], frame: Frame) -> bool:
     if not faces:
         return False
+
     h, w = frame.shape[:2]
+
     for face in faces:
         bbox = face.get('bbox')
-        if not bbox or len(bbox) != 4:
+        if bbox is None:
             continue
-        start_x, start_y, end_x, end_y = map(int, bbox)
+
+        # pastikan bbox selalu list 4 angka
+        bbox_list = list(bbox)
+        if len(bbox_list) != 4:
+            continue
+
+        start_x, start_y, end_x, end_y = map(int, bbox_list)
+
+        # clamp agar tidak keluar frame
         start_x = max(0, min(w, start_x))
-        end_x = max(0, min(w, end_x))
+        end_x   = max(0, min(w, end_x))
         start_y = max(0, min(h, start_y))
-        end_y = max(0, min(h, end_y))
+        end_y   = max(0, min(h, end_y))
+
         fw = max(0, end_x - start_x)
         fh = max(0, end_y - start_y)
+
         if fw >= MIN_FACE_SIZE and fh >= MIN_FACE_SIZE:
             return True
+
     return False
+
 
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
