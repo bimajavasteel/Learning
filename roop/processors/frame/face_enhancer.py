@@ -8,6 +8,7 @@ from collections import deque
 import roop.globals
 from roop.face_analyser import get_many_faces
 from roop.utilities import resolve_relative_path, is_video
+from roop.core import update_status
 
 NAME = "ROOP.FACE-ENHANCER"
 
@@ -43,11 +44,15 @@ SOFT_MASK = build_soft_mask()
 # ---------------------------------------------------------------------
 def align_face(frame, face):
     try:
-        kps = np.array(face["kps"], dtype=np.float32)
+        kps = np.array(face.get("kps", []), dtype=np.float32)
+        if kps.shape != (5, 2):
+            return None, None
         M = cv2.estimateAffinePartial2D(kps, TEMPLATE_5PT, method=cv2.LMEDS)[0]
+        if M is None:
+            return None, None
         aligned = cv2.warpAffine(frame, M, (112, 112), borderValue=0)
         return aligned, M
-    except:
+    except Exception:
         return None, None
 
 
@@ -56,7 +61,7 @@ def paste_back(frame, enhanced, M):
         inv = cv2.invertAffineTransform(M)
         restored = cv2.warpAffine(enhanced, inv, (frame.shape[1], frame.shape[0]))
         return restored
-    except:
+    except Exception:
         return frame
 
 
@@ -87,31 +92,33 @@ def color_correction(src, dst):
 
 
 # ---------------------------------------------------------------------
-# LOAD ENHANCER (FP16 → ONNX → ERROR)
+# MODEL LOADING (ONNX FP16 AUTODETECT)
 # ---------------------------------------------------------------------
 def get_enhancer():
     global ENHANCER
     with THREAD_LOCK:
         if ENHANCER is None:
-
             base_dir = resolve_relative_path("../models")
-
             fp16_path = os.path.join(base_dir, "GFPGANv1.4-fp16.onnx")
             full_path = os.path.join(base_dir, "GFPGANv1.4.onnx")
 
             if os.path.exists(fp16_path):
                 model_path = fp16_path
-                print(f"[FACE-ENHANCER] Menggunakan FP16 ONNX: {model_path}")
+                update_status(f"[{NAME}] Menggunakan FP16 ONNX: {os.path.basename(model_path)}", NAME)
             elif os.path.exists(full_path):
                 model_path = full_path
-                print(f"[FACE-ENHANCER] FP16 tidak ada, memakai ONNX FULL: {model_path}")
+                update_status(f"[{NAME}] Menggunakan ONNX Full: {os.path.basename(model_path)}", NAME)
             else:
-                raise FileNotFoundError(
-                    "Tidak menemukan GFPGANv1.4.onnx atau GFPGANv1.4-fp16.onnx!"
-                )
+                msg = "GFPGAN onnx tidak ditemukan. Jalankan konversi atau tempatkan file ONNX di folder models."
+                update_status(msg, NAME)
+                raise FileNotFoundError(msg)
 
             providers = roop.globals.execution_providers
-            ENHANCER = ort.InferenceSession(model_path, providers=providers)
+            try:
+                ENHANCER = ort.InferenceSession(model_path, providers=providers)
+            except Exception as e:
+                update_status(f"[{NAME}] Gagal load ONNX: {e}", NAME)
+                raise
 
     return ENHANCER
 
@@ -121,25 +128,29 @@ def get_enhancer():
 # ---------------------------------------------------------------------
 def enhance_face(frame, face):
     aligned, M = align_face(frame, face)
-    if aligned is None:
+    if aligned is None or M is None:
         return frame
 
     inp = normalize_input(aligned)
-    enhancer = get_enhancer()
+    enhancer = None
+    try:
+        enhancer = get_enhancer()
+    except FileNotFoundError:
+        return frame
+    except Exception as e:
+        update_status(f"[{NAME}] get_enhancer error: {e}", NAME)
+        return frame
 
     with THREAD_SEMAPHORE:
         try:
             out = enhancer.run(None, {"input": inp})[0]
         except Exception as e:
-            print(f"[ERROR] Inference ONNX gagal: {e}")
+            update_status(f"[{NAME}] Inference ONNX gagal: {e}", NAME)
             return frame
 
     enhanced = denormalize_output(out)
     enhanced = color_correction(aligned, enhanced)
-
-    blended = enhanced * SOFT_MASK + aligned * (1 - SOFT_MASK)
-    blended = blended.astype(np.uint8)
-
+    blended = (enhanced.astype(np.float32) * SOFT_MASK + aligned.astype(np.float32) * (1 - SOFT_MASK)).astype(np.uint8)
     restored = paste_back(frame, blended, M)
     return restored
 
@@ -149,14 +160,25 @@ def enhance_face(frame, face):
 # ---------------------------------------------------------------------
 def smooth_frame(frame):
     FRAME_SMOOTH.append(frame)
-    return np.mean(FRAME_SMOOTH, axis=0).astype(np.uint8)
+    if len(FRAME_SMOOTH) == 0:
+        return frame
+    return np.mean(list(FRAME_SMOOTH), axis=0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------
-# FRAME PROCESSING
+# FRAME PROCESSING CORE
 # ---------------------------------------------------------------------
 def process_frame(source_face, reference_face, frame):
-    faces = get_many_faces(frame)
+    """
+    Dipanggil untuk setiap frame oleh process_frames.
+    source_face / reference_face disediakan oleh pipeline (boleh None).
+    """
+    try:
+        faces = get_many_faces(frame)
+    except Exception as e:
+        update_status(f"[{NAME}] face detection error: {e}", NAME)
+        return frame
+
     if not faces:
         return frame
 
@@ -164,8 +186,10 @@ def process_frame(source_face, reference_face, frame):
         try:
             frame = enhance_face(frame, f)
         except Exception as e:
-            print(f"[WARNING] Enhance error: {e}")
+            # catat warning tapi jangan crash pipeline
+            update_status(f"[{NAME}] enhance warning: {e}", NAME)
 
+    # smoothing hanya untuk video
     if is_video(roop.globals.target_path):
         frame = smooth_frame(frame)
 
@@ -173,26 +197,94 @@ def process_frame(source_face, reference_face, frame):
 
 
 # ---------------------------------------------------------------------
-# IMAGE / VIDEO API
+# API YANG HARUS ADA UNTUK FRAME PROCESSOR (CORE)
 # ---------------------------------------------------------------------
-def process_image(source_path, target_path, output_path):
-    img = cv2.imread(target_path)
-    out = process_frame(None, None, img)
-    cv2.imwrite(output_path, out)
+def pre_check() -> bool:
+    """
+    Dipanggil sebelum pipeline dimulai untuk memastikan model tersedia.
+    """
+    base_dir = resolve_relative_path("../models")
+    fp16_path = os.path.join(base_dir, "GFPGANv1.4-fp16.onnx")
+    full_path = os.path.join(base_dir, "GFPGANv1.4.onnx")
+    if os.path.exists(fp16_path) or os.path.exists(full_path):
+        return True
+    update_status(f"[{NAME}] Model ONNX tidak ditemukan di folder models.", NAME)
+    return False
 
 
-def process_frames(source_path, temp_frame_paths, update):
-    for p in temp_frame_paths:
+def pre_start() -> bool:
+    """
+    Validasi target path (image/video) sebelum start.
+    """
+    if not (os.path.exists(roop.globals.target_path)):
+        update_status(f"[{NAME}] Target path tidak ada: {roop.globals.target_path}", NAME)
+        return False
+    return True
+
+
+def post_process() -> None:
+    """
+    Bersihkan resource setelah selesai.
+    """
+    global ENHANCER
+    with THREAD_LOCK:
+        ENHANCER = None
+    FRAME_SMOOTH.clear()
+    update_status(f"[{NAME}] post_process complete.", NAME)
+
+
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
+    """
+    Dipanggil saat pipeline memproses single image.
+    """
+    try:
+        target_frame = cv2.imread(target_path)
+        if target_frame is None:
+            update_status(f"[{NAME}] Gagal baca image: {target_path}", NAME)
+            return
+        result = process_frame(None, None, target_frame)
+        cv2.imwrite(output_path, result)
+    except Exception as e:
+        update_status(f"[{NAME}] process_image error: {e}", NAME)
+
+
+def process_frames(source_path: str, temp_frame_paths: list, update: callable = None) -> None:
+    """
+    Dipanggil oleh core processor untuk memproses list frame sementara.
+    - source_path: path sumber asli (bisa None)
+    - temp_frame_paths: list path file frame sementara (ordered)
+    - update: callable untuk melaporkan progress (boleh None)
+    """
+    for idx, temp_path in enumerate(temp_frame_paths):
         try:
-            frame = cv2.imread(p)
+            frame = cv2.imread(temp_path)
+            if frame is None:
+                update_status(f"[{NAME}] Gagal baca frame: {temp_path}", NAME)
+                continue
             result = process_frame(None, None, frame)
-            cv2.imwrite(p, result)
+            cv2.imwrite(temp_path, result)
         except Exception as e:
-            print(f"[FRAME ERROR] {e}")
-        if update:
-            update()
+            update_status(f"[{NAME}] process_frames error ({temp_path}): {e}", NAME)
+        finally:
+            if update:
+                try:
+                    update(idx, len(temp_frame_paths))
+                except TypeError:
+                    # beberapa core pass update() tanpa args
+                    try:
+                        update()
+                    except Exception:
+                        pass
 
 
-def process_video(source_path, temp_frame_paths):
-    from roop.processors.frame.core import process_video
-    process_video(None, temp_frame_paths, process_frames)
+def process_video(source_path: str, temp_frame_paths: list) -> None:
+    """
+    Integrasi dengan roop.processors.frame.core.process_video
+    Pastikan memanggil core.process_video dengan signature (source_path, temp_frame_paths, processor_callback)
+    """
+    # import local reference to avoid shadowing function name
+    from roop.processors.frame import core as frame_core
+    try:
+        frame_core.process_video(source_path, temp_frame_paths, process_frames)
+    except Exception as e:
+        update_status(f"[{NAME}] process_video error: {e}", NAME)
