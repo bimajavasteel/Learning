@@ -1,221 +1,213 @@
+# roop/face_analyser.py
+
 import threading
 from typing import Any, Optional, List
-import cv2
-import insightface
+
 import numpy as np
+import insightface
 
 import roop.globals
 from roop.typing import Frame, Face
 
+from roop.face_segmentation import get_face_segmenter  # ← tambahkan import ini
+
 FACE_ANALYSER = None
 THREAD_LOCK = threading.Lock()
 
-# ==========================
-# Konfigurasi model & kualitas
-# ==========================
-PRIMARY_PACK = "antelopev2"     # target utama: ArcFace R100 + SCRFD
-FALLBACK_PACK = "buffalo_l"     # fallback aman kalau antelopev2 gagal
-MIN_FACE_SIZE = 64              # minimal lebar/tinggi wajah (px)
-MIN_DET_SCORE = 0.5             # minimal confidence deteksi wajah
-USE_CENTER_PRIORITY = True      # prioritas wajah yang paling besar & paling di tengah
-MAX_FACES = 5                   # batasi jumlah wajah yang dikembalikan
-DET_MAX_SIZE = 720              # deteksi dilakukan max di resolusi ini (lebih kecil = lebih cepat)
-
-
-def _init_face_analysis(pack_name: str) -> Any:
-    """
-    Load model pack InsightFace.
-    Pastikan module 'detection' tersedia.
-    """
-    analyser = insightface.app.FaceAnalysis(
-        name=pack_name,
-        root="/root/.insightface",
-        providers=roop.globals.execution_providers,
-        allowed_modules=['detection', 'recognition']
-    )
-
-    analyser.prepare(ctx_id=0, det_size=(640, 640))
-
-    # Cek apakah detection benar-benar termuat
-    if not hasattr(analyser, "models") or "detection" not in analyser.models:
-        raise AssertionError(f"Pack '{pack_name}' tidak memiliki model detection.")
-
-    return analyser
-
+# =========================
+#   ANALYSER SINGLETON
+# =========================
 
 def get_face_analyser() -> Any:
-    """
-    Urutan load:
-    1. Coba antelopev2
-    2. Kalau gagal → buffalo_l
-    """
     global FACE_ANALYSER
-
     with THREAD_LOCK:
-        if FACE_ANALYSER is not None:
-            return FACE_ANALYSER
-
-        # Coba antelopev2 dulu
-        try:
-            FACE_ANALYSER = _init_face_analysis(PRIMARY_PACK)
-            print(f"[FaceAnalyser] Menggunakan pack utama: {PRIMARY_PACK}")
-            return FACE_ANALYSER
-        except Exception as e:
-            print(f"[FaceAnalyser] Gagal load '{PRIMARY_PACK}'. Fallback ke '{FALLBACK_PACK}'. Error: {e}")
-
-        # Fallback ke buffalo_l
-        try:
-            FACE_ANALYSER = _init_face_analysis(FALLBACK_PACK)
-            print(f"[FaceAnalyser] Menggunakan pack fallback: {FALLBACK_PACK}")
-            return FACE_ANALYSER
-        except Exception as e:
-            print(f"[FaceAnalyser] Tidak bisa load fallback '{FALLBACK_PACK}'. Error: {e}")
-            raise RuntimeError("Gagal memuat antelopev2 dan buffalo_l.")
+        if FACE_ANALYSER is None:
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            FACE_ANALYSER = insightface.app.FaceAnalysis(
+                name="buffalo_l", providers=providers
+            )
+            FACE_ANALYSER.prepare(
+                ctx_id=roop.globals.gpu_id if roop.globals.gpu_id is not None else 0,
+                det_size=(640, 640)
+            )
+        return FACE_ANALYSER
 
 
-def clear_face_analyser() -> None:
-    global FACE_ANALYSER
-    FACE_ANALYSER = None
+# =========================
+#   FUNGSI BANTU OCCLUSION
+# =========================
+
+def _distance(p1, p2):
+    return np.linalg.norm(np.array(p1) - np.array(p2))
 
 
-# ==========================
-# Helper fungsi speed-up detection
-# ==========================
+def landmarks_ok(lm) -> bool:
+    """
+    lm: 5 landmark, format [(x,y), ...] atau np.array shape (5,2)
+    """
+    lm = np.array(lm)
 
-def _resize_for_detection(frame: Frame):
-    h, w = frame.shape[:2]
-    max_side = max(h, w)
-    if max_side <= DET_MAX_SIZE:
-        return frame, 1.0
+    # Jarak antar mata cukup besar
+    eye_dist = _distance(lm[0], lm[1])
+    if eye_dist < 20:
+        return False
 
-    scale = DET_MAX_SIZE / float(max_side)
-    resized = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-    return resized, scale
+    # Mata harus di atas hidung
+    if lm[0][1] > lm[2][1] or lm[1][1] > lm[2][1]:
+        return False
 
+    # Hidung harus di atas mulut
+    if lm[2][1] > lm[3][1] or lm[2][1] > lm[4][1]:
+        return False
 
-def _rescale_faces_to_original(faces: List[Face], scale: float) -> None:
-    if scale == 1.0 or not faces:
-        return
-
-    inv = 1.0 / scale
-    for face in faces:
-        if hasattr(face, "bbox"):
-            face.bbox *= inv
-        if hasattr(face, "kps") and face.kps is not None:
-            face.kps *= inv
-        if hasattr(face, "landmark_2d_106") and face.landmark_2d_106 is not None:
-            face.landmark_2d_106 *= inv
+    return True
 
 
-def _face_area_and_center_score(face: Face, frame: Frame) -> float:
-    h, w = frame.shape[:2]
-    bbox = getattr(face, "bbox", None)
-    if bbox is None or len(bbox) != 4:
-        return 0.0
-
+def aspect_ok(bbox) -> bool:
+    """
+    bbox: [x1, y1, x2, y2]
+    """
     x1, y1, x2, y2 = bbox
-    fw = max(0.0, x2 - x1)
-    fh = max(0.0, y2 - y1)
-    area = fw * fh
-    if area <= 0:
-        return 0.0
+    w = x2 - x1
+    h = y2 - y1
 
-    if not USE_CENTER_PRIORITY:
-        return area
+    if w <= 0 or h <= 0:
+        return False
 
-    cx_face = (x1 + x2) / 2
-    cy_face = (y1 + y2) / 2
-    cx_frame = w / 2
-    cy_frame = h / 2
+    ratio = h / float(w)
 
-    dx = (cx_face - cx_frame) / w
-    dy = (cy_face - cy_frame) / h
-    penalty = (dx * dx + dy * dy)
+    # Wajah normal tidak terlalu tinggi/pipih
+    if ratio > 2.0 or ratio < 0.5:
+        return False
 
-    return area * (1.0 - min(0.9, penalty))
+    return True
 
 
-def _filter_and_sort_faces(faces: List[Face], frame: Frame) -> List[Face]:
+def segmentation_ok(frame: Frame, faces: List[Face], min_ratio: float = 0.40) -> List[bool]:
+    """
+    Mengembalikan list boolean: apakah face_i lolos segmentation (tidak terlalu ter-occlude).
+    min_ratio: minimal rasio area wajah (0–1). Semakin tinggi, semakin ketat.
+    """
+    if len(faces) == 0:
+        return []
+
+    h, w, _ = frame.shape
+    crops = []
+    boxes = []
+
+    for face in faces:
+        x1, y1, x2, y2 = face.bbox
+        x1 = max(int(x1), 0)
+        y1 = max(int(y1), 0)
+        x2 = min(int(x2), w - 1)
+        y2 = min(int(y2), h - 1)
+
+        if x2 <= x1 or y2 <= y1:
+            crops.append(None)
+            boxes.append(None)
+            continue
+
+        crop = frame[y1:y2, x1:x2]
+        crops.append(crop)
+        boxes.append((x1, y1, x2, y2))
+
+    # Filter crop valid
+    valid_idx = [i for i, c in enumerate(crops) if c is not None]
+    if not valid_idx:
+        return [False] * len(faces)
+
+    valid_crops = [crops[i] for i in valid_idx]
+
+    segmenter = get_face_segmenter()
+    visibility_scores = segmenter.face_visibility_scores(valid_crops)
+
+    # Rekonstruksi ke list full
+    results = [False] * len(faces)
+    for i, idx in enumerate(valid_idx):
+        score = visibility_scores[i]
+        results[idx] = (score >= min_ratio)
+
+    return results
+
+
+# =========================
+#   FILTER FACES
+# =========================
+
+def filter_faces(frame: Frame, faces: List[Face]) -> List[Face]:
     if not faces:
         return []
 
-    filt = []
+    # 1. Filter basic (confidence, landmark, aspect ratio)
+    basic_valid_flags = []
+    basic_valid_faces = []
+
     for face in faces:
-        bbox = face.bbox
-        if bbox is None or len(bbox) != 4:
+        # Confidence minimal
+        if getattr(face, "det_score", 0.0) < 0.60:
+            basic_valid_flags.append(False)
             continue
 
-        x1, y1, x2, y2 = bbox
-        fw = x2 - x1
-        fh = y2 - y1
-
-        if fw < MIN_FACE_SIZE or fh < MIN_FACE_SIZE:
+        # Landmark check
+        if not hasattr(face, "landmark_5"):
+            basic_valid_flags.append(False)
             continue
 
-        det_score = getattr(face, "det_score", None)
-        if det_score is not None and det_score < MIN_DET_SCORE:
+        if not landmarks_ok(face.landmark_5):
+            basic_valid_flags.append(False)
             continue
 
-        filt.append(face)
+        # Aspect ratio check
+        if not aspect_ok(face.bbox):
+            basic_valid_flags.append(False)
+            continue
 
-    if not filt:
+        basic_valid_flags.append(True)
+        basic_valid_faces.append(face)
+
+    if not basic_valid_faces:
         return []
 
-    filt.sort(key=lambda f: _face_area_and_center_score(f, frame), reverse=True)
+    # 2. Segmentation check (BiSeNet) – hanya untuk yang basic valid
+    # mapping index
+    mapping = [i for i, flag in enumerate(basic_valid_flags) if flag]
+    seg_flags_full = [False] * len(faces)
 
-    return filt[:MAX_FACES]
+    seg_flags_basic = segmentation_ok(frame, basic_valid_faces, min_ratio=0.40)
 
+    for j, orig_idx in enumerate(mapping):
+        seg_flags_full[orig_idx] = seg_flags_basic[j]
 
-# ==========================
-# API utama untuk Roop
-# ==========================
+    # 3. Gabungkan hasil
+    filtered = []
+    for i, face in enumerate(faces):
+        if i >= len(basic_valid_flags):
+            continue
+        if not basic_valid_flags[i]:
+            continue
+        if not seg_flags_full[i]:
+            continue
+        filtered.append(face)
 
-def get_many_faces(frame: Frame) -> Optional[List[Face]]:
-    if frame is None or frame.size == 0:
-        return None
-
-    try:
-        det_frame, scale = _resize_for_detection(frame)
-        faces = get_face_analyser().get(det_frame)
-        _rescale_faces_to_original(faces, scale)
-        faces = _filter_and_sort_faces(faces, frame)
-        return faces or None
-    except Exception as e:
-        print(f"[FaceAnalyser] Error membaca wajah: {e}")
-        return None
-
-
-def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
-    faces = get_many_faces(frame)
-    if faces:
-        return faces[position] if position < len(faces) else faces[-1]
-    return None
+    return filtered
 
 
-def find_similar_face(frame: Frame, reference_face: Face) -> Optional[Face]:
+# =========================
+#   API UTAMA ROOP
+# =========================
+
+def get_many_faces(frame: Frame) -> List[Face]:
+    analyser = get_face_analyser()
+    faces: List[Face] = analyser.get(frame)
+    faces = filter_faces(frame, faces)
+    return faces
+
+
+def get_one_face(frame: Frame) -> Optional[Face]:
     faces = get_many_faces(frame)
     if not faces:
         return None
 
-    ref_emb = getattr(reference_face, "normed_embedding", None)
-    if ref_emb is None:
-        return None
-
-    best_face = None
-    best_dist = None
-
-    for face in faces:
-        emb = getattr(face, "normed_embedding", None)
-        if emb is None:
-            continue
-
-        dist = float(np.sum((np.array(emb) - np.array(ref_emb)) ** 2))
-
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best_face = face
-
-    if best_dist is not None and best_dist < roop.globals.similar_face_distance:
-        return best_face
-
-    return None
+    # Bisa pilih face terbesar / skor tertinggi
+    faces = sorted(faces, key=lambda f: (f.det_score, (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])), reverse=True)
+    return faces[0]
