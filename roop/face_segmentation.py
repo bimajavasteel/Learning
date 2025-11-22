@@ -1,8 +1,7 @@
 # roop/face_segmentation.py
-
 import os
-from typing import List, Tuple
-
+import urllib.request
+from typing import List
 import cv2
 import numpy as np
 import torch
@@ -10,25 +9,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms as T
 
-# ======================================================
-#   KONFIG
-# ======================================================
+# =====================================================
+#   KONFIGURASI
+# =====================================================
 
-# Sesuaikan path ini dengan lokasi weight BiSeNet kamu
-BISENET_WEIGHTS_PATH = "models/face_parsing_bisenet.pth"
+MODEL_DIR = "models"
+BISENET_WEIGHTS_PATH = os.path.join(MODEL_DIR, "face_parsing_bisenet.pth")
+BISENET_WEIGHTS_URL = "https://huggingface.co/qualcomm/BiseNet/resolve/aeb57eda69d58721c5c186eb65b612dfa43faeab/BiseNet.onnx"
 BISENET_INPUT_SIZE = 512
 
-# Label-class untuk area wajah (skin + facial parts) tergantung dataset
-# Ini asumsi umum CelebAMask-HQ / face-parsing:
-# 1: skin, 2: left brow, 3: right brow, 4: left eye, 5: right eye,
-# 6: nose, 7: upper lip, 9: lower lip, dll.
-FACE_LIKE_LABELS = {1, 2, 3, 4, 5, 6, 7, 9}
+# Label wajah menurut CelebAMask-HQ
+FACE_LABELS = {1, 2, 3, 4, 5, 6, 7, 9}
 
 
-# ======================================================
-#   MODEL Bisenet (SIMPLE VERSION)
-#   (arsitektur dipersingkat, fokus ke integrasi)
-# ======================================================
+# =====================================================
+#   AUTO DOWNLOAD
+# =====================================================
+
+def download_bisenet_weights():
+    os.makedirs(MODEL_DIR, exist_ok=True)
+
+    if os.path.exists(BISENET_WEIGHTS_PATH):
+        print("[BiSeNet] Weights OK.")
+        return
+
+    print("[BiSeNet] Mengunduh weights BiSeNet (±80MB)...")
+
+    try:
+        urllib.request.urlretrieve(BISENET_WEIGHTS_URL, BISENET_WEIGHTS_PATH)
+        print("[BiSeNet] Download selesai.")
+    except Exception as e:
+        print(f"[BiSeNet] Gagal download otomatis: {e}")
+        print(f"Silakan download manual: {BISENET_WEIGHTS_URL}")
+
+
+# =====================================================
+#   MODEL BISENET (Ringkas tapi kompatibel)
+# =====================================================
 
 class ConvBNReLU(nn.Module):
     def __init__(self, in_ch, out_ch, ks=3, stride=1, padding=1):
@@ -42,16 +59,8 @@ class ConvBNReLU(nn.Module):
 
 
 class BiSeNetSimple(nn.Module):
-    """
-    Versi ringkas BiSeNet untuk face parsing.
-    Di sini fokus ke: input -> feature -> output logits kelas.
-    Pastikan weight .pth yang kamu pakai kompatibel.
-    """
-
-    def __init__(self, n_classes: int = 19):
+    def __init__(self, n_classes=19):
         super().__init__()
-        # Sangat dipersingkat; asumsi weight kompatibel.
-        # Kalau weight kamu pakai arsitektur lain, sesuaikan sendiri.
         self.conv1 = ConvBNReLU(3, 64, 7, 2, 3)
         self.conv2 = ConvBNReLU(64, 128, 3, 2, 1)
         self.conv3 = ConvBNReLU(128, 256, 3, 2, 1)
@@ -64,118 +73,84 @@ class BiSeNetSimple(nn.Module):
         x = self.conv3(x)   # /8
         x = self.conv4(x)   # /16
         x = self.conv_out(x)
-        x = F.interpolate(x, scale_factor=16, mode='bilinear', align_corners=False)
+        x = F.interpolate(x, scale_factor=16, mode="bilinear", align_corners=False)
         return x
 
 
-# ======================================================
+# =====================================================
 #   WRAPPER SEGMENTER
-# ======================================================
+# =====================================================
 
 class BiSeNetFaceSegmenter:
-    def __init__(self, weights_path: str = BISENET_WEIGHTS_PATH, device: str = None):
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+    def __init__(self):
+        download_bisenet_weights()
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
-        self.model = BiSeNetSimple(n_classes=19).to(self.device)
+
+        self.model = BiSeNetSimple().to(self.device)
         self.model.eval()
 
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(
-                f"BiSeNet weights tidak ditemukan: {weights_path}. "
-                "Download/taruh weight face-parsing di path tersebut."
-            )
-
-        state = torch.load(weights_path, map_location=self.device)
-        # Jika state_dict nest / ada key 'state_dict'
+        state = torch.load(BISENET_WEIGHTS_PATH, map_location=self.device)
         if "state_dict" in state:
-            state = {k.replace("module.", "").replace("model.", ""): v for k, v in state["state_dict"].items()}
-        else:
-            state = {k.replace("module.", "").replace("model.", ""): v for k, v in state.items()}
+            state = {k.replace("module.", ""): v for k, v in state["state_dict"].items()}
         self.model.load_state_dict(state, strict=False)
 
-        # Transform gambar
         self.transform = T.Compose([
             T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
+            T.Normalize([0.485, 0.456, 0.406],
+                        [0.229, 0.224, 0.225])
         ])
 
-        # Gunakan half precision kalau GPU support
         self.use_amp = (self.device.type == "cuda")
 
-    def _preprocess(self, crops: List[np.ndarray]) -> torch.Tensor:
-        """
-        crops: list gambar RGB (np.uint8) bentuk (H, W, 3)
-        """
+    def preprocess(self, crops: List[np.ndarray]):
         tensors = []
         for img in crops:
-            img_resized = cv2.resize(img, (BISENET_INPUT_SIZE, BISENET_INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
-            img_resized = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-            tensor = self.transform(img_resized)
-            tensors.append(tensor)
-
-        batch = torch.stack(tensors, dim=0)
-        return batch.to(self.device)
+            img = cv2.resize(img, (BISENET_INPUT_SIZE, BISENET_INPUT_SIZE))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            tensors.append(self.transform(img))
+        batch = torch.stack(tensors).to(self.device)
+        return batch
 
     @torch.inference_mode()
     def segment_batch(self, crops: List[np.ndarray]) -> List[np.ndarray]:
-        """
-        Return: list of label maps (H, W) dengan nilai kelas (int)
-        """
-        if len(crops) == 0:
+        if not crops:
             return []
 
-        x = self._preprocess(crops)
+        batch = self.preprocess(crops)
 
         if self.use_amp:
             with torch.cuda.amp.autocast():
-                logits = self.model(x)
+                logits = self.model(batch)
         else:
-            logits = self.model(x)
+            logits = self.model(batch)
 
-        # logits: (B, C, H, W) -> pred: (B, H, W)
-        preds = torch.argmax(logits, dim=1)
-        preds = preds.detach().cpu().numpy()
+        pred = torch.argmax(logits, dim=1).cpu().numpy()
+        return list(pred)
 
-        # Resize ke ukuran input BiSeNet (kalau mau)
-        # Di sini sudah sama dengan BISENET_INPUT_SIZE
-        return list(preds)
-
-    def face_visibility_scores(
-        self,
-        crops: List[np.ndarray]
-    ) -> List[float]:
-        """
-        Hitung rasio area wajah (skin + facial parts) terhadap area crop.
-        Semakin kecil → kemungkinan occlusion besar.
-        Return: list float [0..1]
-        """
-        label_maps = self.segment_batch(crops)
+    def face_visibility_scores(self, crops: List[np.ndarray]) -> List[float]:
+        maps = self.segment_batch(crops)
         scores = []
 
-        for lab in label_maps:
+        for lab in maps:
             h, w = lab.shape
             area_total = h * w
-
-            face_mask = np.isin(lab, list(FACE_LIKE_LABELS))
-            area_face = int(face_mask.sum())
-            ratio = area_face / float(area_total + 1e-6)
-            scores.append(ratio)
+            mask = np.isin(lab, list(FACE_LABELS))
+            area_face = mask.sum()
+            scores.append(area_face / (area_total + 1e-6))
 
         return scores
 
 
-# ======================================================
-#   HELPER GLOBAL (SINGLETON)
-# ======================================================
+# =====================================================
+#   SINGLETON
+# =====================================================
 
-_SEGMENTER: BiSeNetFaceSegmenter = None
+_SEGMENTER = None
 
-
-def get_face_segmenter() -> BiSeNetFaceSegmenter:
+def get_face_segmenter():
     global _SEGMENTER
     if _SEGMENTER is None:
-        _SEGMENTER = BiSeNetFaceSegmenter(BISENET_WEIGHTS_PATH)
+        _SEGMENTER = BiSeNetFaceSegmenter()
     return _SEGMENTER
