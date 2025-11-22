@@ -98,103 +98,80 @@ class OneEuroFilter:
 class OpticalFlowTracker:
     """Optical flow-based face tracking untuk backup tracking"""
     
-    def __init__(self, max_frames_to_keep: int = 10):
-        self.max_frames_to_keep = max_frames_to_keep
-        self.prev_frame = None
-        self.prev_gray = None
-        self.prev_landmarks = {}
-        self.track_history = {}
-        self.next_track_id = 0
-
-    def update(self, current_frame: Frame, current_faces: List[Face], frame_count: int) -> Dict[int, Face]:
-        """Update tracking dengan optical flow"""
-        if current_frame is None:
-            return {}
-            
-        current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-        tracked_faces = {}
-
-        if self.prev_gray is not None and self.prev_frame is not None:
-            # Calculate optical flow
-            flow = cv2.calcOpticalFlowFarneback(
-                self.prev_gray, current_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
-            
-            # Track existing faces
-            for track_id, face_data in self.track_history.items():
-                if frame_count - face_data['last_seen'] > 5:  # Skip if too old
-                    continue
-                    
-                prev_landmarks = face_data['landmarks']
-                if prev_landmarks is not None:
-                    # Predict new landmark positions using optical flow
-                    new_landmarks = []
-                    for lm in prev_landmarks:
-                        x, y = int(lm[0]), int(lm[1])
-                        if 0 <= x < flow.shape[1] and 0 <= y < flow.shape[0]:
-                            flow_x = flow[y, x, 0]
-                            flow_y = flow[y, x, 1]
-                            new_landmarks.append([lm[0] + flow_x, lm[1] + flow_y])
-                        else:
-                            new_landmarks.append(lm.copy())
-                    
-                    # Find best matching face based on landmark distance
-                    best_face_idx = self._find_best_matching_face(new_landmarks, current_faces)
-                    if best_face_idx is not None:
-                        tracked_faces[track_id] = current_faces[best_face_idx]
-                        self.track_history[track_id].update({
-                            'landmarks': safe_get_landmarks(current_faces[best_face_idx]),
-                            'last_seen': frame_count,
-                            'bbox': current_faces[best_face_idx].bbox
-                        })
-
-        # Assign new IDs to untracked faces
-        for i, face in enumerate(current_faces):
-            if not any(face is tracked_face for tracked_face in tracked_faces.values()):
-                track_id = self.next_track_id
-                tracked_faces[track_id] = face
-                self.track_history[track_id] = {
-                    'landmarks': safe_get_landmarks(face),
-                    'last_seen': frame_count,
-                    'bbox': face.bbox
-                }
-                self.next_track_id += 1
-
-        # Cleanup old tracks
-        self._cleanup_old_tracks(frame_count)
-
-        self.prev_frame = current_frame.copy()
-        self.prev_gray = current_gray.copy()
-        
-        return tracked_faces
-
-    def _find_best_matching_face(self, predicted_landmarks: np.ndarray, current_faces: List[Face]) -> Optional[int]:
-        """Find best matching face based on landmark distance"""
-        if not current_faces or predicted_landmarks is None:
-            return None
-            
-        min_distance = float('inf')
-        best_idx = None
-        
-        for i, face in enumerate(current_faces):
-            face_landmarks = safe_get_landmarks(face)
-            if face_landmarks is not None and len(face_landmarks) == len(predicted_landmarks):
-                distance = np.mean(np.linalg.norm(face_landmarks - predicted_landmarks, axis=1))
-                if distance < min_distance and distance < 20.0:  # Reasonable threshold
-                    min_distance = distance
-                    best_idx = i
-                    
-        return best_idx
-
     def _cleanup_old_tracks(self, current_frame: int):
-        """Remove tracks that haven't been seen recently"""
-        tracks_to_remove = []
-        for track_id, data in self.track_history.items():
-            if current_frame - data['last_seen'] > self.max_frames_to_keep:
-                tracks_to_remove.append(track_id)
+    """Remove tracks that haven't been seen recently - FIXED VERSION"""
+    tracks_to_remove = []
+    for track_id, data in self.track_history.items():
+        if current_frame - data['last_seen'] > self.max_frames_to_keep:
+            tracks_to_remove.append(track_id)
+            
+    # FIX: Remove outside of iteration
+    for track_id in tracks_to_remove:
+        del self.track_history[track_id]
+
+def update(self, current_frame: Frame, current_faces: List[Face], frame_count: int) -> Dict[int, Face]:
+    """Update tracking dengan optical flow - FIXED VERSION"""
+    if current_frame is None:
+        return {}
+        
+    current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+    tracked_faces = {}
+
+    if self.prev_gray is not None and self.prev_frame is not None:
+        # Calculate optical flow
+        flow = cv2.calcOpticalFlowFarneback(
+            self.prev_gray, current_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+        
+        # FIX: Create copy of items before iteration
+        track_items = list(self.track_history.items())
+        
+        for track_id, face_data in track_items:
+            if frame_count - face_data['last_seen'] > 5:  # Skip if too old
+                continue
                 
-        for track_id in tracks_to_remove:
-            del self.track_history[track_id]
+            prev_landmarks = face_data['landmarks']
+            if prev_landmarks is not None:
+                # Predict new landmark positions using optical flow
+                new_landmarks = []
+                for lm in prev_landmarks:
+                    x, y = int(lm[0]), int(lm[1])
+                    if 0 <= x < flow.shape[1] and 0 <= y < flow.shape[0]:
+                        flow_x = flow[y, x, 0]
+                        flow_y = flow[y, x, 1]
+                        new_landmarks.append([lm[0] + flow_x, lm[1] + flow_y])
+                    else:
+                        new_landmarks.append(lm.copy())
+                
+                # Find best matching face based on landmark distance
+                best_face_idx = self._find_best_matching_face(new_landmarks, current_faces)
+                if best_face_idx is not None:
+                    tracked_faces[track_id] = current_faces[best_face_idx]
+                    self.track_history[track_id].update({
+                        'landmarks': safe_get_landmarks(current_faces[best_face_idx]),
+                        'last_seen': frame_count,
+                        'bbox': current_faces[best_face_idx].bbox
+                    })
+
+    # Assign new IDs to untracked faces
+    for i, face in enumerate(current_faces):
+        if not any(face is tracked_face for tracked_face in tracked_faces.values()):
+            track_id = self.next_track_id
+            tracked_faces[track_id] = face
+            self.track_history[track_id] = {
+                'landmarks': safe_get_landmarks(face),
+                'last_seen': frame_count,
+                'bbox': face.bbox
+            }
+            self.next_track_id += 1
+
+    # Cleanup old tracks - FIXED: outside of iteration
+    self._cleanup_old_tracks(frame_count)
+
+    self.prev_frame = current_frame.copy()
+    self.prev_gray = current_gray.copy()
+    
+    return tracked_faces
 
 # =====================
 # Enhanced Module Variables
