@@ -173,5 +173,3 @@ def clear_face_analyser() -> None:
     global _FACE_ANALYSER
     _FACE_ANALYSER = None
     _cached_get_faces.cache_clear()
-
-```
