@@ -1,5 +1,3 @@
-# ROOP Turbo — Extreme-Angle Edition
-
 import os
 import threading
 from functools import lru_cache
@@ -13,8 +11,7 @@ import onnxruntime as ort
 import roop.globals
 from roop.typing import Frame, Face
 
-# ---------- Configuration tuned for T4 ----------
-T4_GPU_MEM_LIMIT = int(os.getenv('ROOP_GPU_MEM_LIMIT', 12 * 1024**3))  # default 12GB
+T4_GPU_MEM_LIMIT = int(os.getenv('ROOP_GPU_MEM_LIMIT', 12 * 1024**3))
 BATCH_SIZE = int(os.getenv('ROOP_BATCH_SIZE', 8))
 DET_SIZE = (1280, 1280)
 PARTIAL_EMB_MASK = np.concatenate([np.ones(256, dtype=np.float32), np.zeros(256, dtype=np.float32)])
@@ -25,7 +22,6 @@ _THREAD_LOCK = threading.Lock()
 
 
 def _build_providers():
-    # Use CUDA EP first, tuned; fallback to CPU
     try:
         providers = [
             ('CUDAExecutionProvider', {
@@ -42,7 +38,6 @@ def _build_providers():
 
 
 def get_face_analyser() -> Any:
-    """Initialize and return a configured FaceAnalysis instance. Thread-safe singletons."""
     global _FACE_ANALYSER
     if _FACE_ANALYSER is not None:
         return _FACE_ANALYSER
@@ -50,21 +45,19 @@ def get_face_analyser() -> Any:
     with _THREAD_LOCK:
         if _FACE_ANALYSER is None:
             providers = _build_providers()
-            # prefer antelopev2 for occlusion/extreme angles
+
             _FACE_ANALYSER = insightface.app.FaceAnalysis(
                 name='antelopev2',
                 providers=providers,
-                allowed_modules=['detection', 'recognition']
+                allowed_modules=['detection', 'recognition'],
+                root="/kaggle/working/Learning/roop/models"
             )
 
-            # Force detector model if supported (scrfd_10g_kps expected in models/)
-            try:
-                _FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE, det_model='scrfd_10g_kps')
-            except TypeError:
-                # Older insightface may not accept det_model param; rely on local models directory
-                _FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
+            _FACE_ANALYSER.prepare(
+                ctx_id=0,
+                det_size=DET_SIZE
+            )
 
-            # enable landmark smoothing if available
             try:
                 if hasattr(_FACE_ANALYSER.app, 'landmark_model'):
                     _FACE_ANALYSER.app.landmark_model.use_smoothing = True
@@ -74,16 +67,13 @@ def get_face_analyser() -> Any:
     return _FACE_ANALYSER
 
 
-# LRU cache keyed by frame id; we will use hash of bytes. Keep modest cache to avoid heavy mem.
 @lru_cache(maxsize=1024)
 def _cached_get_faces(frame_bytes: bytes) -> Tuple:
     analyser = get_face_analyser()
-    # analyser.get can accept numpy array or list; use single frame call
     return tuple(analyser.get(np.frombuffer(frame_bytes, dtype=np.uint8)))
 
 
 def _frame_key(frame: Frame) -> bytes:
-    # Create a stable key: use shape + small hash of top-left 32x32 to reduce cost
     try:
         h = cv2.resize(frame, (32, 32)).tobytes()
     except Exception:
@@ -92,7 +82,6 @@ def _frame_key(frame: Frame) -> bytes:
 
 
 def get_many_faces(frame: Frame) -> Optional[List[Face]]:
-    """Return list of faces for a single frame, uses a bytes-based cache and batch-friendly analyser."""
     if frame is None or getattr(frame, 'size', 0) == 0:
         return None
 
@@ -101,7 +90,6 @@ def get_many_faces(frame: Frame) -> Optional[List[Face]]:
         faces = _cached_get_faces(key)
         return list(faces)
     except Exception:
-        # Fallback direct call
         try:
             return get_face_analyser().get(frame)
         except Exception:
@@ -117,8 +105,6 @@ def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
     return faces[-1]
 
 
-# Temporal store for smoothing
-_prev_landmarks = {}
 _prev_embeddings = {}
 
 
@@ -133,14 +119,10 @@ def _smooth_embedding(face_id: int, emb: np.ndarray, alpha: float = 0.6) -> np.n
 
 
 def partial_distance(a: np.ndarray, b: np.ndarray) -> float:
-    """Partial embedding distance emphasizing upper-face features.
-    Using precomputed mask PARTIAL_EMB_MASK.
-    """
     return float(np.sum(((a - b) * PARTIAL_EMB_MASK) ** 2))
 
 
 def find_similar_face(frame: Frame, reference_face: Face) -> Optional[Face]:
-    """Find the face in frame most similar to reference_face using partial_distance & smoothing."""
     if reference_face is None:
         return None
 
@@ -152,12 +134,11 @@ def find_similar_face(frame: Frame, reference_face: Face) -> Optional[Face]:
     best = None
     best_dist = float('inf')
 
-    for idx, f in enumerate(faces):
+    for f in faces:
         if not hasattr(f, 'normed_embedding'):
             continue
         emb = f.normed_embedding
-        # smooth per detected face using bbox hash as id
-        face_id = int(np.sum(f.bbox))  # simple stable id
+        face_id = int(np.sum(f.bbox))
         emb = _smooth_embedding(face_id, emb)
         dist = partial_distance(emb, ref_emb)
         if dist < best_dist:
