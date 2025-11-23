@@ -1,188 +1,129 @@
-import threading
-from typing import Any, Optional, List
-import insightface
-import numpy as np
+from typing import Any, List, Callable
 import cv2
-import os
-from scipy.spatial.distance import cosine
-from collections import deque
+import insightface
+import threading
+import numpy as np
 
 import roop.globals
-from roop.typing import Frame, Face
+import roop.processors.frame.core
+from roop.core import update_status
+from roop.face_analyser import get_one_face, get_many_faces, find_similar_face, smart_face_tracking, detect_occlusion
+from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
+from roop.typing import Face, Frame
+from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-FACE_ANALYSER = None
+FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
+NAME = 'ROOP.FACE-SWAPPER'
 
-# Tracking variables
-FACE_TRACKING = {}
-TRACKING_HISTORY = deque(maxlen=30)
+# Occlusion handling
+LAST_GOOD_SWAP = None
 
-def resolve_relative_path(path: str) -> str:
-    """Resolve relative path untuk model loading"""
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), path))
-
-def get_face_analyser() -> Any:
-    global FACE_ANALYSER
+def get_face_swapper() -> Any:
+    global FACE_SWAPPER
 
     with THREAD_LOCK:
-        if FACE_ANALYSER is None:
-            try:
-                # 🔥 COBA ANTELOPEV2 dengan path yang benar
-                antelope_path = resolve_relative_path('../models/antelopev2')
-                print(f"🔍 Mencari AntelopeV2 di: {antelope_path}")
-                
-                # Cek apakah model AntelopeV2 sudah ada
-                if os.path.exists(antelope_path):
-                    FACE_ANALYSER = insightface.app.FaceAnalysis(
-                        name='antelopev2', 
-                        providers=roop.globals.execution_providers,
-                        root=resolve_relative_path('../models')
-                    )
-                    FACE_ANALYSER.prepare(
-                        ctx_id=0, 
-                        det_thresh=0.2,
-                        det_size=(640, 640)
-                    )
-                    print("✅ Menggunakan AntelopeV2 dengan SCRFD 10G KPS")
-                else:
-                    raise FileNotFoundError("Model AntelopeV2 tidak ditemukan")
-                    
-            except Exception as e:
-                print(f"❌ AntelopeV2 gagal: {e}")
-                print("🔄 Fallback ke buffalo_l...")
-                # Fallback ke buffalo_l - biarkan insightface handle download
-                FACE_ANALYSER = insightface.app.FaceAnalysis(
-                    name='buffalo_l', 
-                    providers=roop.globals.execution_providers
-                )
-                FACE_ANALYSER.prepare(ctx_id=0)
-                print("✅ Menggunakan buffalo_l (fallback)")
-    return FACE_ANALYSER
+        if FACE_SWAPPER is None:
+            model_path = resolve_relative_path('../models/inswapper_128.onnx')
+            FACE_SWAPPER = insightface.model_zoo.get_model(
+                model_path, 
+                providers=roop.globals.execution_providers
+            )
+    return FACE_SWAPPER
 
-def clear_face_analyser() -> Any:
-    global FACE_ANALYSER
-    FACE_TRACKING.clear()
-    TRACKING_HISTORY.clear()
-    FACE_ANALYSER = None
+def clear_face_swapper() -> None:
+    global FACE_SWAPPER
+    FACE_SWAPPER = None
 
-def get_many_faces(frame: Frame) -> Optional[List[Face]]:
-    try:
-        faces = get_face_analyser().get(frame)
-        faces = [face for face in faces if face.det_score > 0.3]
-        return faces
-    except ValueError:
-        return None
+def pre_check() -> bool:
+    download_directory_path = resolve_relative_path('../models')
+    conditional_download(download_directory_path, [
+        'https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx'
+    ])
+    return True
 
-def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
-    many_faces = get_many_faces(frame)
-    if many_faces:
-        try:
-            return many_faces[position]
-        except IndexError:
-            return many_faces[-1]
-    return None
+def pre_start() -> bool:
+    if not is_image(roop.globals.source_path):
+        update_status('Select an image for source path.', NAME)
+        return False
+    elif not get_one_face(cv2.imread(roop.globals.source_path)):
+        update_status('No face in source path detected.', NAME)
+        return False
+    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
+        update_status('Select an image or video for target path.', NAME)
+        return False
+    return True
 
-def calculate_motion_vector(prev_face: Face, current_face: Face) -> float:
-    if not prev_face or not current_face:
-        return 0.0
-    
-    prev_bbox = prev_face.bbox
-    current_bbox = current_face.bbox
-    
-    prev_center = np.array([(prev_bbox[0] + prev_bbox[2]) / 2, (prev_bbox[1] + prev_bbox[3]) / 2])
-    current_center = np.array([(current_bbox[0] + current_bbox[2]) / 2, (current_bbox[1] + current_bbox[3]) / 2])
-    
-    motion = np.linalg.norm(current_center - prev_center)
-    return motion
+def post_process() -> None:
+    clear_face_swapper()
+    clear_face_reference()
 
-def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]:
-    global FACE_TRACKING, TRACKING_HISTORY
+def handle_occlusion_fallback(temp_frame: Frame, swapped_frame: Frame, target_face: Face) -> Frame:
+    global LAST_GOOD_SWAP
     
-    current_faces = get_many_faces(frame)
-    if not current_faces:
-        return None
-    
-    tracked_faces = []
-    
-    for face in current_faces:
-        face_id = None
-        max_similarity = 0.7
-        best_match_id = None
-        
-        partial_embedding = face.normed_embedding if hasattr(face, 'normed_embedding') else np.array([])
-        
-        for track_id, track_data in FACE_TRACKING.items():
-            if frame_number - track_data['last_seen'] > 10:
-                continue
-                
-            if not hasattr(track_data['last_face'], 'normed_embedding'):
-                continue
-                
-            # Simple similarity calculation
-            try:
-                embedding_similarity = 1 - cosine(partial_embedding, track_data['last_face'].normed_embedding)
-            except:
-                embedding_similarity = 0
-                
-            if embedding_similarity > max_similarity:
-                max_similarity = embedding_similarity
-                best_match_id = track_id
-        
-        if best_match_id:
-            face_id = best_match_id
-            prev_face = FACE_TRACKING[face_id]['last_face']
-            motion = calculate_motion_vector(prev_face, face)
-            
-            FACE_TRACKING[face_id].update({
-                'last_face': face,
-                'last_seen': frame_number,
-                'motion': motion
-            })
+    if detect_occlusion(target_face):
+        if LAST_GOOD_SWAP is not None:
+            # Blend dengan frame sebelumnya untuk transisi smooth
+            alpha = 0.6
+            blended_frame = cv2.addWeighted(swapped_frame, alpha, LAST_GOOD_SWAP, 1-alpha, 0)
+            return blended_frame
         else:
-            face_id = len(FACE_TRACKING) + 1
-            FACE_TRACKING[face_id] = {
-                'last_face': face,
-                'last_seen': frame_number,
-                'motion': 0.0
-            }
-        
-        # Simple smoothing
-        if len(TRACKING_HISTORY) >= 2:
-            recent_faces = list(TRACKING_HISTORY)[-2:]
-            if all('bbox' in f for f in recent_faces):
-                smoothed_bbox = np.mean([f['bbox'] for f in recent_faces], axis=0)
-                face.bbox = smoothed_bbox
-        
-        face_data = {'bbox': face.bbox.copy()}
-        TRACKING_HISTORY.append(face_data)
-        tracked_faces.append(face)
+            return temp_frame
     
-    FACE_TRACKING = {k: v for k, v in FACE_TRACKING.items() 
-                    if frame_number - v['last_seen'] <= 15}
-    
-    return tracked_faces
+    LAST_GOOD_SWAP = swapped_frame.copy()
+    return swapped_frame
 
-def detect_occlusion(face: Face) -> bool:
-    return face.det_score < 0.4
+def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
+    try:
+        swapped_frame = get_face_swapper().get(temp_frame, target_face, source_face, paste_back=True)
+        
+        # Simple occlusion handling
+        swapped_frame = handle_occlusion_fallback(temp_frame, swapped_frame, target_face)
+        
+        return swapped_frame
+    except Exception as e:
+        print(f"Face swap error: {e}")
+        return temp_frame
 
-def find_similar_face(frame: Frame, reference_face: Face, use_tracking: bool = False) -> Optional[Face]:
-    if use_tracking:
-        many_faces = smart_face_tracking(frame, 0)
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, frame_number: int = 0) -> Frame:
+    if roop.globals.many_faces:
+        many_faces = smart_face_tracking(temp_frame, frame_number)
+        if many_faces:
+            for target_face in many_faces:
+                temp_frame = swap_face(source_face, target_face, temp_frame)
     else:
-        many_faces = get_many_faces(frame)
-        
-    if many_faces and hasattr(reference_face, 'normed_embedding'):
-        best_face = None
-        best_distance = float('inf')
-        
-        for face in many_faces:
-            if hasattr(face, 'normed_embedding'):
-                distance = np.sum(np.square(face.normed_embedding - reference_face.normed_embedding))
-                
-                if distance < roop.globals.similar_face_distance and distance < best_distance:
-                    best_distance = distance
-                    best_face = face
-        
-        return best_face
+        target_face = find_similar_face(temp_frame, reference_face, use_tracking=True)
+        if target_face:
+            temp_frame = swap_face(source_face, target_face, temp_frame)
     
-    return None
+    return temp_frame
+
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    source_face = get_one_face(cv2.imread(source_path))
+    reference_face = None if roop.globals.many_faces else get_face_reference()
+    
+    for frame_number, temp_frame_path in enumerate(temp_frame_paths):
+        temp_frame = cv2.imread(temp_frame_path)
+        result = process_frame(source_face, reference_face, temp_frame, frame_number)
+        cv2.imwrite(temp_frame_path, result)
+        if update:
+            update()
+
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
+    source_face = get_one_face(cv2.imread(source_path))
+    target_frame = cv2.imread(target_path)
+    reference_face = None if roop.globals.many_faces else get_one_face(target_frame, roop.globals.reference_face_position)
+    result = process_frame(source_face, reference_face, target_frame)
+    cv2.imwrite(output_path, result)
+
+def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
+    if not roop.globals.many_faces and not get_face_reference():
+        reference_frame = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
+        reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
+        set_face_reference(reference_face)
+    
+    roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
+
+def resolve_relative_path(path: str) -> str:
+    import os
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), path))
