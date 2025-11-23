@@ -2,62 +2,72 @@ from typing import Any, Optional, List
 import threading
 from collections import deque
 from scipy.spatial.distance import cosine
-
-import insightface
 import numpy as np
 import cv2
 import os
 
+import insightface
 import roop.globals
 from roop.typing import Frame, Face
 
 # =====================================================================
-#  GLOBALS
+#  GLOBALS & CONFIGURATION
 # =====================================================================
 
 FACE_ANALYSER: Any = None
-THREAD_LOCK = threading.Lock()        # lock untuk init model
-TRACK_LOCK = threading.Lock()         # lock khusus tracking (penting untuk multi-thread)
+THREAD_LOCK = threading.Lock()
+TRACK_LOCK = threading.Lock()
 
-# Tracking variables
+# Tracking variables untuk video processing
 FACE_TRACKING: dict[int, dict[str, Any]] = {}
 TRACKING_HISTORY: deque = deque(maxlen=30)
 
-# Threshold / hyper-parameter default (boleh kamu tuning)
-MIN_DET_SCORE = 0.30        # min score agar wajah dianggap valid (untuk get_many_faces)
-OCCLUSION_THRESHOLD = 0.40  # det_score < ini dianggap occluded
-MAX_TRACK_GAP = 10          # frame: kalau lebih lama dari ini → track di-skip saat matching
-MAX_TRACK_AGE = 15          # frame: track dihapus bila tidak terlihat selama ini
-MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0–1)
+# ✅ OPTIMIZED THRESHOLDS UNTUK ReaSwapper 256
+MIN_DET_SCORE = 0.40        # Lebih ketat untuk kualitas tinggi
+OCCLUSION_THRESHOLD = 0.35  # Lebih sensitif untuk ReaSwapper
+MAX_TRACK_GAP = 8           # Lebih responsif
+MAX_TRACK_AGE = 12          # Cleanup lebih cepat
+MIN_EMBED_SIMILARITY = 0.75 # Similarity lebih tinggi untuk akurasi
 
+# ✅ QUALITY PRESETS UNTUK ReaSwapper 256
+QUALITY_PRESETS = {
+    'high': {'det_size': (640, 640), 'min_score': 0.5},
+    'balanced': {'det_size': (512, 512), 'min_score': 0.4},
+    'fast': {'det_size': (384, 384), 'min_score': 0.3}
+}
 
 # =====================================================================
-#  MODEL HANDLING
+#  MODEL HANDLING - OPTIMIZED UNTUK ReaSwapper
 # =====================================================================
 
 def get_face_analyser() -> Any:
     """
-    Lazy init insightface FaceAnalysis.
-    Sekali saja per proses, thread-safe.
+    Inisialisasi FaceAnalysis yang dioptimalkan untuk ReaSwapper 256.
     """
     global FACE_ANALYSER
 
     with THREAD_LOCK:
         if FACE_ANALYSER is None:
-            # langsung pakai buffalo_l (seperti mod kamu sebelumnya)
+            # ✅ Gunakan quality preset berdasarkan config
+            quality_preset = getattr(roop.globals, 'face_analysis_quality', 'balanced')
+            preset = QUALITY_PRESETS.get(quality_preset, QUALITY_PRESETS['balanced'])
+            
             FACE_ANALYSER = insightface.app.FaceAnalysis(
                 name='buffalo_l',
-                providers=roop.globals.execution_providers
+                providers=roop.globals.execution_providers,
+                allowed_modules=['detection', 'recognition']  # ✅ Hanya modul diperlukan
             )
-            FACE_ANALYSER.prepare(ctx_id=0)
-            print("✅ [face_analyser] Using buffalo_l with optimized settings")
+            FACE_ANALYSER.prepare(
+                ctx_id=0, 
+                det_size=preset['det_size']  # ✅ Size optimal
+            )
+            print(f"✅ [FaceAnalyser] Loaded with {quality_preset} preset (det_size: {preset['det_size']})")
     return FACE_ANALYSER
 
 
 def clear_face_analyser() -> None:
     """
     Reset analyser & tracking state.
-    Dipanggil saat post_process / cleanup.
     """
     global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY
 
@@ -70,95 +80,146 @@ def clear_face_analyser() -> None:
 
 
 # =====================================================================
-#  BASIC FACE ACCESSORS
+#  FRAME PRE-PROCESSING - OPTIMIZED UNTUK ReaSwapper
+# =====================================================================
+
+def preprocess_frame(frame: Frame) -> Frame:
+    """
+    Pre-processing frame untuk meningkatkan akurasi deteksi.
+    Dioptimalkan untuk ReaSwapper 256.
+    """
+    if frame is None or frame.size == 0:
+        return frame
+
+    try:
+        # ✅ Normalize ukuran frame untuk konsistensi
+        h, w = frame.shape[:2]
+        if h > 1080 or w > 1920:
+            # Scale down frame besar untuk performa
+            scale = min(1080/h, 1920/w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # ✅ Enhance contrast untuk deteksi lebih baik
+        if len(frame.shape) == 3:  # Color image
+            # Convert to YUV dan enhance luminance
+            yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+            yuv[:,:,0] = cv2.equalizeHist(yuv[:,:,0])
+            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
+        
+        return frame
+    except Exception as e:
+        print(f"[FaceAnalyser] Pre-processing failed: {e}")
+        return frame
+
+
+# =====================================================================
+#  BASIC FACE DETECTION - OPTIMIZED UNTUK ReaSwapper
 # =====================================================================
 
 def get_many_faces(frame: Frame) -> Optional[List[Face]]:
     """
-    Deteksi banyak wajah di satu frame.
-    - Pakai buffalo_l
-    - Filter berdasarkan det_score minimal (untuk video dance / gerak cepat)
+    Deteksi banyak wajah dengan quality filtering untuk ReaSwapper 256.
     """
+    if frame is None or frame.size == 0:
+        return None
+
     try:
-        faces = get_face_analyser().get(frame)
+        # ✅ Pre-process frame terlebih dahulu
+        processed_frame = preprocess_frame(frame)
+        
+        # ✅ Deteksi wajah
+        faces = get_face_analyser().get(processed_frame)
         if not faces:
             return []
 
-        # filter berdasarkan confidence
-        faces = [face for face in faces if getattr(face, "det_score", 0.0) >= MIN_DET_SCORE]
-        return faces
-    except ValueError:
+        # ✅ Filter ketat untuk ReaSwapper 256
+        quality_faces = []
+        for face in faces:
+            score = getattr(face, "det_score", 0.0)
+            # Filter berdasarkan score dan size wajah
+            bbox = face.bbox
+            face_width = bbox[2] - bbox[0]
+            face_height = bbox[3] - bbox[1]
+            min_face_size = min(face_width, face_height)
+            
+            if score >= MIN_DET_SCORE and min_face_size >= 40:  # Minimal 40px
+                quality_faces.append(face)
+
+        return quality_faces
+        
+    except ValueError as e:
+        print(f"[FaceAnalyser] Detection error: {e}")
         return None
-    except Exception:
-        # kalau ada error aneh dari insightface, jangan matikan pipeline
+    except Exception as e:
+        print(f"[FaceAnalyser] Unexpected error: {e}")
         return None
 
 
 def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
     """
-    Ambil 1 wajah dari frame:
-    - default: index 0
-    - kalau index out-of-range → pakai wajah terakhir
+    Ambil 1 wajah terbaik dengan prioritas kualitas untuk ReaSwapper 256.
     """
     many_faces = get_many_faces(frame)
-    if many_faces:
-        try:
-            return many_faces[position]
-        except IndexError:
-            return many_faces[-1]
-    return None
+    if not many_faces:
+        return None
+
+    try:
+        # ✅ Prioritaskan wajah dengan score tertinggi
+        sorted_faces = sorted(many_faces, 
+                            key=lambda x: getattr(x, "det_score", 0), 
+                            reverse=True)
+        
+        return sorted_faces[position]
+    except IndexError:
+        return sorted_faces[-1] if sorted_faces else None
 
 
 # =====================================================================
-#  MOTION & TRACKING
+#  SMART TRACKING - ENHANCED UNTUK ReaSwapper
 # =====================================================================
 
 def calculate_motion_vector(prev_face: Face, current_face: Face) -> float:
     """
-    Hitung pergerakan (jarak Euclidean) antara dua bbox wajah berturutan.
-    Dipakai untuk informasi tambahan tracking (walau saat ini lebih fokus ke embedding).
+    Hitung pergerakan wajah untuk tracking stability.
     """
     if prev_face is None or current_face is None:
         return 0.0
 
-    prev_bbox = prev_face.bbox
-    current_bbox = current_face.bbox
+    try:
+        prev_bbox = prev_face.bbox
+        current_bbox = current_face.bbox
 
-    # hitung titik tengah
-    prev_center = np.array([
-        (prev_bbox[0] + prev_bbox[2]) / 2,
-        (prev_bbox[1] + prev_bbox[3]) / 2
-    ])
-    current_center = np.array([
-        (current_bbox[0] + current_bbox[2]) / 2,
-        (current_bbox[1] + current_bbox[3]) / 2
-    ])
+        prev_center = np.array([
+            (prev_bbox[0] + prev_bbox[2]) / 2,
+            (prev_bbox[1] + prev_bbox[3]) / 2
+        ])
+        current_center = np.array([
+            (current_bbox[0] + current_bbox[2]) / 2,
+            (current_bbox[1] + current_bbox[3]) / 2
+        ])
 
-    motion = np.linalg.norm(current_center - prev_center)
-    return float(motion)
+        motion = np.linalg.norm(current_center - prev_center)
+        return float(motion)
+    except Exception:
+        return 0.0
 
 
-def _compute_embedding_similarity(current_embedding: np.ndarray,
+def _compute_embedding_similarity(current_embedding: np.ndarray, 
                                   track_embedding: np.ndarray) -> float:
     """
-    Hitung similarity embedding (cosine-based).
-    Return 0 kalau terjadi error.
+    Hitung similarity embedding dengan cosine distance.
     """
     try:
-        # cosine() dari scipy.spatial.distance mengembalikan *distance*
-        # kita ubah jadi similarity: 1 - distance
-        return 1.0 - float(cosine(current_embedding, track_embedding))
+        similarity = 1.0 - float(cosine(current_embedding, track_embedding))
+        return max(0.0, min(1.0, similarity))  # Clamp to [0, 1]
     except Exception:
         return 0.0
 
 
 def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]:
     """
-    Smart tracking:
-    - gunakan embedding similarity + sedikit motion
-    - jaga agar ID wajah konsisten antar frame
-    - smoothing bbox pakai TRACKING_HISTORY
-    - thread-safe: di-protect oleh TRACK_LOCK
+    Smart tracking yang dioptimalkan untuk ReaSwapper 256.
     """
     global FACE_TRACKING, TRACKING_HISTORY
 
@@ -169,19 +230,19 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
     tracked_faces: List[Face] = []
 
     with TRACK_LOCK:
+        # ✅ Process setiap wajah yang terdeteksi
         for face in current_faces:
             face_id = None
             max_similarity = MIN_EMBED_SIMILARITY
             best_match_id = None
 
-            # embedding wajah sekarang
             current_embedding = getattr(face, "normed_embedding", None)
             if current_embedding is None or len(current_embedding) == 0:
-                current_embedding = np.array([])
+                continue  # Skip wajah tanpa embedding
 
-            # cari track yang paling cocok (snapshot list() → aman dari perubahan size)
+            # ✅ Cari track yang cocok dari existing tracks
             for track_id, track_data in list(FACE_TRACKING.items()):
-                # lupakan track yang terlalu lama tidak terlihat
+                # Skip track yang terlalu lama tidak terlihat
                 if frame_number - track_data.get('last_seen', -9999) > MAX_TRACK_GAP:
                     continue
 
@@ -193,16 +254,24 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
                 if track_embedding is None:
                     continue
 
+                # ✅ Hitung similarity
                 embedding_similarity = _compute_embedding_similarity(
                     current_embedding, track_embedding
                 )
 
-                if embedding_similarity > max_similarity:
-                    max_similarity = embedding_similarity
+                # ✅ Tambah penalty untuk motion yang terlalu cepat
+                motion_penalty = 0.0
+                if 'motion' in track_data and track_data['motion'] > 50:  # Motion threshold
+                    motion_penalty = 0.2  # Reduce similarity untuk motion cepat
+
+                adjusted_similarity = embedding_similarity - motion_penalty
+
+                if adjusted_similarity > max_similarity:
+                    max_similarity = adjusted_similarity
                     best_match_id = track_id
 
             if best_match_id is not None:
-                # update track yang ada
+                # ✅ Update existing track
                 face_id = best_match_id
                 prev_face = FACE_TRACKING[face_id]['last_face']
                 motion = calculate_motion_vector(prev_face, face)
@@ -210,68 +279,96 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
                 FACE_TRACKING[face_id].update({
                     'last_face': face,
                     'last_seen': frame_number,
-                    'motion': motion
+                    'motion': motion,
+                    'similarity': max_similarity
                 })
             else:
-                # buat track baru
+                # ✅ Buat new track
                 face_id = len(FACE_TRACKING) + 1
                 FACE_TRACKING[face_id] = {
                     'last_face': face,
                     'last_seen': frame_number,
-                    'motion': 0.0
+                    'motion': 0.0,
+                    'similarity': 1.0,
+                    'created_at': frame_number
                 }
 
-            # smoothing bbox sederhana dengan history 2 frame terakhir
+            # ✅ Smoothing bbox dengan weighted average
             if len(TRACKING_HISTORY) >= 2:
                 recent_faces = list(TRACKING_HISTORY)[-2:]
-                if all('bbox' in f for f in recent_faces):
-                    smoothed_bbox = np.mean([f['bbox'] for f in recent_faces], axis=0)
-                    face.bbox = smoothed_bbox
+                valid_faces = [f for f in recent_faces if 'bbox' in f]
+                if valid_faces:
+                    weights = [0.7, 0.3]  # Weight untuk frame terbaru lebih tinggi
+                    if len(valid_faces) == 1:
+                        weights = [1.0]
+                    
+                    weighted_bbox = np.average(
+                        [f['bbox'] for f in valid_faces[:len(weights)]], 
+                        axis=0, 
+                        weights=weights[:len(valid_faces)]
+                    )
+                    face.bbox = weighted_bbox
 
-            # simpan ke history
+            # ✅ Simpan ke history
             face_data = {
-                'bbox': np.array(face.bbox, dtype=np.float32).copy()
+                'bbox': np.array(face.bbox, dtype=np.float32).copy(),
+                'score': getattr(face, "det_score", 0.0),
+                'frame_num': frame_number
             }
             TRACKING_HISTORY.append(face_data)
+            
+            # ✅ Attach tracking info ke face object
+            setattr(face, 'track_id', face_id)
+            setattr(face, 'track_similarity', max_similarity)
+            
             tracked_faces.append(face)
 
-        # bersihkan track yang sudah terlalu tua
-        FACE_TRACKING = {
-            k: v for k, v in list(FACE_TRACKING.items())
-            if frame_number - v.get('last_seen', -9999) <= MAX_TRACK_AGE
-        }
+        # ✅ Cleanup old tracks
+        current_track_ids = list(FACE_TRACKING.keys())
+        for track_id in current_track_ids:
+            if frame_number - FACE_TRACKING[track_id].get('last_seen', -9999) > MAX_TRACK_AGE:
+                del FACE_TRACKING[track_id]
 
-    return tracked_faces
+    return tracked_faces if tracked_faces else None
 
 
 # =====================================================================
-#  OCCLUSION & SIMILAR FACE
+#  ADVANCED FEATURES - OPTIMIZED UNTUK ReaSwapper
 # =====================================================================
 
 def detect_occlusion(face: Face) -> bool:
     """
-    Deteksi wajah yang ter-occlusion (tertutup tangan, rambut, dsb)
-    dengan memanfaatkan det_score dari detector.
-    - Semakin kecil score → deteksi makin tidak yakin / sebagian tertutup.
-    - Dengan threshold default 0.4.
+    Deteksi occlusion yang dioptimalkan untuk ReaSwapper 256.
     """
     score = getattr(face, "det_score", 1.0)
+    
+    # ✅ Additional checks untuk ReaSwapper
+    bbox = face.bbox
+    face_width = bbox[2] - bbox[0]
+    face_height = bbox[3] - bbox[1]
+    aspect_ratio = face_width / face_height if face_height > 0 else 1.0
+    
+    # ✅ Check untuk aspect ratio tidak normal (indicative of partial face)
+    if aspect_ratio < 0.6 or aspect_ratio > 1.8:
+        return True
+    
+    # ✅ Check size terlalu kecil
+    if min(face_width, face_height) < 30:
+        return True
+        
     return score < OCCLUSION_THRESHOLD
 
 
-def find_similar_face(frame: Frame,
-                      reference_face: Face,
-                      use_tracking: bool = True) -> Optional[Face]:
+def find_similar_face(frame: Frame, reference_face: Face, 
+                     use_tracking: bool = True) -> Optional[Face]:
     """
-    Cari wajah paling mirip di frame terhadap reference_face.
-    - Bisa pakai smart tracking (use_tracking=True)
-    - Atau fallback ke get_many_faces biasa
-    - Menggunakan embedding distance seperti di mod kamu sebelumnya
+    Cari wajah paling mirip dengan optimasi untuk ReaSwapper 256.
     """
     if reference_face is None:
         return None
 
-    if use_tracking:
+    # ✅ Gunakan tracking jika available
+    if use_tracking and hasattr(roop.globals, 'process_video') and roop.globals.process_video:
         many_faces = smart_face_tracking(frame, frame_number=0)
     else:
         many_faces = get_many_faces(frame)
@@ -286,20 +383,86 @@ def find_similar_face(frame: Frame,
     best_face = None
     best_distance = float('inf')
 
-    # threshold diambil dari globals kalau ada, else fallback
-    similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
+    # ✅ Threshold yang dioptimalkan untuk ReaSwapper
+    similar_threshold = getattr(roop.globals, 'similar_face_distance', 0.6)
 
     for face in many_faces:
         if not hasattr(face, "normed_embedding"):
             continue
 
+        # ✅ Additional quality check
+        face_score = getattr(face, "det_score", 0.0)
+        if face_score < MIN_DET_SCORE:
+            continue
+
         try:
+            # ✅ Euclidean distance untuk embedding
             distance = np.sum(np.square(face.normed_embedding - ref_emb))
+            
+            # ✅ Adjust threshold berdasarkan quality score
+            quality_adjustment = (1.0 - face_score) * 0.2  # Poor quality faces get penalty
+            adjusted_threshold = similar_threshold + quality_adjustment
+            
+            if distance < adjusted_threshold and distance < best_distance:
+                best_distance = distance
+                best_face = face
+                
         except Exception:
             continue
 
-        if distance < similar_threshold and distance < best_distance:
-            best_distance = distance
-            best_face = face
-
     return best_face
+
+
+def get_face_quality(face: Face) -> float:
+    """
+    Return quality score (0-1) untuk wajah.
+    Useful untuk prioritization dalam ReaSwapper 256.
+    """
+    if face is None:
+        return 0.0
+    
+    base_score = getattr(face, "det_score", 0.0)
+    
+    # ✅ Additional quality metrics
+    bbox = face.bbox
+    face_width = bbox[2] - bbox[0]
+    face_height = bbox[3] - bbox[1]
+    
+    # Size quality (normalize to 0-1)
+    size_quality = min(1.0, min(face_width, face_height) / 200.0)
+    
+    # Aspect ratio quality (penalty for extreme ratios)
+    aspect_ratio = face_width / face_height if face_height > 0 else 1.0
+    aspect_quality = 1.0 - abs(1.0 - aspect_ratio) * 0.5  # Penalty up to 0.5
+    
+    # Final quality score
+    quality = base_score * 0.6 + size_quality * 0.2 + aspect_quality * 0.2
+    return max(0.0, min(1.0, quality))
+
+
+# =====================================================================
+#  UTILITY FUNCTIONS
+# =====================================================================
+
+def get_face_landmarks(face: Face) -> Optional[np.ndarray]:
+    """
+    Extract landmarks dari face object jika available.
+    """
+    return getattr(face, "kps", None)
+
+
+def get_face_pose(face: Face) -> dict:
+    """
+    Estimate face pose dari landmarks.
+    """
+    landmarks = get_face_landmarks(face)
+    if landmarks is None or len(landmarks) < 5:
+        return {'pitch': 0, 'yaw': 0, 'roll': 0}
+    
+    # Simple pose estimation (placeholder implementation)
+    # Untuk implementasi lengkap, butuh complex 3D pose estimation
+    return {
+        'pitch': 0.0,  # Placeholder
+        'yaw': 0.0,    # Placeholder  
+        'roll': 0.0    # Placeholder
+    }
