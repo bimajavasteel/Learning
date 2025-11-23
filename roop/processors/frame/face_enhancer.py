@@ -6,23 +6,23 @@ from gfpgan.utils import GFPGANer
 import roop.globals
 import roop.processors.frame.core
 from roop.core import update_status
-from roop.face_analyser import (
-    get_many_faces,
-    smart_face_tracking,
-    detect_occlusion
-)
+from roop.face_analyser import get_many_faces, detect_occlusion  # ✅ pakai occlusion dari face_analyser
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()  # batasi concurrent enhance (hindari OOM)
+FACE_ENHANCER: Any = None
+THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-ENHANCER'
 
+# ==========================
+# Hyper-parameter enhancer
+# ==========================
+MIN_FACE_SIZE = 32          # lebar/tinggi minimal wajah yang akan di-enhance
+BASE_PAD_RATIO = 0.15       # padding dasar 15%
+MIN_PAD_RATIO = 0.08        # batas bawah padding
+MAX_PAD_RATIO = 0.30        # batas atas padding
 
-# ==========================
-#  MODEL HANDLING
-# ==========================
 
 def get_face_enhancer() -> Any:
     """
@@ -39,6 +39,7 @@ def get_face_enhancer() -> Any:
                 upscale=1,
                 device=get_device()
             )
+            print("✅ [face_enhancer] Using GFPGANv1.4")
     return FACE_ENHANCER
 
 
@@ -51,16 +52,13 @@ def get_device() -> str:
 
 
 def clear_face_enhancer() -> None:
-    """
-    Reset enhancer agar bisa re-init kalau perlu.
-    """
     global FACE_ENHANCER
     FACE_ENHANCER = None
 
 
 def pre_check() -> bool:
     """
-    Pastikan model GFPGAN sudah di-download.
+    Download model GFPGAN bila belum ada.
     """
     download_directory_path = resolve_relative_path('../models')
     conditional_download(
@@ -72,7 +70,7 @@ def pre_check() -> bool:
 
 def pre_start() -> bool:
     """
-    Validasi target path (image / video).
+    Pastikan target_path valid (image / video).
     """
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
         update_status('Select an image or video for target path.', NAME)
@@ -81,160 +79,133 @@ def pre_start() -> bool:
 
 
 def post_process() -> None:
-    """
-    Cleanup setelah selesai enhance.
-    """
     clear_face_enhancer()
 
 
-# ==========================
-#  INTI ENHANCE
-# ==========================
-
-def _extract_bbox_from_face(target_face: Face, frame_shape) -> tuple[int, int, int, int] | None:
+def _get_bbox_from_face(target_face: Face):
     """
-    Helper untuk ambil dan clamp bbox dari objek Face (bukan dict).
-    Menggunakan bbox hasil smoothing dari face_analyser.
+    Support dua gaya:
+    - Face object dengan atribut .bbox (insightface)
+    - dict dengan key 'bbox'
     """
-    frame_height, frame_width = frame_shape[:2]
-
     bbox = getattr(target_face, "bbox", None)
-    if bbox is None:
-        return None
-
-    # bbox bisa float → convert ke int
-    x1, y1, x2, y2 = map(int, bbox)
-
-    # pastikan urutan benar (kadang bisa kebalik kalau ada bug upstream)
-    start_x, end_x = sorted([x1, x2])
-    start_y, end_y = sorted([y1, y2])
-
-    # clamp ke dalam frame
-    start_x = max(0, min(start_x, frame_width - 1))
-    end_x   = max(0, min(end_x,   frame_width))
-    start_y = max(0, min(start_y, frame_height - 1))
-    end_y   = max(0, min(end_y,   frame_height))
-
-    if end_x <= start_x or end_y <= start_y:
-        return None
-
-    return start_x, start_y, end_x, end_y
+    if bbox is None and isinstance(target_face, dict):
+        bbox = target_face.get("bbox", None)
+    return bbox
 
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Enhance satu wajah pada frame menggunakan GFPGAN:
-    - pakai bbox dari Face (bukan dict)
-    - padding adaptif agar konteks cukup tanpa terlalu lebar
-    - aman terhadap error enhancer
+    Enhance satu wajah dengan:
+    - bbox + padding adaptif
+    - aman terhadap out-of-bound
+    - resize kalau output GFPGAN beda ukuran
     """
     frame_height, frame_width = temp_frame.shape[:2]
 
-    bbox = _extract_bbox_from_face(target_face, temp_frame.shape)
+    bbox = _get_bbox_from_face(target_face)
     if bbox is None:
         return temp_frame
 
-    start_x, start_y, end_x, end_y = bbox
+    try:
+        start_x, start_y, end_x, end_y = map(int, bbox)
+    except Exception:
+        return temp_frame
 
     face_w, face_h = end_x - start_x, end_y - start_y
     if face_w <= 0 or face_h <= 0:
         return temp_frame
 
+    # Skip wajah terlalu kecil (biasanya noise / jauh)
+    if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE:
+        return temp_frame
+
     # Padding adaptif:
-    # - minimal 10% bbox
-    # - maksimal 30% bbox
-    # - kalau wajah kecil → padding relatif lebih besar biar cukup konteks
-    pad_ratio = max(0.10, min(0.30, 100 / max(face_w, face_h)))
+    # - makin kecil wajah → padding relatif lebih besar
+    # - tetap dibatasi MIN_PAD_RATIO–MAX_PAD_RATIO
+    max_side = max(face_w, face_h)
+    dynamic_ratio = BASE_PAD_RATIO + (80.0 / max(max_side, 1_000))  # kecil → naik sedikit
+    pad_ratio = max(MIN_PAD_RATIO, min(MAX_PAD_RATIO, dynamic_ratio))
+
     padding_x = int(face_w * pad_ratio)
     padding_y = int(face_h * pad_ratio)
 
-    # terapkan padding & clamp
+    # Clamp ke dalam frame
     start_x = max(0, start_x - padding_x)
     start_y = max(0, start_y - padding_y)
-    end_x   = min(frame_width,  end_x + padding_x)
-    end_y   = min(frame_height, end_y + padding_y)
+    end_x = min(frame_width, end_x + padding_x)
+    end_y = min(frame_height, end_y + padding_y)
+
+    if end_x <= start_x or end_y <= start_y:
+        return temp_frame
 
     temp_face = temp_frame[start_y:end_y, start_x:end_x]
     if temp_face.size == 0:
         return temp_frame
 
-    # GFPGAN kadang makan banyak VRAM → batasi dengan semaphore
     with THREAD_SEMAPHORE:
         try:
-            # enhance:
-            # return: cropped_faces, restored_faces, restored_img
+            # GFPGANer.enhance() → (cropped_faces, restored_faces, restored_img)
             _, _, enhanced_face = get_face_enhancer().enhance(
                 temp_face,
-                paste_back=True
+                has_aligned=False,
+                only_center_face=True,
+                paste_back=False
             )
 
-            # Pastikan ukuran match sebelum dipaste kembali
-            if enhanced_face is not None and enhanced_face.shape == temp_face.shape:
-                temp_frame[start_y:end_y, start_x:end_x] = enhanced_face
+            if enhanced_face is None:
+                return temp_frame
+
+            # Pastikan ukuran cocok (resize kalau perlu)
+            if enhanced_face.shape[:2] != temp_face.shape[:2]:
+                enhanced_face = cv2.resize(
+                    enhanced_face,
+                    (temp_face.shape[1], temp_face.shape[0]),
+                    interpolation=cv2.INTER_LINEAR
+                )
+
+            temp_frame[start_y:end_y, start_x:end_x] = enhanced_face
+
         except Exception as e:
             print(f"[WARNING] Enhance face failed: {e}")
 
     return temp_frame
 
 
-# ==========================
-#  FRAME PROCESSING
-# ==========================
-
-def process_frame(
-    source_face: Face,
-    reference_face: Face,
-    temp_frame: Frame,
-    frame_number: int = 0
-) -> Frame:
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
     """
-    Proses 1 frame:
-    - Pakai smart_face_tracking kalau perlu konsistensi ID
-    - Skip wajah occluded (tangan, rambut, objek)
-    - Enhance hanya wajah valid
+    Enhance semua wajah di frame:
+    - Deteksi wajah via get_many_faces (buffalo_l)
+    - Skip wajah occluded via detect_occlusion()
     """
-    # Mode banyak wajah → gunakan tracking agar stabil
-    if roop.globals.many_faces:
-        faces = smart_face_tracking(temp_frame, frame_number)
-        if not faces:
-            faces = get_many_faces(temp_frame)
-    else:
-        # Mode single-face, cukup deteksi biasa
-        faces = get_many_faces(temp_frame)
-
-    if not faces:
+    many_faces = get_many_faces(temp_frame)
+    if not many_faces:
         return temp_frame
 
-    for face in faces:
-        # Skip wajah yang ter-occlusion (det_score rendah)
-        if detect_occlusion(face):
-            continue
+    for target_face in many_faces:
+        # ✅ Occlusion-aware: skip wajah dengan det_score rendah / tertutup
+        try:
+            if detect_occlusion(target_face):
+                continue
+        except Exception:
+            # Kalau detect_occlusion error, lanjut saja (fallback)
+            pass
 
-        temp_frame = enhance_face(face, temp_frame)
+        temp_frame = enhance_face(target_face, temp_frame)
 
     return temp_frame
 
 
-def process_frames(
-    source_path: str,
-    temp_frame_paths: List[str],
-    update: Callable[[], None]
-) -> None:
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     """
-    Dipanggil oleh core.process_video untuk batch frame (per-thread).
-    Kita kasih frame_number lokal (index loop) ke process_frame untuk tracking.
+    Proses batch frame (dipanggil core.process_video).
     """
-    for idx, temp_frame_path in enumerate(temp_frame_paths):
+    for temp_frame_path in temp_frame_paths:
         temp_frame = cv2.imread(temp_frame_path)
         if temp_frame is None:
             continue
 
-        result = process_frame(
-            source_face=None,
-            reference_face=None,
-            temp_frame=temp_frame,
-            frame_number=idx
-        )
+        result = process_frame(None, None, temp_frame)
         cv2.imwrite(temp_frame_path, result)
 
         if update:
@@ -243,29 +214,17 @@ def process_frames(
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     """
-    Enhance image tunggal.
+    Mode image ke image.
     """
     target_frame = cv2.imread(target_path)
-    if target_frame is None:
-        return
-
-    result = process_frame(
-        source_face=None,
-        reference_face=None,
-        temp_frame=target_frame,
-        frame_number=0
-    )
+    result = process_frame(None, None, target_frame)
     cv2.imwrite(output_path, result)
 
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """
-    Entry point mode video.
-    - source_path tidak dipakai untuk enhancer (hanya target yang di-enhance)
-    - core.process_video yang akan mengatur multi-thread / progres
+    Mode video:
+    - core.process_video akan handle multi-thread frame
+    - enhancer hanya fokus ke per-frame processing
     """
-    roop.processors.frame.core.process_video(
-        None,
-        temp_frame_paths,
-        process_frames
-    )
+    roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
