@@ -1,38 +1,5 @@
 # ROOP Turbo — Extreme-Angle Edition
 
-**TL;DR**: Paket ini berisi full-ready kode yang dioptimalkan untuk:
-
-* SCRFD 10G KPS detector
-* antelopev2 embedder
-* CUDA T4 (FP16, tuned providers)
-* Occlusion & extreme-angle stabilizers
-* Batch detection, landmark smoothing, partial-embedding matching
-* Soft-mask blending + color correction
-
----
-
-## Plan (pseudocode)
-
-1. Initialize ONNX/InsightFace with SessionOptions tuned for T4.
-2. Load SCRFD detector (10g_kps) and antelopev2 embedder with high-res det_size.
-3. Implement caching per-frame and batching for `get_many_faces`.
-4. Implement temporal smoothing for landmarks & embeddings.
-5. Implement `partial_distance` (upper-face mask) for robust matching.
-6. Implement face swapper wrapper that does segmentation-aware soft blending, color correction, and motion-consistent embedding freeze.
-7. Provide utilities: CLAHE eye enhancement, gaussian soft mask, simple color-match (gain/offset + histogram match fallback).
-
----
-
-## Files included (copy each block into the corresponding file in your project):
-
-### `roop/face_analyser.py`
-
-```python
-# File: roop/face_analyser.py
-"""Face analyser optimized for extreme angles, occlusion, and CUDA T4.
-Paths: place high-quality detectors (scrfd_10g_kps) and antelopev2 under <project>/models/
-"""
-
 import os
 import threading
 from functools import lru_cache
