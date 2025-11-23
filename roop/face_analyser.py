@@ -1,305 +1,182 @@
+# (FILE 1) – face_analyser_3D.py (AUTO DOWNLOAD VERSION)
+# ------------------------------------------------------
+
 from typing import Any, Optional, List
 import threading
-from collections import deque
 from scipy.spatial.distance import cosine
-
-import insightface
+from collections import deque
 import numpy as np
 import cv2
-import os
+import onnxruntime as ort
 
+import insightface
 import roop.globals
 from roop.typing import Frame, Face
+from roop.utilities import resolve_relative_path, conditional_download
 
-# =====================================================================
-#  GLOBALS
-# =====================================================================
+FACE_ANALYSER = None
+THREAD_LOCK = threading.Lock()
+TRACK_LOCK = threading.Lock()
 
-FACE_ANALYSER: Any = None
-THREAD_LOCK = threading.Lock()        # lock untuk init model
-TRACK_LOCK = threading.Lock()         # lock khusus tracking (penting untuk multi-thread)
+FACE_TRACKING = {}
+TRACKING_HISTORY = deque(maxlen=30)
 
-# Tracking variables
-FACE_TRACKING: dict[int, dict[str, Any]] = {}
-TRACKING_HISTORY: deque = deque(maxlen=30)
+MIN_DET_SCORE = 0.30
+MAX_TRACK_GAP = 10
+MAX_TRACK_AGE = 15
+MIN_EMBED_SIM = 0.70
 
-# Threshold / hyper-parameter default (boleh kamu tuning)
-MIN_DET_SCORE = 0.30        # min score agar wajah dianggap valid (untuk get_many_faces)
-OCCLUSION_THRESHOLD = 0.40  # det_score < ini dianggap occluded
-MAX_TRACK_GAP = 10          # frame: kalau lebih lama dari ini → track di-skip saat matching
-MAX_TRACK_AGE = 15          # frame: track dihapus bila tidak terlihat selama ini
-MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0–1)
+OCCLUDER = None
 
 
-# =====================================================================
-#  MODEL HANDLING
-# =====================================================================
+# ------------------------------------------------------
+# AUTO DOWNLOAD OCCLUDER
+# ------------------------------------------------------
+def pre_check_occluder():
+    """
+    Auto download occluder.onnx jika belum ada.
+    """
+    download_directory = resolve_relative_path("../models")
+    conditional_download(download_directory, [
+        "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/occluder.onnx"
+    ])
+    return True
 
+
+# ------------------------------------------------------
+# LOAD OCCLUDER.ONNX
+# ------------------------------------------------------
+def load_occluder():
+    global OCCLUDER
+    if OCCLUDER is None:
+        pre_check_occluder()
+        path = resolve_relative_path("../models/occluder.onnx")
+        OCCLUDER = ort.InferenceSession(
+            path,
+            providers=roop.globals.execution_providers
+        )
+    return OCCLUDER
+
+
+def occlusion_mask(face_crop: np.ndarray):
+    occl = load_occluder()
+    img = cv2.resize(face_crop, (256,256))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2,0,1))[None]
+
+    out = occl.run(None, {"input": img})[0]
+    mask = out.squeeze()
+    mask = (mask > 0.3).astype(np.uint8)
+    return cv2.resize(mask, (face_crop.shape[1], face_crop.shape[0]))
+
+
+# ------------------------------------------------------
+# HEADPOSE FROM LANDMARKS (Yaw / Pitch)
+# ------------------------------------------------------
+def headpose_from_landmarks(lm):
+    left_eye = lm[36]
+    right_eye = lm[45]
+    nose = lm[30]
+
+    dx = right_eye[0] - left_eye[0]
+    dy = right_eye[1] - left_eye[1]
+
+    yaw = np.degrees(np.arctan2(dy, dx))
+
+    nose_up = nose[1] - ((left_eye[1] + right_eye[1]) / 2)
+    pitch = np.degrees(np.arctan2(nose_up, abs(dx)))
+
+    return yaw, pitch
+
+
+# ------------------------------------------------------
+# INIT FACE ANALYSER (BUFFALO_L)
+# ------------------------------------------------------
 def get_face_analyser() -> Any:
-    """
-    Lazy init insightface FaceAnalysis.
-    Sekali saja per proses, thread-safe.
-    """
     global FACE_ANALYSER
 
     with THREAD_LOCK:
         if FACE_ANALYSER is None:
-            # langsung pakai buffalo_l (seperti mod kamu sebelumnya)
+            pre_check_occluder()  # auto download occluder
             FACE_ANALYSER = insightface.app.FaceAnalysis(
-                name='buffalo_l',
+                name="buffalo_l",
                 providers=roop.globals.execution_providers
             )
-            FACE_ANALYSER.prepare(ctx_id=0)
-            print("✅ [face_analyser] Using buffalo_l with optimized settings")
+            FACE_ANALYSER.prepare(ctx_id=0, det_size=(640,640))
     return FACE_ANALYSER
 
 
-def clear_face_analyser() -> None:
-    """
-    Reset analyser & tracking state.
-    Dipanggil saat post_process / cleanup.
-    """
-    global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY
-
-    with TRACK_LOCK:
-        FACE_TRACKING.clear()
-        TRACKING_HISTORY.clear()
-
-    with THREAD_LOCK:
-        FACE_ANALYSER = None
-
-
-# =====================================================================
-#  BASIC FACE ACCESSORS
-# =====================================================================
-
+# ------------------------------------------------------
+# FACE DETECTION
+# ------------------------------------------------------
 def get_many_faces(frame: Frame) -> Optional[List[Face]]:
-    """
-    Deteksi banyak wajah di satu frame.
-    - Pakai buffalo_l
-    - Filter berdasarkan det_score minimal (untuk video dance / gerak cepat)
-    """
     try:
         faces = get_face_analyser().get(frame)
         if not faces:
             return []
-
-        # filter berdasarkan confidence
-        faces = [face for face in faces if getattr(face, "det_score", 0.0) >= MIN_DET_SCORE]
-        return faces
-    except ValueError:
-        return None
-    except Exception:
-        # kalau ada error aneh dari insightface, jangan matikan pipeline
+        return [f for f in faces if getattr(f, "det_score", 0.0) >= MIN_DET_SCORE]
+    except:
         return None
 
 
-def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
-    """
-    Ambil 1 wajah dari frame:
-    - default: index 0
-    - kalau index out-of-range → pakai wajah terakhir
-    """
-    many_faces = get_many_faces(frame)
-    if many_faces:
-        try:
-            return many_faces[position]
-        except IndexError:
-            return many_faces[-1]
+def get_one_face(frame: Frame, pos=0):
+    f = get_many_faces(frame)
+    if f:
+        return f[pos] if pos < len(f) else f[-1]
     return None
 
 
-# =====================================================================
-#  MOTION & TRACKING
-# =====================================================================
-
-def calculate_motion_vector(prev_face: Face, current_face: Face) -> float:
-    """
-    Hitung pergerakan (jarak Euclidean) antara dua bbox wajah berturutan.
-    Dipakai untuk informasi tambahan tracking (walau saat ini lebih fokus ke embedding).
-    """
-    if prev_face is None or current_face is None:
-        return 0.0
-
-    prev_bbox = prev_face.bbox
-    current_bbox = current_face.bbox
-
-    # hitung titik tengah
-    prev_center = np.array([
-        (prev_bbox[0] + prev_bbox[2]) / 2,
-        (prev_bbox[1] + prev_bbox[3]) / 2
-    ])
-    current_center = np.array([
-        (current_bbox[0] + current_bbox[2]) / 2,
-        (current_bbox[1] + current_bbox[3]) / 2
-    ])
-
-    motion = np.linalg.norm(current_center - prev_center)
-    return float(motion)
-
-
-def _compute_embedding_similarity(current_embedding: np.ndarray,
-                                  track_embedding: np.ndarray) -> float:
-    """
-    Hitung similarity embedding (cosine-based).
-    Return 0 kalau terjadi error.
-    """
+# ------------------------------------------------------
+# SIMILARITY
+# ------------------------------------------------------
+def _sim(e1, e2):
     try:
-        # cosine() dari scipy.spatial.distance mengembalikan *distance*
-        # kita ubah jadi similarity: 1 - distance
-        return 1.0 - float(cosine(current_embedding, track_embedding))
-    except Exception:
+        return 1.0 - float(cosine(e1, e2))
+    except:
         return 0.0
 
 
-def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]:
-    """
-    Smart tracking:
-    - gunakan embedding similarity + sedikit motion
-    - jaga agar ID wajah konsisten antar frame
-    - smoothing bbox pakai TRACKING_HISTORY
-    - thread-safe: di-protect oleh TRACK_LOCK
-    """
+# ------------------------------------------------------
+# SMART FACE TRACKING
+# ------------------------------------------------------
+def smart_face_tracking(frame: Frame, idx: int):
     global FACE_TRACKING, TRACKING_HISTORY
 
-    current_faces = get_many_faces(frame)
-    if not current_faces:
+    faces = get_many_faces(frame)
+    if not faces:
         return None
 
-    tracked_faces: List[Face] = []
-
+    output = []
     with TRACK_LOCK:
-        for face in current_faces:
-            face_id = None
-            max_similarity = MIN_EMBED_SIMILARITY
-            best_match_id = None
+        for f in faces:
+            emb = getattr(f, "normed_embedding", None)
+            if emb is None:
+                continue
 
-            # embedding wajah sekarang
-            current_embedding = getattr(face, "normed_embedding", None)
-            if current_embedding is None or len(current_embedding) == 0:
-                current_embedding = np.array([])
+            best = None
+            best_sim = MIN_EMBED_SIM
 
-            # cari track yang paling cocok (snapshot list() → aman dari perubahan size)
-            for track_id, track_data in list(FACE_TRACKING.items()):
-                # lupakan track yang terlalu lama tidak terlihat
-                if frame_number - track_data.get('last_seen', -9999) > MAX_TRACK_GAP:
+            for tid, t in list(FACE_TRACKING.items()):
+                if idx - t["last"] > MAX_TRACK_GAP:
                     continue
 
-                last_face = track_data.get('last_face', None)
-                if last_face is None:
-                    continue
+                tface = t["face"]
+                tsim = _sim(emb, tface.normed_embedding)
+                if tsim > best_sim:
+                    best_sim = tsim
+                    best = tid
 
-                track_embedding = getattr(last_face, "normed_embedding", None)
-                if track_embedding is None:
-                    continue
-
-                embedding_similarity = _compute_embedding_similarity(
-                    current_embedding, track_embedding
-                )
-
-                if embedding_similarity > max_similarity:
-                    max_similarity = embedding_similarity
-                    best_match_id = track_id
-
-            if best_match_id is not None:
-                # update track yang ada
-                face_id = best_match_id
-                prev_face = FACE_TRACKING[face_id]['last_face']
-                motion = calculate_motion_vector(prev_face, face)
-
-                FACE_TRACKING[face_id].update({
-                    'last_face': face,
-                    'last_seen': frame_number,
-                    'motion': motion
-                })
+            if best is None:
+                new_id = len(FACE_TRACKING) + 1
+                FACE_TRACKING[new_id] = {"face": f, "last": idx}
             else:
-                # buat track baru
-                face_id = len(FACE_TRACKING) + 1
-                FACE_TRACKING[face_id] = {
-                    'last_face': face,
-                    'last_seen': frame_number,
-                    'motion': 0.0
-                }
+                FACE_TRACKING[best] = {"face": f, "last": idx}
 
-            # smoothing bbox sederhana dengan history 2 frame terakhir
-            if len(TRACKING_HISTORY) >= 2:
-                recent_faces = list(TRACKING_HISTORY)[-2:]
-                if all('bbox' in f for f in recent_faces):
-                    smoothed_bbox = np.mean([f['bbox'] for f in recent_faces], axis=0)
-                    face.bbox = smoothed_bbox
+            output.append(f)
 
-            # simpan ke history
-            face_data = {
-                'bbox': np.array(face.bbox, dtype=np.float32).copy()
-            }
-            TRACKING_HISTORY.append(face_data)
-            tracked_faces.append(face)
-
-        # bersihkan track yang sudah terlalu tua
         FACE_TRACKING = {
-            k: v for k, v in list(FACE_TRACKING.items())
-            if frame_number - v.get('last_seen', -9999) <= MAX_TRACK_AGE
+            tid: t for tid, t in FACE_TRACKING.items()
+            if idx - t["last"] <= MAX_TRACK_AGE
         }
 
-    return tracked_faces
-
-
-# =====================================================================
-#  OCCLUSION & SIMILAR FACE
-# =====================================================================
-
-def detect_occlusion(face: Face) -> bool:
-    """
-    Deteksi wajah yang ter-occlusion (tertutup tangan, rambut, dsb)
-    dengan memanfaatkan det_score dari detector.
-    - Semakin kecil score → deteksi makin tidak yakin / sebagian tertutup.
-    - Dengan threshold default 0.4.
-    """
-    score = getattr(face, "det_score", 1.0)
-    return score < OCCLUSION_THRESHOLD
-
-
-def find_similar_face(frame: Frame,
-                      reference_face: Face,
-                      use_tracking: bool = True) -> Optional[Face]:
-    """
-    Cari wajah paling mirip di frame terhadap reference_face.
-    - Bisa pakai smart tracking (use_tracking=True)
-    - Atau fallback ke get_many_faces biasa
-    - Menggunakan embedding distance seperti di mod kamu sebelumnya
-    """
-    if reference_face is None:
-        return None
-
-    if use_tracking:
-        many_faces = smart_face_tracking(frame, frame_number=0)
-    else:
-        many_faces = get_many_faces(frame)
-
-    if not many_faces:
-        return None
-
-    if not hasattr(reference_face, "normed_embedding"):
-        return None
-
-    ref_emb = reference_face.normed_embedding
-    best_face = None
-    best_distance = float('inf')
-
-    # threshold diambil dari globals kalau ada, else fallback
-    similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
-
-    for face in many_faces:
-        if not hasattr(face, "normed_embedding"):
-            continue
-
-        try:
-            distance = np.sum(np.square(face.normed_embedding - ref_emb))
-        except Exception:
-            continue
-
-        if distance < similar_threshold and distance < best_distance:
-            best_distance = distance
-            best_face = face
-
-    return best_face
+    return output
