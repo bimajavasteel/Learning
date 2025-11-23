@@ -466,3 +466,16 @@ def get_face_pose(face: Face) -> dict:
         'yaw': 0.0,    # Placeholder  
         'roll': 0.0    # Placeholder
     }
+
+def get_face_analyser() -> Any:
+    global FACE_ANALYSER
+
+    with THREAD_LOCK:
+        if FACE_ANALYSER is None:
+            FACE_ANALYSER = insightface.app.FaceAnalysis(
+                name='buffalo_l',
+                providers=roop.globals.execution_providers,
+                allowed_modules=['detection', 'recognition']
+            )
+            FACE_ANALYSER.prepare(ctx_id=0, det_size=(640, 640))  # ✅ Higher resolution for better 256px swapping
+    return FACE_ANALYSER
