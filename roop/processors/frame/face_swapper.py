@@ -33,12 +33,27 @@ def get_face_swapper() -> Any:
         if FACE_SWAPPER is None:
             # ✅ UPDATED: Gunakan ReaSwapper 256
             model_path = resolve_relative_path('../models/reaSwapper_256.onnx')
-            FACE_SWAPPER = insightface.model_zoo.get_model(
-                model_path,
-                providers=roop.globals.execution_providers,
-                # ✅ Optimasi khusus untuk ReaSwapper 256
-                session_options=roop.globals.session_options
-            )
+            
+            # ✅ FIXED: Hapus session_options yang tidak ada
+            try:
+                FACE_SWAPPER = insightface.model_zoo.get_model(
+                    model_path,
+                    providers=roop.globals.execution_providers
+                )
+                print("✅ [ReaSwapper] Loaded ReaSwapper 256 model successfully")
+            except Exception as e:
+                print(f"❌ [ReaSwapper] Failed to load model: {e}")
+                # Fallback ke inswapper_128 jika ReaSwapper gagal
+                try:
+                    model_path = resolve_relative_path('../models/inswapper_128.onnx')
+                    FACE_SWAPPER = insightface.model_zoo.get_model(
+                        model_path,
+                        providers=roop.globals.execution_providers
+                    )
+                    print("✅ [ReaSwapper] Fallback to inswapper_128")
+                except Exception as fallback_error:
+                    print(f"❌ [ReaSwapper] Fallback also failed: {fallback_error}")
+                    
     return FACE_SWAPPER
 
 
@@ -52,11 +67,26 @@ def pre_check() -> bool:
     Pastikan model ReaSwapper 256 sudah ke-download.
     """
     download_directory_path = resolve_relative_path('../models')
-    # ✅ UPDATED: Download link untuk ReaSwapper 256
-    conditional_download(download_directory_path, [
-        'https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/reswapper_256.onnx'
-    ])
-    return True
+    
+    # ✅ UPDATED: Coba download ReaSwapper 256, fallback ke inswapper_128
+    try:
+        conditional_download(download_directory_path, [
+            'https://huggingface.co/ezioruan/reaSwapper_256/resolve/main/reaSwapper_256.onnx'
+        ])
+        print("✅ [ReaSwapper] ReaSwapper 256 model available")
+        return True
+    except Exception as e:
+        print(f"⚠️ [ReaSwapper] ReaSwapper 256 not available: {e}")
+        # Fallback ke inswapper_128
+        try:
+            conditional_download(download_directory_path, [
+                'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx'
+            ])
+            print("✅ [ReaSwapper] Using inswapper_128 as fallback")
+            return True
+        except Exception as fallback_error:
+            print(f"❌ [ReaSwapper] All models failed: {fallback_error}")
+            return False
 
 
 def pre_start() -> bool:
@@ -74,9 +104,9 @@ def pre_start() -> bool:
         update_status('No face in source path detected.', NAME)
         return False
 
-    # ✅ ENHANCED: Validasi kualitas source face untuk ReaSwapper 256
-    if hasattr(source_face, 'det_score') and source_face.det_score < 0.5:
-        update_status('Source face quality too low for ReaSwapper 256.', NAME)
+    # ✅ ENHANCED: Validasi kualitas source face 
+    if hasattr(source_face, 'det_score') and source_face.det_score < 0.4:
+        update_status('Source face quality too low for face swapping.', NAME)
         return False
 
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
@@ -102,7 +132,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         return temp_frame
 
     try:
-        # ✅ ENHANCED: Optimasi parameter untuk ReaSwapper 256
+        # ✅ FIXED: Panggil model tanpa parameter tambahan
         result = get_face_swapper().get(
             temp_frame,
             target_face,
@@ -110,44 +140,11 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
             paste_back=True
         )
         
-        # ✅ ENHANCED: Post-processing untuk hasil lebih natural
-        if result is not None and roop.globals.face_enhancer:
-            result = enhance_swapped_face(result, target_face)
-            
         return result
+        
     except Exception as e:
         print(f"[ReaSwapper] Swap failed: {e}")
         return temp_frame
-
-
-def enhance_swapped_face(swapped_frame: Frame, original_face: Face) -> Frame:
-    """
-    Enhancement khusus untuk hasil ReaSwapper 256.
-    """
-    try:
-        # Soft blending untuk hasil lebih natural
-        alpha = 0.95  # Blending factor
-        if hasattr(original_face, 'bbox'):
-            bbox = original_face.bbox.astype(int)
-            x1, y1, x2, y2 = bbox
-            
-            # Ensure coordinates are within frame bounds
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(swapped_frame.shape[1], x2), min(swapped_frame.shape[0], y2)
-            
-            if x2 > x1 and y2 > y1:
-                # Extract face region
-                face_region = swapped_frame[y1:y2, x1:x2]
-                if face_region.size > 0:
-                    # Apply subtle Gaussian blur for blending
-                    blended = cv2.GaussianBlur(face_region, (3, 3), 0)
-                    swapped_frame[y1:y2, x1:x2] = cv2.addWeighted(
-                        face_region, alpha, blended, 1 - alpha, 0
-                    )
-    except Exception:
-        pass
-    
-    return swapped_frame
 
 
 def _select_best_target_by_embedding(
@@ -167,8 +164,8 @@ def _select_best_target_by_embedding(
     best_face = None
     best_distance = float('inf')
 
-    # ✅ UPDATED: Threshold lebih ketat untuk ReaSwapper 256
-    similar_threshold = getattr(roop.globals, 'similar_face_distance', 0.6)  # Lebih ketat
+    # ✅ UPDATED: Threshold lebih ketat untuk kualitas tinggi
+    similar_threshold = getattr(roop.globals, 'similar_face_distance', 0.6)
 
     for f in faces:
         if not hasattr(f, 'normed_embedding'):
@@ -210,7 +207,7 @@ def process_frame(
             return temp_frame
 
         for target_face in faces:
-            # ✅ ENHANCED: Filter lebih ketat untuk ReaSwapper 256
+            # ✅ ENHANCED: Filter lebih ketat 
             if detect_occlusion(target_face) or getattr(target_face, 'det_score', 0) < 0.4:
                 continue
 
@@ -226,7 +223,7 @@ def process_frame(
     if not tracked_faces:
         return temp_frame
 
-    # ✅ ENHANCED: Filter kualitas untuk ReaSwapper 256
+    # ✅ ENHANCED: Filter kualitas
     valid_faces = [
         f for f in tracked_faces 
         if not detect_occlusion(f) and getattr(f, 'det_score', 0) >= 0.4
@@ -247,19 +244,6 @@ def process_frame(
     return temp_frame
 
 
-# ✅ FUNGSI BARU: Pre-process frame untuk ReaSwapper 256
-def preprocess_frame(frame: Frame) -> Frame:
-    """
-    Pre-processing frame untuk optimasi ReaSwapper 256.
-    """
-    try:
-        # Normalize brightness/contrast
-        frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
-        return frame
-    except Exception:
-        return frame
-
-
 def process_frames(
     source_path: str,
     temp_frame_paths: List[str],
@@ -275,9 +259,6 @@ def process_frames(
 
     for idx, temp_frame_path in enumerate(temp_frame_paths):
         temp_frame = cv2.imread(temp_frame_path)
-        
-        # ✅ ENHANCED: Pre-process frame
-        temp_frame = preprocess_frame(temp_frame)
         
         result = process_frame(
             source_face=source_face,
@@ -297,9 +278,6 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
     """
     source_img = cv2.imread(source_path)
     target_frame = cv2.imread(target_path)
-    
-    # ✅ ENHANCED: Pre-process target frame
-    target_frame = preprocess_frame(target_frame)
 
     source_face = get_one_face(source_img)
 
@@ -327,7 +305,6 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
         try:
             ref_idx = roop.globals.reference_frame_number
             reference_frame = cv2.imread(temp_frame_paths[ref_idx])
-            reference_frame = preprocess_frame(reference_frame)  # ✅ ENHANCED
             reference_face = get_one_face(
                 reference_frame,
                 roop.globals.reference_face_position
