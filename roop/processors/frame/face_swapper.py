@@ -1,8 +1,8 @@
-from typing import Any, List, Callable
+from typing import Any, List, Callable, Optional
 import cv2
 import insightface
 import threading
-import numpy as np  # ✅ untuk hitung jarak embedding
+import numpy as np  # untuk hitung jarak embedding
 
 import roop.globals
 import roop.processors.frame.core
@@ -11,17 +11,27 @@ from roop.face_analyser import (
     get_one_face,
     get_many_faces,
     find_similar_face,   # masih disediakan kalau mau fallback
-    smart_face_tracking, # ✅ tracking pintar
-    detect_occlusion     # ✅ deteksi occlusion
+    smart_face_tracking, # tracking pintar
+    detect_occlusion     # occlusion basic (berdasarkan det_score)
 )
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-FACE_SWAPPER = None
+# Occlusion PRO (BiseNet)
+from roop.face_parsing_bisenet import (
+    pre_check_bisenet,
+    is_occluded_bisenet,
+)
+
+FACE_SWAPPER: Any = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
+
+# ============================================================
+#  MODEL HANDLING
+# ============================================================
 
 def get_face_swapper() -> Any:
     """
@@ -37,6 +47,7 @@ def get_face_swapper() -> Any:
                 model_path,
                 providers=roop.globals.execution_providers
             )
+            print("✅ [face_swapper] Using inswapper_128")
     return FACE_SWAPPER
 
 
@@ -47,12 +58,20 @@ def clear_face_swapper() -> None:
 
 def pre_check() -> bool:
     """
-    Pastikan model sudah ke-download sebelum mulai.
+    Pastikan model-model yang dibutuhkan sudah ke-download sebelum mulai:
+    - inswapper_128
+    - BiseNet (untuk occlusion PRO)
     """
     download_directory_path = resolve_relative_path('../models')
+
+    # Model face swapper
     conditional_download(download_directory_path, [
         'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx'
     ])
+
+    # Model BiseNet untuk occlusion PRO
+    pre_check_bisenet()
+
     return True
 
 
@@ -65,7 +84,7 @@ def pre_start() -> bool:
         update_status('Select an image for source path.', NAME)
         return False
 
-    # ✅ pakai get_one_face dari face_analyser (sudah pakai buffalo_l + filter det_score)
+    # pakai get_one_face dari face_analyser (sudah buffalo_l + filter det_score)
     source_img = cv2.imread(roop.globals.source_path)
     if not get_one_face(source_img):
         update_status('No face in source path detected.', NAME)
@@ -86,6 +105,10 @@ def post_process() -> None:
     clear_face_reference()
 
 
+# ============================================================
+#  SWAP CORE
+# ============================================================
+
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
     Fungsi swap dasar (panggil inswapper).
@@ -105,7 +128,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 def _select_best_target_by_embedding(
     faces: List[Face],
     reference_face: Face
-) -> Face | None:
+) -> Optional[Face]:
     """
     Pilih wajah target terbaik berdasarkan embedding similarity
     (mengikuti logika di find_similar_face, tapi dengan kontrol lebih besar).
@@ -117,7 +140,7 @@ def _select_best_target_by_embedding(
         return None
 
     ref_emb = reference_face.normed_embedding
-    best_face = None
+    best_face: Optional[Face] = None
     best_distance = float('inf')
 
     # gunakan threshold dari roop.globals bila tersedia, else fallback
@@ -139,6 +162,34 @@ def _select_best_target_by_embedding(
     return best_face
 
 
+# ============================================================
+#  FRAME PROCESSING
+# ============================================================
+
+def _is_face_occluded_pro(frame: Frame, face: Face) -> bool:
+    """
+    Check occlusion gabungan:
+    - Basic: detect_occlusion (berdasarkan det_score dari detector)
+    - PRO: is_occluded_bisenet (berdasarkan segmentasi BiseNet)
+    """
+    # occlusion basic (det_score rendah)
+    try:
+        if detect_occlusion(face):
+            return True
+    except Exception:
+        # kalau gagal, lanjut ke BiseNet saja
+        pass
+
+    # occlusion PRO (segmentasi)
+    try:
+        if is_occluded_bisenet(frame, face):
+            return True
+    except Exception as e:
+        print(f"[face_swapper] BiseNet occlusion check failed: {e}")
+
+    return False
+
+
 def process_frame(
     source_face: Face,
     reference_face: Face,
@@ -154,9 +205,11 @@ def process_frame(
         # Safety guard: sudah dicek di pre_start, tapi buat jaga-jaga.
         return temp_frame
 
-    # MODE: banyak wajah → swap semua yang valid
+    # =====================================================
+    # MODE: banyak wajah → swap semua wajah valid
+    # =====================================================
     if roop.globals.many_faces:
-        # ✅ pakai smart_face_tracking agar ID wajah konsisten antar frame
+        # pakai smart_face_tracking agar ID wajah konsisten antar frame
         faces = smart_face_tracking(temp_frame, frame_number)
         if not faces:
             faces = get_many_faces(temp_frame)
@@ -165,15 +218,18 @@ def process_frame(
             return temp_frame
 
         for target_face in faces:
-            # ✅ skip wajah yang ter-occlusion berat (tangan, rambut, dsb)
-            if detect_occlusion(target_face):
+            # Occlusion PRO: gabungan det_score + BiseNet
+            if _is_face_occluded_pro(temp_frame, target_face):
                 continue
 
             temp_frame = swap_face(source_face, target_face, temp_frame)
 
         return temp_frame
 
-    # MODE: single / fokus 1 wajah → pakai reference + embedding matching
+    # =====================================================
+    # MODE: single / fokus 1 wajah
+    # =====================================================
+
     # tracking pintar untuk target
     tracked_faces = smart_face_tracking(temp_frame, frame_number)
     if not tracked_faces:
@@ -182,12 +238,17 @@ def process_frame(
     if not tracked_faces:
         return temp_frame
 
-    # Filter occlusion dulu
-    valid_faces = [f for f in tracked_faces if not detect_occlusion(f)]
+    # Filter occlusion dulu (basic + PRO)
+    valid_faces: List[Face] = []
+    for f in tracked_faces:
+        if _is_face_occluded_pro(temp_frame, f):
+            continue
+        valid_faces.append(f)
+
     if not valid_faces:
         return temp_frame
 
-    best_target = None
+    best_target: Optional[Face] = None
 
     # Kalau ada reference_face (dari reference frame) → pakai embedding-based selection
     if reference_face is not None:
@@ -200,6 +261,10 @@ def process_frame(
     temp_frame = swap_face(source_face, best_target, temp_frame)
     return temp_frame
 
+
+# ============================================================
+#  BATCH PROCESSING (untuk video)
+# ============================================================
 
 def process_frames(
     source_path: str,
@@ -221,6 +286,9 @@ def process_frames(
 
     for idx, temp_frame_path in enumerate(temp_frame_paths):
         temp_frame = cv2.imread(temp_frame_path)
+        if temp_frame is None:
+            continue
+
         result = process_frame(
             source_face=source_face,
             reference_face=reference_face,
@@ -232,6 +300,10 @@ def process_frames(
         if update:
             update()
 
+
+# ============================================================
+#  IMAGE MODE
+# ============================================================
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     """
@@ -259,6 +331,10 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
     )
     cv2.imwrite(output_path, result)
 
+
+# ============================================================
+#  VIDEO MODE
+# ============================================================
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """
