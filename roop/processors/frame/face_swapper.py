@@ -32,7 +32,7 @@ def get_face_swapper() -> Any:
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
             # ✅ UPDATED: Gunakan ReaSwapper 256
-            model_path = resolve_relative_path('../models/reaSwapper_256.onnx')
+            model_path = resolve_relative_path('../models/reswapper_256.onnx')
             
             # ✅ FIXED: Hapus session_options yang tidak ada
             try:
@@ -71,7 +71,7 @@ def pre_check() -> bool:
     # ✅ UPDATED: Coba download ReaSwapper 256, fallback ke inswapper_128
     try:
         conditional_download(download_directory_path, [
-            'https://huggingface.co/ezioruan/reaSwapper_256/resolve/main/reaSwapper_256.onnx'
+            'https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/reswapper_256.onnx'
         ])
         print("✅ [ReaSwapper] ReaSwapper 256 model available")
         return True
@@ -80,7 +80,7 @@ def pre_check() -> bool:
         # Fallback ke inswapper_128
         try:
             conditional_download(download_directory_path, [
-                'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx'
+                'https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/reswapper_256.onnx'
             ])
             print("✅ [ReaSwapper] Using inswapper_128 as fallback")
             return True
