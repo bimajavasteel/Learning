@@ -1,8 +1,7 @@
 from typing import Any, List, Callable
 import cv2
-import insightface
 import threading
-import numpy as np  # untuk hitung jarak embedding
+import numpy as np
 
 import roop.globals
 import roop.processors.frame.core
@@ -10,70 +9,101 @@ from roop.core import update_status
 from roop.face_analyser import (
     get_one_face,
     get_many_faces,
-    find_similar_face,
     smart_face_tracking,
-    detect_occlusion,   # sekarang pakai occluder.onnx + fallback det_score
+    find_similar_face,
+    detect_occlusion
 )
-from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
-from roop.typing import Face, Frame
-from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+from roop.face_reference import (
+    get_face_reference,
+    set_face_reference,
+    clear_face_reference
+)
+from roop.typing import Frame, Face
+from roop.utilities import (
+    conditional_download,
+    resolve_relative_path,
+    is_image,
+    is_video
+)
+
+# ============================================================
+# GLOBALS
+# ============================================================
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-SWAPPER'
+NAME = "ROOP.FACE-SWAPPER"
 
-CSCS256_URL = 'https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/cscs_256.onnx'
+# URL CSCS Swapper
+CSCS256_URL = "https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/cscs_256.onnx"
 
+
+# ============================================================
+# MODEL LOADER — FIXED FOR CSCS_256
+# ============================================================
 
 def get_face_swapper() -> Any:
     """
-    Inisialisasi model CSCS_256.
+    Load CSCS_256 using Swapper class.
+    GUARANTEED: Tidak akan memuat RetinaFace, hanya Swapper.
     """
     global FACE_SWAPPER
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            model_path = resolve_relative_path('../models/cscs_256.onnx')
-            FACE_SWAPPER = insightface.model_zoo.get_model(
-                model_path,
+
+            model_path = resolve_relative_path("../models/cscs_256.onnx")
+
+            # Wajib pakai Swapper() — get_model() TIDAK boleh dipakai!
+            from insightface.model_zoo import Swapper
+
+            FACE_SWAPPER = Swapper(
+                model_file=model_path,
+                session_options=None,
                 providers=roop.globals.execution_providers
             )
-            print("✅ [face_swapper] Using CSCS_256 ONNX model")
+
+            print("✅ [face_swapper] CSCS_256 loaded via Swapper()")
+
     return FACE_SWAPPER
 
 
 def clear_face_swapper() -> None:
+    """
+    Reset swapper model
+    """
     global FACE_SWAPPER
     FACE_SWAPPER = None
 
 
+# ============================================================
+# INITIAL CHECKS
+# ============================================================
+
 def pre_check() -> bool:
     """
-    Pastikan model CSCS_256 sudah ke-download sebelum mulai.
+    Pastikan CSCS_256 tersedia (auto-download).
     """
-    download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, [
-        CSCS256_URL
-    ])
+    download_dir = resolve_relative_path("../models")
+    conditional_download(download_dir, [CSCS256_URL])
     return True
 
 
 def pre_start() -> bool:
     """
-    Validasi path source & target sebelum proses.
-    Sekaligus pastikan source punya wajah yang bisa dianalisis.
+    Validasi source image + target image/video
     """
     if not is_image(roop.globals.source_path):
-        update_status('Select an image for source path.', NAME)
+        update_status("Select an image for source path.", NAME)
         return False
 
     source_img = cv2.imread(roop.globals.source_path)
-    if not get_one_face(source_img):
-        update_status('No face in source path detected.', NAME)
+    if get_one_face(source_img) is None:
+        update_status("No face in source path detected.", NAME)
         return False
 
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status('Select an image or video for target path.', NAME)
+        update_status("Select an image or video for target path.", NAME)
         return False
 
     return True
@@ -81,199 +111,209 @@ def pre_start() -> bool:
 
 def post_process() -> None:
     """
-    Bersihkan model & reference setelah selesai.
+    Cleanup setelah selesai
     """
     clear_face_swapper()
     clear_face_reference()
 
 
-def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
+# ============================================================
+# FACE SWAP EXECUTION
+# ============================================================
+
+def swap_face(source_face: Face, target_face: Face, frame: Frame) -> Frame:
     """
-    Fungsi swap dasar (panggil CSCS_256).
-    Dipisah supaya mudah di-mod / patch kalau mau.
+    Panggil CSCS_256.get() untuk swap.
+    Pastikan kedua face tidak None.
     """
     if source_face is None or target_face is None:
-        return temp_frame
+        return frame
 
-    return get_face_swapper().get(
-        temp_frame,
-        target_face,
-        source_face,
-        paste_back=True
-    )
+    try:
+        return get_face_swapper().get(
+            frame,
+            target_face,
+            source_face,
+            paste_back=True
+        )
+    except Exception as e:
+        print(f"⚠️ [swap_face] Swap failed: {e}")
+        return frame
 
 
-def _select_best_target_by_embedding(
-    faces: List[Face],
-    reference_face: Face
-) -> Face | None:
+# ============================================================
+# MULTI-FACE & SINGLE-FACE LOGIC
+# ============================================================
+
+def _select_best_target(faces: List[Face], reference_face: Face) -> Face | None:
     """
-    Pilih wajah target terbaik berdasarkan embedding similarity.
+    Pilih wajah target berdasarkan embedding similarity.
     """
     if not faces or reference_face is None:
         return None
 
-    if not hasattr(reference_face, 'normed_embedding'):
+    if not hasattr(reference_face, "normed_embedding"):
         return None
 
     ref_emb = reference_face.normed_embedding
     best_face = None
-    best_distance = float('inf')
+    best_dist = float("inf")
 
-    similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
+    threshold = getattr(roop.globals, "similar_face_distance", 1.0)
 
     for f in faces:
-        if not hasattr(f, 'normed_embedding'):
+        if not hasattr(f, "normed_embedding"):
             continue
-
         try:
-            distance = np.sum(np.square(f.normed_embedding - ref_emb))
+            dist = np.sum(np.square(f.normed_embedding - ref_emb))
         except Exception:
             continue
 
-        if distance < similar_threshold and distance < best_distance:
-            best_distance = distance
+        if dist < threshold and dist < best_dist:
+            best_dist = dist
             best_face = f
 
     return best_face
 
 
+# ============================================================
+# FRAME PROCESSING CORE
+# ============================================================
+
 def process_frame(
     source_face: Face,
     reference_face: Face,
-    temp_frame: Frame,
+    frame: Frame,
     frame_number: int = 0
 ) -> Frame:
-    """
-    Proses 1 frame dengan strategi:
-    - many_faces = True  → swap ke semua wajah yang lolos filter & tidak occluded
-    - many_faces = False → cari wajah paling mirip + stabil (tracking + embedding)
-    """
+
     if source_face is None:
-        return temp_frame
+        return frame
 
-    # MODE: banyak wajah → swap semua yang valid
+    # ==========================#
+    # MODE: MANY FACES (swap semua)
+    # ==========================#
     if roop.globals.many_faces:
-        faces = smart_face_tracking(temp_frame, frame_number)
+
+        faces = smart_face_tracking(frame, frame_number)
         if not faces:
-            faces = get_many_faces(temp_frame)
+            faces = get_many_faces(frame)
 
         if not faces:
-            return temp_frame
+            return frame
 
-        for target_face in faces:
-            # gunakan occluder + fallback det_score
-            if detect_occlusion(target_face, temp_frame):
+        for tf in faces:
+
+            # skip wajah occluded (pakai occluder.onnx dari face_analyser)
+            if detect_occlusion(tf, frame):
                 continue
 
-            temp_frame = swap_face(source_face, target_face, temp_frame)
+            frame = swap_face(source_face, tf, frame)
 
-        return temp_frame
+        return frame
 
-    # MODE: single / fokus 1 wajah → pakai reference + embedding matching
-    tracked_faces = smart_face_tracking(temp_frame, frame_number)
-    if not tracked_faces:
-        tracked_faces = get_many_faces(temp_frame)
+    # ==========================#
+    # MODE: SINGLE-FACE (pilih 1 terbaik)
+    # ==========================#
+    faces = smart_face_tracking(frame, frame_number)
+    if not faces:
+        faces = get_many_faces(frame)
 
-    if not tracked_faces:
-        return temp_frame
+    if not faces:
+        return frame
 
-    # Filter occlusion dulu (pakai frame)
-    valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
+    valid_faces = [f for f in faces if not detect_occlusion(f, frame)]
     if not valid_faces:
-        return temp_frame
+        return frame
 
     best_target = None
 
-    # Kalau ada reference_face (dari reference frame) → pakai embedding-based selection
+    # bila ada reference face (dari reference frame)
     if reference_face is not None:
-        best_target = _select_best_target_by_embedding(valid_faces, reference_face)
+        best_target = _select_best_target(valid_faces, reference_face)
 
-    # Kalau belum ketemu, fallback ke wajah pertama yang valid
     if best_target is None:
         best_target = valid_faces[0]
 
-    temp_frame = swap_face(source_face, best_target, temp_frame)
-    return temp_frame
+    frame = swap_face(source_face, best_target, frame)
+    return frame
 
 
-def process_frames(
-    source_path: str,
-    temp_frame_paths: List[str],
-    update: Callable[[], None]
-) -> None:
+# ============================================================
+# MULTI-FRAME PROCESS HANDLER
+# ============================================================
+
+def process_frames(source_path: str, frame_paths: List[str], update: Callable[[], None]) -> None:
     """
-    Dipanggil oleh core.process_video untuk memproses semua frame.
-    Di sini kita pegang:
-    - source_face: konstan
-    - reference_face: diambil dari face_reference (single-mode)
-    - frame_number: index frame → dipakai di smart_face_tracking
+    Dipanggil Roop saat proses video.
     """
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
 
-    # Single-face mode → pakai reference_face global yang sudah diset di process_video
-    reference_face = None if roop.globals.many_faces else get_face_reference()
+    reference_face = None
+    if not roop.globals.many_faces:
+        reference_face = get_face_reference()
 
-    for idx, temp_frame_path in enumerate(temp_frame_paths):
-        temp_frame = cv2.imread(temp_frame_path)
-        result = process_frame(
+    for idx, fp in enumerate(frame_paths):
+        frame = cv2.imread(fp)
+        out = process_frame(
             source_face=source_face,
             reference_face=reference_face,
-            temp_frame=temp_frame,
+            frame=frame,
             frame_number=idx
         )
-        cv2.imwrite(temp_frame_path, result)
+        cv2.imwrite(fp, out)
 
         if update:
             update()
 
 
+# ============================================================
+# IMAGE MODE
+# ============================================================
+
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
-    """
-    Proses mode gambar ke gambar.
-    """
     source_img = cv2.imread(source_path)
-    target_frame = cv2.imread(target_path)
+    target_img = cv2.imread(target_path)
 
     source_face = get_one_face(source_img)
 
     reference_face = None
     if not roop.globals.many_faces:
         reference_face = get_one_face(
-            target_frame,
+            target_img,
             roop.globals.reference_face_position
         )
 
-    result = process_frame(
+    out = process_frame(
         source_face=source_face,
         reference_face=reference_face,
-        temp_frame=target_frame,
+        frame=target_img,
         frame_number=0
     )
-    cv2.imwrite(output_path, result)
+    cv2.imwrite(output_path, out)
 
 
-def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
+# ============================================================
+# VIDEO MODE ENTRY
+# ============================================================
+
+def process_video(source_path: str, frame_paths: List[str]) -> None:
     """
-    Entry point untuk mode video.
-    - Set face_reference sekali di awal (single-face)
-    - Lalu serahkan looping frame ke core.process_video
+    Entry untuk mode video.
     """
+    # Ambil reference face sekali di awal (single-face mode)
     if not roop.globals.many_faces and not get_face_reference():
         try:
             ref_idx = roop.globals.reference_frame_number
-            reference_frame = cv2.imread(temp_frame_paths[ref_idx])
-            reference_face = get_one_face(
-                reference_frame,
-                roop.globals.reference_face_position
-            )
-            set_face_reference(reference_face)
+            ref_frame = cv2.imread(frame_paths[ref_idx])
+            ref_face = get_one_face(ref_frame, roop.globals.reference_face_position)
+            set_face_reference(ref_face)
         except Exception:
             set_face_reference(None)
 
     roop.processors.frame.core.process_video(
         source_path,
-        temp_frame_paths,
+        frame_paths,
         process_frames
     )
