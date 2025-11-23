@@ -31,7 +31,6 @@ def get_device() -> str:
     """
     Tentukan device untuk CodeFormer berdasarkan execution_providers Roop.
     """
-    # Mirip pola di GFPGAN lama, tapi dipakai untuk torch
     if 'CUDAExecutionProvider' in roop.globals.execution_providers and torch.cuda.is_available():
         return 'cuda'
     if 'CoreMLExecutionProvider' in roop.globals.execution_providers:
@@ -154,14 +153,16 @@ def _get_bbox_from_face(target_face: Face):
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Restorasi 1 wajah di dalam frame menggunakan CodeFormer.
+    Restorasi 1 wajah di dalam frame menggunakan CodeFormer
+    dengan anti-kotak (feathered blending).
 
     Langkah:
     - ambil bbox dari Face,
-    - crop + padding,
+    - crop + padding tipis,
     - resize ke 512x512,
     - kirim ke CodeFormer,
     - hasilnya di-resize kembali ke ukuran crop,
+    - blend halus dengan wajah asli (anti edge box),
     - paste balik ke frame.
     """
     try:
@@ -171,9 +172,9 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
         # kalau bbox tidak valid, skip
         return temp_frame
 
-    # tambahkan padding di sekitar wajah biar lebih natural
-    padding_x = int((end_x - start_x) * 0.2)
-    padding_y = int((end_y - start_y) * 0.2)
+    # padding sedikit di sekitar wajah biar natural, tapi tidak kebesaran
+    padding_x = int((end_x - start_x) * 0.08)
+    padding_y = int((end_y - start_y) * 0.08)
     start_x = max(0, start_x - padding_x)
     start_y = max(0, start_y - padding_y)
     end_x = min(temp_frame.shape[1], end_x + padding_x)
@@ -185,6 +186,9 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     temp_face = temp_frame[start_y:end_y, start_x:end_x]
     if temp_face.size == 0:
         return temp_frame
+
+    # simpan original crop untuk blending anti kotak
+    temp_face_original = temp_face.copy()
 
     enhancer = get_face_enhancer()
     net = enhancer['net']
@@ -228,8 +232,27 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
         interpolation=cv2.INTER_LINEAR
     )
 
-    # Paste ke frame
-    temp_frame[start_y:end_y, start_x:end_x] = restored_face
+    # ========= ANTI-KOTAK: FEATHERED BLENDING =========
+    # mask lingkaran di tengah wajah, tepi di-blur supaya kotak hilang
+    mask = np.zeros((face_h, face_w), dtype=np.float32)
+
+    # radius sedikit lebih kecil dari min(w,h)/2 supaya tepi halus
+    radius = int(min(face_h, face_w) * 0.48)
+    cv2.circle(mask, (face_w // 2, face_h // 2), radius, 1.0, -1)
+
+    # blur mask agar transisi lembut (pakai sigma, kernel otomatis)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=15, sigmaY=15)
+    mask = np.clip(mask, 0.0, 1.0)
+    mask = mask[..., None]  # (H, W, 1)
+
+    # convert ke float untuk blending
+    restored_f = restored_face.astype(np.float32)
+    original_f = temp_face_original.astype(np.float32)
+
+    blended = (restored_f * mask + original_f * (1.0 - mask)).astype('uint8')
+
+    # paste balik hasil blend ke frame
+    temp_frame[start_y:end_y, start_x:end_x] = blended
     return temp_frame
 
 
@@ -237,7 +260,7 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
     """
     Proses 1 frame:
     - deteksi semua wajah,
-    - apply CodeFormer ke tiap wajah.
+    - apply CodeFormer + anti-kotak ke tiap wajah.
     """
     many_faces = get_many_faces(temp_frame)
     if many_faces:
