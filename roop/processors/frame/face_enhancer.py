@@ -1,3 +1,4 @@
+# /mnt/data/face_enhancer_ultra.py
 import cv2
 import threading
 import numpy as np
@@ -12,39 +13,41 @@ from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
 # -----------------------
-# Stable GPEN Face Enhancer
-# - GPEN ONNX (auto-download)
-# - bbox smoothing per-identity (via embedding if available)
-# - color match GPEN output to original crop
-# - feathered mask + cv2.MIXED_CLONE for stable blending
-# - small padding to reduce halo
+# Ultra-Stable GPEN Face Enhancer
+# - Temporal smoothing per-face (reduces GPEN flicker)
+# - Damped color matching + shading match
+# - Feathered mask + MIXED_CLONE
+# - Small padding + bbox smoothing
+# - Auto-download GPEN ONNX
 # -----------------------
 
 FACE_ENHANCER: Optional[ort.InferenceSession] = None
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-ENHANCER'
+NAME = 'ROOP.FACE-ENHANCER-ULTRA'
 MODEL_URL = 'https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/GPEN-BFR-512.onnx'
 MODEL_NAME = 'GPEN-BFR-512.onnx'
 
-# simple bbox cache keyed by embedding signature or center coordinate
-BBOX_CACHE: dict[str, Tuple[float, float, float, float]] = {}
-SMOOTH_ALPHA = 0.65  # smoothing factor (higher = more inertia)
+# caches
+BBOX_CACHE: dict[str, Tuple[int, int, int, int]] = {}
+SMOOTH_ALPHA = 0.72  # bbox smoothing inertia
+PREV_OUTPUTS: dict[str, np.ndarray] = {}  # temporal smoothing cache per face signature
+TEMP_SMOOTH_ALPHA = 0.78  # how much previous frame influences current (0..1) higher = more stable
+MAX_CACHE_SIZE = 200  # avoid unbounded memory growth
 
+def _trim_cache():
+    if len(PREV_OUTPUTS) > MAX_CACHE_SIZE:
+        # simple trim: clear all (could be improved)
+        PREV_OUTPUTS.clear()
 
 def _sign_from_face(face: Face) -> str:
-    """Create a stable-ish signature for a face.
-    Prefer normalized embedding if available, else use rounded center coords.
-    """
     try:
         emb = getattr(face, 'normed_embedding', None)
         if emb is not None and len(emb) >= 8:
-            # use first 8 dims rounded to 3 decimals
             key = ','.join([f'{float(x):.3f}' for x in emb[:8]])
             return f'emb:{key}'
     except Exception:
         pass
-
     try:
         bbox = face['bbox'] if isinstance(face, dict) else getattr(face, 'bbox', None)
         if bbox is not None:
@@ -54,9 +57,7 @@ def _sign_from_face(face: Face) -> str:
             return f'center:{cx}:{cy}'
     except Exception:
         pass
-
     return 'unknown'
-
 
 def get_device() -> str:
     if 'CUDAExecutionProvider' in roop.globals.execution_providers:
@@ -64,7 +65,6 @@ def get_device() -> str:
     if 'CoreMLExecutionProvider' in roop.globals.execution_providers:
         return 'mps'
     return 'cpu'
-
 
 def get_face_enhancer() -> ort.InferenceSession:
     global FACE_ENHANCER
@@ -76,17 +76,14 @@ def get_face_enhancer() -> ort.InferenceSession:
             FACE_ENHANCER = ort.InferenceSession(model_path, providers=roop.globals.execution_providers)
     return FACE_ENHANCER
 
-
 def clear_face_enhancer() -> None:
     global FACE_ENHANCER
     FACE_ENHANCER = None
-
 
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
     conditional_download(download_directory_path, [MODEL_URL])
     return True
-
 
 def pre_start() -> bool:
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
@@ -94,17 +91,14 @@ def pre_start() -> bool:
         return False
     return True
 
-
 def post_process() -> None:
     clear_face_enhancer()
-
 
 def _prepare_input(img: np.ndarray) -> np.ndarray:
     inp = cv2.resize(img, (512, 512), interpolation=cv2.INTER_LINEAR)
     inp = inp.astype(np.float32) / 127.5 - 1.0
     inp = inp.transpose(2, 0, 1)[None, ...]
     return inp
-
 
 def _postprocess_output(out: np.ndarray, target_size: tuple) -> np.ndarray:
     out = np.clip(out, -1.0, 1.0)
@@ -113,35 +107,42 @@ def _postprocess_output(out: np.ndarray, target_size: tuple) -> np.ndarray:
     out = cv2.resize(out, target_size, interpolation=cv2.INTER_LINEAR)
     return out
 
-
-def _color_match(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    """Match mean brightness of dst (GPEN out) to src (original crop).
-    Uses simple gain on V channel in HSV for stable results.
-    """
+def _damped_color_match(src: np.ndarray, dst: np.ndarray, max_gain_delta: float = 0.12) -> np.ndarray:
+    # Match brightness on V (HSV) but damp the change to avoid flicker.
     try:
         src_hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV).astype(np.float32)
         dst_hsv = cv2.cvtColor(dst, cv2.COLOR_BGR2HSV).astype(np.float32)
-        mean_src = np.mean(src_hsv[..., 2])
-        mean_dst = np.mean(dst_hsv[..., 2])
-        if mean_dst > 1e-3:
+        mean_src = float(np.mean(src_hsv[..., 2]))
+        mean_dst = float(np.mean(dst_hsv[..., 2]))
+        if mean_dst > 1e-6:
             gain = mean_src / mean_dst
+            # limit gain change to avoid sudden jumps
+            gain = max(1.0 - max_gain_delta, min(1.0 + max_gain_delta, gain))
             dst_hsv[..., 2] = np.clip(dst_hsv[..., 2] * gain, 0, 255)
             dst = cv2.cvtColor(dst_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
     except Exception:
         pass
     return dst
 
+def _shading_match(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    # Use large blur to get coarse shading map then apply ratio to dst
+    try:
+        k = max(21, (min(src.shape[0], src.shape[1]) // 16) | 1)
+        blur_src = cv2.GaussianBlur(src.astype(np.float32), (k, k), 0)
+        blur_dst = cv2.GaussianBlur(dst.astype(np.float32), (k, k), 0) + 1e-6
+        shade = blur_src / blur_dst
+        out = np.clip(dst.astype(np.float32) * shade, 0, 255).astype(np.uint8)
+        return out
+    except Exception:
+        return dst
 
 def _make_feathered_mask(shape: Tuple[int, int]) -> np.ndarray:
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
-    # circle mask centered -> good for faces
     cv2.circle(mask, (w // 2, h // 2), min(w, h) // 2, 255, -1)
-    # large gaussian blur to make feather
     k = max(31, (min(w, h) // 8) | 1)
     mask = cv2.GaussianBlur(mask, (k, k), 0)
     return mask
-
 
 def _smooth_bbox(sig: str, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = bbox
@@ -156,6 +157,17 @@ def _smooth_bbox(sig: str, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, i
     BBOX_CACHE[sig] = (nx1, ny1, nx2, ny2)
     return nx1, ny1, nx2, ny2
 
+def _temporal_smooth(sig: str, cur_out: np.ndarray) -> np.ndarray:
+    # Smooth output using exponential moving average in uint8 space
+    if sig not in PREV_OUTPUTS:
+        PREV_OUTPUTS[sig] = cur_out.copy()
+        _trim_cache()
+        return cur_out
+    prev = PREV_OUTPUTS[sig].astype(np.float32)
+    cur = cur_out.astype(np.float32)
+    sm = (TEMP_SMOOTH_ALPHA * prev + (1.0 - TEMP_SMOOTH_ALPHA) * cur).astype(np.uint8)
+    PREV_OUTPUTS[sig] = sm
+    return sm
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     try:
@@ -165,19 +177,15 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     if bbox is None:
         return temp_frame
 
-    # raw bbox
     x1, y1, x2, y2 = map(int, bbox)
-
-    # small padding to avoid large color bleed
-    padding_x = max(1, int((x2 - x1) * 0.06))
-    padding_y = max(1, int((y2 - y1) * 0.06))
+    padding_x = max(1, int((x2 - x1) * 0.05))
+    padding_y = max(1, int((y2 - y1) * 0.05))
 
     x1 = max(0, x1 - padding_x)
     y1 = max(0, y1 - padding_y)
     x2 = min(temp_frame.shape[1], x2 + padding_x)
     y2 = min(temp_frame.shape[0], y2 + padding_y)
 
-    # smoothing by signature
     sig = _sign_from_face(target_face)
     x1, y1, x2, y2 = _smooth_bbox(sig, (x1, y1, x2, y2))
 
@@ -185,10 +193,10 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     if crop.size == 0:
         return temp_frame
 
+    # prepare and run ONNX
     inp = _prepare_input(crop)
     session = get_face_enhancer()
     input_name = session.get_inputs()[0].name
-
     with THREAD_SEMAPHORE:
         outputs = session.run(None, {input_name: inp})
 
@@ -197,18 +205,20 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     target_h = y2 - y1
     out = _postprocess_output(out, (target_w, target_h))
 
-    # color match to original crop
-    out = _color_match(crop, out)
+    # shading + color match with damping
+    out = _damped_color_match(crop, out, max_gain_delta=0.10)
+    out = _shading_match(crop, out)
 
-    # feathered mask
+    # temporal smoothing (reduces GPEN per-frame jitter)
+    out = _temporal_smooth(sig, out)
+
+    # feathered mask and blending
     mask = _make_feathered_mask((out.shape[0], out.shape[1]))
-
-    # blending with MIXED_CLONE (more stable than NORMAL_CLONE for videos)
     try:
         center = (int(x1 + out.shape[1] // 2), int(y1 + out.shape[0] // 2))
         temp_frame = cv2.seamlessClone(out, temp_frame, mask, center, cv2.MIXED_CLONE)
     except Exception:
-        # fallback to alpha blend with feather mask
+        # alpha fallback
         try:
             alpha = (mask.astype(np.float32) / 255.0)[..., None]
             inv = 1.0 - alpha
@@ -218,14 +228,12 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
 
     return temp_frame
 
-
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
     many_faces = get_many_faces(temp_frame)
     if many_faces:
         for target_face in many_faces:
             temp_frame = enhance_face(target_face, temp_frame)
     return temp_frame
-
 
 def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     for temp_frame_path in temp_frame_paths:
@@ -235,12 +243,10 @@ def process_frames(source_path: str, temp_frame_paths: List[str], update: Callab
         if update:
             update()
 
-
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     target_frame = cv2.imread(target_path)
     result = process_frame(None, None, target_frame)
     cv2.imwrite(output_path, result)
-
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
