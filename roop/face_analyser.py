@@ -36,9 +36,6 @@ MAX_TRACK_AGE = 15          # frame: track dihapus bila tidak terlihat
 MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal
 
 # [MOD] EMA Factor untuk smoothing bbox (0.0 - 1.0)
-# Semakin kecil (misal 0.2) = Sangat halus tapi agak delay (bagus untuk video lambat)
-# Semakin besar (misal 0.7) = Responsif tapi agak jitter
-# 0.5 adalah keseimbangan yang baik.
 EMA_ALPHA = 0.5 
 
 # Occluder ONNX (opsional)
@@ -115,7 +112,8 @@ def _run_occluder_onnx(crop: np.ndarray) -> float:
 
     try:
         h, w = crop.shape[:2]
-        inp = cv2.resize(crop, (224, 224))
+        # [FIX] Ubah resize dari 224 ke 256 sesuai error log
+        inp = cv2.resize(crop, (256, 256))
         inp = inp.astype('float32') / 255.0
         inp = inp.transpose(2, 0, 1)[None, ...]  # NCHW
 
@@ -162,12 +160,15 @@ def get_occlusion_mask(face: Face, frame: Frame) -> Optional[np.ndarray]:
 
         # Preprocessing standar occluder.onnx
         h_crop, w_crop = crop.shape[:2]
-        inp = cv2.resize(crop, (224, 224))
+        
+        # [FIX] Ubah resize dari 224 ke 256 sesuai error log
+        inp = cv2.resize(crop, (256, 256))
+        
         inp = inp.astype('float32') / 255.0
         inp = inp.transpose(2, 0, 1)[None, ...] # NCHW
 
         outputs = session.run(None, {OCCLUDER_INPUT_NAME: inp})
-        pred = outputs[0] # output shape biasanya [1, 1, 224, 224]
+        pred = outputs[0] # output shape biasanya [1, 1, 256, 256]
 
         if pred.ndim == 4:
             mask = pred[0, 0]
