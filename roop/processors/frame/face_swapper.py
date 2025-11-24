@@ -337,3 +337,13 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
         temp_frame_paths,
         process_frames
     )
+
+# ================================================================
+# POST PROCESS
+# ================================================================
+def post_process() -> None:
+    """
+    Bersihkan swapper & reference setelah selesai.
+    """
+    clear_face_swapper()
+    clear_face_reference()
