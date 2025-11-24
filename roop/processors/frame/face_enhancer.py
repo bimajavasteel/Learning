@@ -93,7 +93,10 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     out = out.transpose(1, 2, 0).astype(np.uint8)
     out = cv2.resize(out, (end_x - start_x, end_y - start_y))
 
-    temp_frame[start_y:end_y, start_x:end_x] = out
+    mask = 255 * np.ones(out.shape, out.dtype)
+center_x = start_x + out.shape[1] // 2
+center_y = start_y + out.shape[0] // 2
+temp_frame = cv2.seamlessClone(out, temp_frame, mask, (center_x, center_y), cv2.NORMAL_CLONE)
     return temp_frame
 
 
