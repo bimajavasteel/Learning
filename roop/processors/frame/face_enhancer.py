@@ -1,63 +1,34 @@
-# /mnt/data/face_enhancer_ultra.py
+from typing import Any, List, Callable, Optional
 import cv2
 import threading
 import numpy as np
-import onnxruntime as ort
-from typing import Any, List, Callable, Tuple, Optional
+from gfpgan.utils import GFPGANer
 
 import roop.globals
 import roop.processors.frame.core
+# Import face_analyser untuk akses occlusion mask
+import roop.face_analyser 
 from roop.core import update_status
 from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-# -----------------------
-# Ultra-Stable GPEN Face Enhancer
-# - Temporal smoothing per-face (reduces GPEN flicker)
-# - Damped color matching + shading match
-# - Feathered mask + MIXED_CLONE
-# - Small padding + bbox smoothing
-# - Auto-download GPEN ONNX
-# -----------------------
-
-FACE_ENHANCER: Optional[ort.InferenceSession] = None
+FACE_ENHANCER = None
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-ENHANCER-ULTRA'
-MODEL_URL = 'https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/GPEN-BFR-512.onnx'
-MODEL_NAME = 'GPEN-BFR-512.onnx'
+NAME = 'ROOP.FACE-ENHANCER'
 
-# caches
-BBOX_CACHE: dict[str, Tuple[int, int, int, int]] = {}
-SMOOTH_ALPHA = 0.72  # bbox smoothing inertia
-PREV_OUTPUTS: dict[str, np.ndarray] = {}  # temporal smoothing cache per face signature
-TEMP_SMOOTH_ALPHA = 0.78  # how much previous frame influences current (0..1) higher = more stable
-MAX_CACHE_SIZE = 200  # avoid unbounded memory growth
 
-def _trim_cache():
-    if len(PREV_OUTPUTS) > MAX_CACHE_SIZE:
-        # simple trim: clear all (could be improved)
-        PREV_OUTPUTS.clear()
+def get_face_enhancer() -> Any:
+    global FACE_ENHANCER
 
-def _sign_from_face(face: Face) -> str:
-    try:
-        emb = getattr(face, 'normed_embedding', None)
-        if emb is not None and len(emb) >= 8:
-            key = ','.join([f'{float(x):.3f}' for x in emb[:8]])
-            return f'emb:{key}'
-    except Exception:
-        pass
-    try:
-        bbox = face['bbox'] if isinstance(face, dict) else getattr(face, 'bbox', None)
-        if bbox is not None:
-            x1, y1, x2, y2 = map(int, bbox)
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            return f'center:{cx}:{cy}'
-    except Exception:
-        pass
-    return 'unknown'
+    with THREAD_LOCK:
+        if FACE_ENHANCER is None:
+            model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
+            # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
+            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
+    return FACE_ENHANCER
+
 
 def get_device() -> str:
     if 'CUDAExecutionProvider' in roop.globals.execution_providers:
@@ -66,24 +37,17 @@ def get_device() -> str:
         return 'mps'
     return 'cpu'
 
-def get_face_enhancer() -> ort.InferenceSession:
-    global FACE_ENHANCER
-    with THREAD_LOCK:
-        if FACE_ENHANCER is None:
-            model_dir = resolve_relative_path('../models')
-            model_path = resolve_relative_path(f"../models/{MODEL_NAME}")
-            conditional_download(model_dir, [MODEL_URL])
-            FACE_ENHANCER = ort.InferenceSession(model_path, providers=roop.globals.execution_providers)
-    return FACE_ENHANCER
 
 def clear_face_enhancer() -> None:
     global FACE_ENHANCER
     FACE_ENHANCER = None
 
+
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, [MODEL_URL])
+    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'])
     return True
+
 
 def pre_start() -> bool:
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
@@ -91,142 +55,122 @@ def pre_start() -> bool:
         return False
     return True
 
+
 def post_process() -> None:
     clear_face_enhancer()
 
-def _prepare_input(img: np.ndarray) -> np.ndarray:
-    inp = cv2.resize(img, (512, 512), interpolation=cv2.INTER_LINEAR)
-    inp = inp.astype(np.float32) / 127.5 - 1.0
-    inp = inp.transpose(2, 0, 1)[None, ...]
-    return inp
-
-def _postprocess_output(out: np.ndarray, target_size: tuple) -> np.ndarray:
-    out = np.clip(out, -1.0, 1.0)
-    out = (out + 1.0) * 127.5
-    out = out.transpose(1, 2, 0).astype(np.uint8)
-    out = cv2.resize(out, target_size, interpolation=cv2.INTER_LINEAR)
-    return out
-
-def _damped_color_match(src: np.ndarray, dst: np.ndarray, max_gain_delta: float = 0.12) -> np.ndarray:
-    # Match brightness on V (HSV) but damp the change to avoid flicker.
-    try:
-        src_hsv = cv2.cvtColor(src, cv2.COLOR_BGR2HSV).astype(np.float32)
-        dst_hsv = cv2.cvtColor(dst, cv2.COLOR_BGR2HSV).astype(np.float32)
-        mean_src = float(np.mean(src_hsv[..., 2]))
-        mean_dst = float(np.mean(dst_hsv[..., 2]))
-        if mean_dst > 1e-6:
-            gain = mean_src / mean_dst
-            # limit gain change to avoid sudden jumps
-            gain = max(1.0 - max_gain_delta, min(1.0 + max_gain_delta, gain))
-            dst_hsv[..., 2] = np.clip(dst_hsv[..., 2] * gain, 0, 255)
-            dst = cv2.cvtColor(dst_hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-    except Exception:
-        pass
-    return dst
-
-def _shading_match(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    # Use large blur to get coarse shading map then apply ratio to dst
-    try:
-        k = max(21, (min(src.shape[0], src.shape[1]) // 16) | 1)
-        blur_src = cv2.GaussianBlur(src.astype(np.float32), (k, k), 0)
-        blur_dst = cv2.GaussianBlur(dst.astype(np.float32), (k, k), 0) + 1e-6
-        shade = blur_src / blur_dst
-        out = np.clip(dst.astype(np.float32) * shade, 0, 255).astype(np.uint8)
-        return out
-    except Exception:
-        return dst
-
-def _make_feathered_mask(shape: Tuple[int, int]) -> np.ndarray:
-    h, w = shape
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.circle(mask, (w // 2, h // 2), min(w, h) // 2, 255, -1)
-    k = max(31, (min(w, h) // 8) | 1)
-    mask = cv2.GaussianBlur(mask, (k, k), 0)
-    return mask
-
-def _smooth_bbox(sig: str, bbox: Tuple[int, int, int, int]) -> Tuple[int, int, int, int]:
-    x1, y1, x2, y2 = bbox
-    if sig in BBOX_CACHE:
-        px1, py1, px2, py2 = BBOX_CACHE[sig]
-        nx1 = int(SMOOTH_ALPHA * px1 + (1 - SMOOTH_ALPHA) * x1)
-        ny1 = int(SMOOTH_ALPHA * py1 + (1 - SMOOTH_ALPHA) * y1)
-        nx2 = int(SMOOTH_ALPHA * px2 + (1 - SMOOTH_ALPHA) * x2)
-        ny2 = int(SMOOTH_ALPHA * py2 + (1 - SMOOTH_ALPHA) * y2)
-    else:
-        nx1, ny1, nx2, ny2 = x1, y1, x2, y2
-    BBOX_CACHE[sig] = (nx1, ny1, nx2, ny2)
-    return nx1, ny1, nx2, ny2
-
-def _temporal_smooth(sig: str, cur_out: np.ndarray) -> np.ndarray:
-    # Smooth output using exponential moving average in uint8 space
-    if sig not in PREV_OUTPUTS:
-        PREV_OUTPUTS[sig] = cur_out.copy()
-        _trim_cache()
-        return cur_out
-    prev = PREV_OUTPUTS[sig].astype(np.float32)
-    cur = cur_out.astype(np.float32)
-    sm = (TEMP_SMOOTH_ALPHA * prev + (1.0 - TEMP_SMOOTH_ALPHA) * cur).astype(np.uint8)
-    PREV_OUTPUTS[sig] = sm
-    return sm
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    try:
-        bbox = target_face['bbox'] if isinstance(target_face, dict) else getattr(target_face, 'bbox', None)
-    except Exception:
-        bbox = None
-    if bbox is None:
+    """
+    Enhance wajah dengan Soft Blending & Occlusion Masking.
+    """
+    # 1. Hitung Koordinat Crop dengan Padding
+    start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
+    
+    # Simpan koordinat asli (raw) untuk referensi mask occlusion
+    raw_x1, raw_y1, raw_x2, raw_y2 = start_x, start_y, end_x, end_y
+
+    padding_x = int((end_x - start_x) * 0.2)
+    padding_y = int((end_y - start_y) * 0.2)
+
+    start_x = max(0, start_x - padding_x)
+    start_y = max(0, start_y - padding_y)
+    end_x = max(0, end_x + padding_x)
+    end_y = max(0, end_y + padding_y)
+
+    temp_face = temp_frame[start_y:end_y, start_x:end_x]
+    if temp_face.size == 0:
         return temp_frame
 
-    x1, y1, x2, y2 = map(int, bbox)
-    padding_x = max(1, int((x2 - x1) * 0.05))
-    padding_y = max(1, int((y2 - y1) * 0.05))
-
-    x1 = max(0, x1 - padding_x)
-    y1 = max(0, y1 - padding_y)
-    x2 = min(temp_frame.shape[1], x2 + padding_x)
-    y2 = min(temp_frame.shape[0], y2 + padding_y)
-
-    sig = _sign_from_face(target_face)
-    x1, y1, x2, y2 = _smooth_bbox(sig, (x1, y1, x2, y2))
-
-    crop = temp_frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return temp_frame
-
-    # prepare and run ONNX
-    inp = _prepare_input(crop)
-    session = get_face_enhancer()
-    input_name = session.get_inputs()[0].name
+    # 2. Jalankan GFPGAN
+    # paste_back=False : Kita butuh raw result untuk manual blending
     with THREAD_SEMAPHORE:
-        outputs = session.run(None, {input_name: inp})
-
-    out = outputs[0][0]
-    target_w = x2 - x1
-    target_h = y2 - y1
-    out = _postprocess_output(out, (target_w, target_h))
-
-    # shading + color match with damping
-    out = _damped_color_match(crop, out, max_gain_delta=0.10)
-    out = _shading_match(crop, out)
-
-    # temporal smoothing (reduces GPEN per-frame jitter)
-    out = _temporal_smooth(sig, out)
-
-    # feathered mask and blending
-    mask = _make_feathered_mask((out.shape[0], out.shape[1]))
-    try:
-        center = (int(x1 + out.shape[1] // 2), int(y1 + out.shape[0] // 2))
-        temp_frame = cv2.seamlessClone(out, temp_frame, mask, center, cv2.MIXED_CLONE)
-    except Exception:
-        # alpha fallback
         try:
-            alpha = (mask.astype(np.float32) / 255.0)[..., None]
-            inv = 1.0 - alpha
-            temp_frame[y1:y2, x1:x2] = (alpha * out + inv * temp_frame[y1:y2, x1:x2]).astype(np.uint8)
+            _, _, restored_face = get_face_enhancer().enhance(
+                temp_face,
+                paste_back=False
+            )
         except Exception:
-            temp_frame[y1:y2, x1:x2] = out
+            # Fallback jika model gagal
+            return temp_frame
 
+    # 3. Manual Blending (Soft Edge + Anti-Occlusion)
+    if restored_face is not None:
+        h_crop, w_crop = temp_face.shape[:2]
+        
+        # Resize hasil restore ke ukuran crop asli
+        restored_face = cv2.resize(restored_face, (w_crop, h_crop))
+
+        # A. Buat Base Mask (Lingkaran/Elips Halus)
+        # Ini mengatasi masalah "Kotak Samar" di pinggiran
+        base_mask = np.zeros((h_crop, w_crop), dtype=np.float32)
+        center = (w_crop // 2, h_crop // 2)
+        axes = (int(w_crop * 0.45), int(h_crop * 0.45))
+        angle = 0
+        
+        cv2.ellipse(base_mask, center, axes, angle, 0, 360, 1.0, -1)
+        base_mask = cv2.GaussianBlur(base_mask, (51, 51), 0)
+
+        # B. Ambil Mask Occlusion (Tangan/Objek)
+        final_mask = base_mask
+        
+        # Cek apakah modul face_analyser punya fungsi yang kita buat
+        if hasattr(roop.face_analyser, 'get_occlusion_mask'):
+            raw_occ_mask = roop.face_analyser.get_occlusion_mask(target_face, temp_frame)
+            
+            if raw_occ_mask is not None:
+                # raw_occ_mask seukuran bbox asli (raw_x1...raw_x2)
+                # Kita perlu menaruhnya di dalam crop yang sudah di-padding (start_x...end_x)
+                
+                full_crop_occ = np.zeros((h_crop, w_crop), dtype=np.float32)
+                
+                # Hitung offset posisi bbox asli di dalam crop padding
+                off_x = raw_x1 - start_x
+                off_y = raw_y1 - start_y
+                
+                h_occ, w_occ = raw_occ_mask.shape[:2]
+                
+                # Pastikan tidak out of bounds
+                y1_paste = max(0, off_y)
+                y2_paste = min(h_crop, off_y + h_occ)
+                x1_paste = max(0, off_x)
+                x2_paste = min(w_crop, off_x + w_occ)
+                
+                # Hitung area source yang sesuai
+                sy1 = y1_paste - off_y
+                sy2 = sy1 + (y2_paste - y1_paste)
+                sx1 = x1_paste - off_x
+                sx2 = sx1 + (x2_paste - x1_paste)
+
+                if (y2_paste > y1_paste) and (x2_paste > x1_paste):
+                    paste_area = raw_occ_mask[sy1:sy2, sx1:sx2]
+                    # Resize kecil jika ada selisih pembulatan 1-2 pixel
+                    target_h = y2_paste - y1_paste
+                    target_w = x2_paste - x1_paste
+                    
+                    if paste_area.shape[:2] != (target_h, target_w):
+                         paste_area = cv2.resize(paste_area, (target_w, target_h))
+
+                    full_crop_occ[y1_paste:y2_paste, x1_paste:x2_paste] = paste_area
+                
+                # Blur mask tangan sedikit
+                full_crop_occ = cv2.GaussianBlur(full_crop_occ, (15, 15), 0)
+                
+                # LOGIC: Mask Final = Base Mask * (1 - Mask Tangan)
+                # Artinya: Enhance area lingkaran KECUALI yang ada tangannya
+                final_mask = base_mask * (1.0 - full_crop_occ)
+
+        # C. Apply Blending
+        final_mask = np.clip(final_mask, 0.0, 1.0)
+        final_mask = final_mask[:, :, np.newaxis] # HxWx1 channel
+
+        # Blend: (Enhanced * Mask) + (Original * (1-Mask))
+        temp_face = (restored_face * final_mask + temp_face * (1.0 - final_mask)).astype(np.uint8)
+
+    # Kembalikan ke frame utama
+    temp_frame[start_y:end_y, start_x:end_x] = temp_face
     return temp_frame
+
 
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
     many_faces = get_many_faces(temp_frame)
@@ -234,6 +178,7 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
         for target_face in many_faces:
             temp_frame = enhance_face(target_face, temp_frame)
     return temp_frame
+
 
 def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     for temp_frame_path in temp_frame_paths:
@@ -243,10 +188,12 @@ def process_frames(source_path: str, temp_frame_paths: List[str], update: Callab
         if update:
             update()
 
+
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     target_frame = cv2.imread(target_path)
     result = process_frame(None, None, target_frame)
     cv2.imwrite(output_path, result)
+
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
