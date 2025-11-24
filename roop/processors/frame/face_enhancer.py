@@ -59,14 +59,16 @@ def post_process() -> None:
 
 def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.ndarray, fidelity: float) -> np.ndarray:
     """
-    Menggabungkan hasil enhance dengan frame asli berdasarkan fidelity.
+    Menggabungkan hasil enhance dengan frame asli menggunakan Fidelity Blending,
+    Color Matching (Anti-Flicker), dan Masking (Anti-Box/Occlusion).
     """
     try:
+        # 1. Validasi Dimensi
         h, w = original_crop.shape[:2]
         if enhanced_crop.shape[:2] != (h, w):
             enhanced_crop = cv2.resize(enhanced_crop, (w, h))
 
-        # 1. Color Matching (Anti-Flicker)
+        # 2. Color Matching (Anti-Flicker)
         original_mean = np.mean(original_crop, axis=(0, 1))
         enhanced_mean = np.mean(enhanced_crop, axis=(0, 1))
         color_diff = original_mean - enhanced_mean
@@ -74,10 +76,10 @@ def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.nda
         corrected_crop = enhanced_crop.astype(np.float32) + color_diff
         corrected_crop = np.clip(corrected_crop, 0, 255).astype(np.uint8)
 
-        # 2. Fidelity Blending (Mengambil nilai fidelity dari argumen)
+        # 3. Fidelity Blending (Menjaga Mimik Wajah)
         blended_expression = cv2.addWeighted(corrected_crop, fidelity, original_crop, 1.0 - fidelity, 0)
 
-        # 3. Masking (Occlusion & Box Removal)
+        # 4. Masking (Occlusion & Box Removal)
         mask = np.zeros((h, w), dtype=np.float32)
         center = (w // 2, h // 2)
         axes = (int(w * 0.45), int(h * 0.45)) 
@@ -88,12 +90,13 @@ def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.nda
         mask = cv2.GaussianBlur(mask, (blur_radius, blur_radius), 0)
         mask_3ch = np.dstack([mask] * 3)
 
+        # 5. Final Compositing
         final_result = (blended_expression * mask_3ch + original_crop * (1.0 - mask_3ch)).astype(np.uint8)
         
         return final_result
         
     except Exception as e:
-        print(f"Error in blending: {e}")
+        update_status(f"Error in blending: {e}", NAME)
         return original_crop
 
 
@@ -117,8 +120,7 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
                 paste_back=True
             )
         
-        # --- AMBIL NILAI DARI ARGUMEN KAGGLE ---
-        # Default ke 0.6 jika entah bagaimana argumennya kosong
+        # 📌 AMBIL NILAI BLEND DARI GLOBAL (0.6 default jika CLI tidak diisi)
         blend_amount = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.6
         
         result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
