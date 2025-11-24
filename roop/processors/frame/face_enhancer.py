@@ -23,7 +23,6 @@ def get_face_enhancer() -> Any:
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
             model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
-            # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
             FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
     return FACE_ENHANCER
 
@@ -38,7 +37,6 @@ def get_device() -> str:
 
 def clear_face_enhancer() -> None:
     global FACE_ENHANCER
-
     FACE_ENHANCER = None
 
 
@@ -62,6 +60,7 @@ def post_process() -> None:
 # -----------------------------
 #  Helper utilities
 # -----------------------------
+
 
 def make_face_mask_from_landmarks(face: Face, frame_shape) -> np.ndarray:
     """
@@ -109,7 +108,6 @@ def feather_mask(mask: np.ndarray, ksize: int = 31) -> np.ndarray:
     """Feather atau soft-edge mask. Mengembalikan float mask 0..1."""
     if ksize % 2 == 0:
         ksize += 1
-    # normalisasi
     mask_f = mask.astype(np.float32) / 255.0
     blurred = cv2.GaussianBlur(mask_f, (ksize, ksize), 0)
     return np.clip(blurred, 0.0, 1.0)
@@ -121,15 +119,13 @@ def paste_with_seamless_clone(src_face_img: np.ndarray, dst_frame: np.ndarray, c
     src_face_img: BGR image yang akan dipaste (ukuran sama dengan area yang ingin di-paste)
     center: (x,y) center lokasi pada dst_frame
     """
-    gray = cv2.cvtColor(src_face_img, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY)
-    # pastikan mask single channel
-    mask = mask.astype(np.uint8)
     try:
+        gray = cv2.cvtColor(src_face_img, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY)
+        mask = mask.astype(np.uint8)
         output = cv2.seamlessClone(src_face_img, dst_frame, mask, center, cv2.NORMAL_CLONE)
         return output
     except Exception:
-        # fallback ke direct paste
         return dst_frame
 
 
@@ -137,8 +133,6 @@ def upscale_background(frame: np.ndarray, faces: List[Face], scale: float = 1.06
     """
     Upscale area background (non-face) sedikit dan blend kembali.
     scale kecil (1.03..1.10) direkomendasikan.
-
-    Jika real esrgan tersedia, kamu bisa panggilnya dengan ganti resize.
     """
     h, w = frame.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -158,7 +152,6 @@ def upscale_background(frame: np.ndarray, faces: List[Face], scale: float = 1.06
     x1, x2 = xs.min(), xs.max()
     y1, y2 = ys.min(), ys.max()
 
-    # jaga padding kecil supaya tidak memperbesar area terlalu jauh
     bg = frame[y1:y2+1, x1:x2+1]
     if bg.size == 0:
         return frame
@@ -167,11 +160,9 @@ def upscale_background(frame: np.ndarray, faces: List[Face], scale: float = 1.06
     new_h = max(1, int(bg.shape[0] * scale))
     up_bg = cv2.resize(bg, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
 
-    # sedikit unsharp mask
     gauss = cv2.GaussianBlur(up_bg, (0, 0), 3)
     up_bg = cv2.addWeighted(up_bg, 1.3, gauss, -0.3, 0)
 
-    # center crop kembali ke ukuran semula
     start_x = max(0, (up_bg.shape[1] - bg.shape[1]) // 2)
     start_y = max(0, (up_bg.shape[0] - bg.shape[0]) // 2)
     up_back = up_bg[start_y:start_y + bg.shape[0], start_x:start_x + bg.shape[1]]
@@ -187,10 +178,11 @@ def upscale_background(frame: np.ndarray, faces: List[Face], scale: float = 1.06
 #  Main enhancer hooks
 # -----------------------------
 
+
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     # baca bbox
     start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
-    padding_x = int((end_x - start_x) * 0.18)  # sedikit kurangi padding default
+    padding_x = int((end_x - start_x) * 0.18)
     padding_y = int((end_y - start_y) * 0.18)
     sx = max(0, start_x - padding_x)
     sy = max(0, start_y - padding_y)
@@ -214,57 +206,62 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
         return temp_frame
 
     temp_face = temp_frame[sy:ey, sx:ex].copy()
-    if temp_face.size:
-        with THREAD_SEMAPHORE:
-            # ambil hasil saja (paste_back=False)
+    if not temp_face.size:
+        return temp_frame
+
+    with THREAD_SEMAPHORE:
+        # ambil hasil saja (paste_back=False)
+        try:
+            restored_face, _, _ = get_face_enhancer().enhance(
+                temp_face,
+                paste_back=False
+            )
+        except Exception:
+            # fallback: coba sekali lagi pakai paste_back True
             try:
-                restored_face, _, _ = get_face_enhancer().enhance(
-                    temp_face,
-                    paste_back=False
-                )
-                # --- FIX: NORMALISASI OUTPUT GFPGAN ---
-                if isinstance(restored_face, list):
-                    restored_face = restored_face[0] if len(restored_face) > 0 else temp_face.copy()
-                restored_face = np.asarray(restored_face)
-                if restored_face.ndim == 2:
-                    restored_face = cv2.cvtColor(restored_face, cv2.COLOR_GRAY2BGR)
-                elif restored_face.ndim == 3 and restored_face.shape[2] == 1:
-                    restored_face = cv2.cvtColor(restored_face, cv2.COLOR_GRAY2BGR)
-                if restored_face.shape[:2] != temp_face.shape[:2]:
-                    restored_face = cv2.resize(restored_face, (temp_face.shape[1], temp_face.shape[0]))
-                if not isinstance(restored_face, np.ndarray):
-                    return temp_frame
-                if restored_face.dtype != np.uint8:
-                    restored_face = restored_face.astype(np.uint8)
+                _, _, restored_face = get_face_enhancer().enhance(temp_face, paste_back=True)
+            except Exception:
+                return temp_frame
 
-        except Exception:
+    # --- FIX: NORMALISASI OUTPUT GFPGAN ---
+    try:
+        if isinstance(restored_face, list):
+            restored_face = restored_face[0] if len(restored_face) > 0 else temp_face.copy()
+        restored_face = np.asarray(restored_face)
+        if restored_face.ndim == 2:
+            restored_face = cv2.cvtColor(restored_face, cv2.COLOR_GRAY2BGR)
+        elif restored_face.ndim == 3 and restored_face.shape[2] == 1:
+            restored_face = cv2.cvtColor(restored_face, cv2.COLOR_GRAY2BGR)
+        if restored_face.shape[:2] != temp_face.shape[:2]:
+            restored_face = cv2.resize(restored_face, (temp_face.shape[1], temp_face.shape[0]))
+        if restored_face.dtype != np.uint8:
+            restored_face = restored_face.astype(np.uint8)
+    except Exception:
+        return temp_frame
+
+    # buat mask full-frame -> crop
+    mask_full = make_face_mask_from_landmarks(target_face, temp_frame.shape)
+    mask_crop = mask_full[sy:ey, sx:ex]
+    alpha = feather_mask(mask_crop, ksize=41)
+    alpha_3 = alpha[:, :, None]
+
+    # blend sederhana dulu
+    try:
+        blended = restored_face.astype(np.float32) * alpha_3 + temp_face.astype(np.float32) * (1 - alpha_3)
+        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        temp_frame[sy:ey, sx:ex] = blended
+    except Exception:
+        temp_frame[sy:ey, sx:ex] = restored_face
+
+    # jika masih terlihat seam, opsi gunakan seamlessClone pada area tersebut
+    try:
+        edge = cv2.Canny((mask_crop > 0).astype(np.uint8) * 255, 50, 150)
+        edge_percent = (edge > 0).sum() / float(edge.size)
+        if edge_percent > 0.0005:
+            center = ((sx + ex) // 2, (sy + ey) // 2)
+            temp_frame = paste_with_seamless_clone(restored_face, temp_frame, center)
+    except Exception:
         pass
-    mask_full = make_face_mask_from_landmarks(target_face, temp_frame.shape) = make_face_mask_from_landmarks(target_face, temp_frame.shape)
-        mask_crop = mask_full[sy:ey, sx:ex]
-        # feather mask (ksize bisa kamu tuning)
-        alpha = feather_mask(mask_crop, ksize=41)
-        alpha_3 = alpha[:, :, None]
-
-        # blend sederhana dulu
-        try:
-            blended = restored_face.astype(np.float32) * alpha_3 + temp_face.astype(np.float32) * (1 - alpha_3)
-            blended = np.clip(blended, 0, 255).astype(np.uint8)
-            temp_frame[sy:ey, sx:ex] = blended
-        except Exception:
-            # fallback paste langsung
-            temp_frame[sy:ey, sx:ex] = restored_face
-
-        # jika masih terlihat seam, opsi gunakan seamlessClone pada area tersebut
-        # deteksi seam sederhana: bandingkan statistik tepi mask
-        try:
-            edge = cv2.Canny((mask_crop > 0).astype(np.uint8) * 255, 50, 150)
-            edge_percent = (edge > 0).sum() / float(edge.size)
-            # jika area edge relatif kecil tapi ada seam, pakai seamlessClone
-            if edge_percent > 0.0005:
-                center = ((sx + ex) // 2, (sy + ey) // 2)
-                temp_frame = paste_with_seamless_clone(restored_face, temp_frame, center)
-        except Exception:
-            pass
 
     return temp_frame
 
