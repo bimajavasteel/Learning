@@ -2,7 +2,7 @@ from typing import Any, List, Callable
 import cv2
 import insightface
 import threading
-import numpy as np
+import numpy as np  # untuk hitung jarak embedding
 
 import roop.globals
 import roop.processors.frame.core
@@ -10,14 +10,22 @@ from roop.core import update_status
 from roop.face_analyser import (
     get_one_face,
     get_many_faces,
-    find_similar_face,   # masih disediakan kalau mau fallback
-    smart_face_tracking, # tracking pintar
-    detect_occlusion,    # kini pakai frame untuk occluder
-    get_face_pose,       # pose (pitch, yaw, roll)
+    find_similar_face,    # masih tersedia kalau mau dipakai di tempat lain
+    smart_face_tracking,
+    detect_occlusion      # sekarang pakai occluder.onnx di face_analyser
 )
-from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
+from roop.face_reference import (
+    get_face_reference,
+    set_face_reference,
+    clear_face_reference
+)
 from roop.typing import Face, Frame
-from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+from roop.utilities import (
+    conditional_download,
+    resolve_relative_path,
+    is_image,
+    is_video
+)
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -27,7 +35,7 @@ NAME = 'ROOP.FACE-SWAPPER'
 def get_face_swapper() -> Any:
     """
     Inisialisasi model inswapper.
-    Kalau nanti mau upgrade ke inswapper_256 / CSCS_256, cukup ganti path di sini.
+    Kalau nanti mau upgrade ke inswapper_256, cukup ganti path di sini.
     """
     global FACE_SWAPPER
 
@@ -66,7 +74,6 @@ def pre_start() -> bool:
         update_status('Select an image for source path.', NAME)
         return False
 
-    # pakai get_one_face dari face_analyser (sudah pakai buffalo_l + filter det_score)
     source_img = cv2.imread(roop.globals.source_path)
     if not get_one_face(source_img):
         update_status('No face in source path detected.', NAME)
@@ -87,67 +94,6 @@ def post_process() -> None:
     clear_face_reference()
 
 
-# =====================================================================
-#  POSE-AWARE BBOX ADJUSTMENT (ANTI MASKER / ANTI KECIL)
-# =====================================================================
-
-def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
-    """
-    Sesuaikan bbox target berdasarkan pose:
-    - yaw besar → tambah padding kiri/kanan supaya wajah tidak mengecil
-    - pitch ke atas → tambah padding ke atas (dahi ikut, anti topeng lepas)
-    - pitch ke bawah → tambah padding ke bawah sedikit
-
-    face.bbox dimodifikasi in-place.
-    """
-    pitch, yaw, roll = get_face_pose(face)
-
-    h_frame, w_frame = frame_shape[:2]
-    bbox = np.array(face.bbox, dtype=np.float32)
-    x1, y1, x2, y2 = bbox
-    w = x2 - x1
-    h = y2 - y1
-
-    pad_x = 0.0
-    pad_y_top = 0.0
-    pad_y_bottom = 0.0
-
-    # yaw: menoleh ke samping → wajah cenderung terlihat kecil
-    # tambahkan padding horizontal bertahap setelah |yaw| > 25°
-    if abs(yaw) > 25.0:
-        extra = (abs(yaw) - 25.0) * 0.02   # 2% per derajat di atas 25
-        extra = min(extra, 0.20)          # max +20% lebar
-        pad_x = w * extra
-
-    # pitch: negatif = lihat ke atas, positif = lihat ke bawah (per definisi InsightFace)
-    if pitch < -15.0:
-        # melihat ke atas → tambah padding dahi
-        extra = (abs(pitch) - 15.0) * 0.02
-        extra = min(extra, 0.25)
-        pad_y_top = h * extra
-    elif pitch > 20.0:
-        # melihat ke bawah → dagu sedikit keluar, tambahkan bawah
-        extra = (pitch - 20.0) * 0.015
-        extra = min(extra, 0.18)
-        pad_y_bottom = h * extra
-
-    # hitung bbox baru
-    nx1 = int(max(0, x1 - pad_x))
-    nx2 = int(min(w_frame - 1, x2 + pad_x))
-    ny1 = int(max(0, y1 - pad_y_top))
-    ny2 = int(min(h_frame - 1, y2 + pad_y_bottom))
-
-    # safety: jangan sampai invalid
-    if nx2 <= nx1 or ny2 <= ny1:
-        return
-
-    face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-
-
-# =====================================================================
-#  CORE SWAP
-# =====================================================================
-
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
     Fungsi swap dasar (panggil inswapper).
@@ -155,9 +101,6 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
     if source_face is None or target_face is None:
         return temp_frame
-
-    # pose-aware bbox adjust (anti masker / anti wajah kecil)
-    adapt_bbox_for_pose(target_face, temp_frame.shape)
 
     return get_face_swapper().get(
         temp_frame,
@@ -172,8 +115,7 @@ def _select_best_target_by_embedding(
     reference_face: Face
 ) -> Face | None:
     """
-    Pilih wajah target terbaik berdasarkan embedding similarity
-    (mengikuti logika di find_similar_face, tapi dengan kontrol lebih besar).
+    Pilih wajah target terbaik berdasarkan embedding similarity.
     """
     if not faces or reference_face is None:
         return None
@@ -185,7 +127,6 @@ def _select_best_target_by_embedding(
     best_face = None
     best_distance = float('inf')
 
-    # gunakan threshold dari roop.globals bila tersedia, else fallback
     similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
 
     for f in faces:
@@ -211,17 +152,15 @@ def process_frame(
     frame_number: int = 0
 ) -> Frame:
     """
-    Proses 1 frame dengan strategi:
-    - many_faces = True  → swap ke semua wajah yang lolos filter & tidak occluded
-    - many_faces = False → cari wajah paling mirip + stabil (tracking + embedding) + pose-aware
+    Proses 1 frame:
+    - many_faces = True  → swap ke semua wajah yang valid + tidak occluded
+    - many_faces = False → cari wajah paling mirip + stabil (tracking + embedding)
     """
     if source_face is None:
-        # Safety guard: sudah dicek di pre_start, tapi buat jaga-jaga.
         return temp_frame
 
     # MODE: banyak wajah → swap semua yang valid
     if roop.globals.many_faces:
-        # pakai smart_face_tracking agar ID wajah konsisten antar frame
         faces = smart_face_tracking(temp_frame, frame_number)
         if not faces:
             faces = get_many_faces(temp_frame)
@@ -230,7 +169,7 @@ def process_frame(
             return temp_frame
 
         for target_face in faces:
-            # skip wajah yang ter-occlusion berat (tangan, rambut, dsb)
+            # ⛔ sekarang occlusion full pakai occluder.onnx (via detect_occlusion)
             if detect_occlusion(target_face, temp_frame):
                 continue
 
@@ -238,7 +177,7 @@ def process_frame(
 
         return temp_frame
 
-    # MODE: single / fokus 1 wajah → pakai reference + embedding matching
+    # MODE: single / fokus 1 wajah
     tracked_faces = smart_face_tracking(temp_frame, frame_number)
     if not tracked_faces:
         tracked_faces = get_many_faces(temp_frame)
@@ -246,8 +185,11 @@ def process_frame(
     if not tracked_faces:
         return temp_frame
 
-    # Filter occlusion dulu
-    valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
+    # Filter occlusion dulu (pakai occluder.onnx)
+    valid_faces = [
+        f for f in tracked_faces
+        if not detect_occlusion(f, temp_frame)
+    ]
     if not valid_faces:
         return temp_frame
 
@@ -272,10 +214,9 @@ def process_frames(
 ) -> None:
     """
     Dipanggil oleh core.process_video untuk memproses semua frame.
-    Di sini kita pegang:
     - source_face: konstan
     - reference_face: diambil dari face_reference (single-mode)
-    - frame_number: index frame → dipakai di smart_face_tracking
+    - frame_number: index frame (dipakai smart_face_tracking)
     """
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
@@ -300,14 +241,12 @@ def process_frames(
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     """
     Proses mode gambar ke gambar.
-    Di sini tidak butuh tracking frame_number kompleks → pakai 0 saja.
     """
     source_img = cv2.imread(source_path)
     target_frame = cv2.imread(target_path)
 
     source_face = get_one_face(source_img)
 
-    # reference_face hanya dipakai kalau many_faces = False
     reference_face = None
     if not roop.globals.many_faces:
         reference_face = get_one_face(
@@ -326,11 +265,10 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """
-    Entry point untuk mode video.
+    Entry point mode video.
     - Set face_reference sekali di awal (single-face)
-    - Lalu serahkan looping frame ke core.process_video
+    - Lalu serahkan looping frame ke core.process_video.
     """
-    # Untuk mode fokus 1 wajah, ambil reference_face dari frame & posisi pilihan user
     if not roop.globals.many_faces and not get_face_reference():
         try:
             ref_idx = roop.globals.reference_frame_number
@@ -341,10 +279,8 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
             )
             set_face_reference(reference_face)
         except Exception:
-            # Kalau gagal ambil reference, biarkan None (fallback ke first valid face per frame)
             set_face_reference(None)
 
-    # core.process_video akan memanggil process_frames di atas
     roop.processors.frame.core.process_video(
         source_path,
         temp_frame_paths,
