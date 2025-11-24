@@ -219,9 +219,31 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
             # ambil hasil saja (paste_back=False)
             try:
                 restored_face, _, _ = get_face_enhancer().enhance(
-                    temp_face,
-                    paste_back=False
-                )
+    temp_face,
+    paste_back=False
+)
+
+# --- FIX: NORMALISASI OUTPUT GFPGAN ---
+# GFPGAN kadang mengembalikan list berisi ndarray
+if isinstance(restored_face, list):
+    if len(restored_face) > 0:
+        restored_face = restored_face[0]
+    else:
+        restored_face = temp_face.copy()
+
+# Pastikan final output adalah numpy array 3D
+restored_face = np.asarray(restored_face)
+
+# Jika GFPGAN memberi channel aneh (1 channel dst), paksa jadi BGR 3-channel
+if restored_face.ndim == 2:
+    restored_face = cv2.cvtColor(restored_face, cv2.COLOR_GRAY2BGR)
+elif restored_face.ndim == 3 and restored_face.shape[2] == 1:
+    restored_face = cv2.cvtColor(restored_face, cv2.COLOR_GRAY2BGR)
+
+# Jika ukuran tidak match, resize
+if restored_face.shape[:2] != temp_face.shape[:2]:
+    restored_face = cv2.resize(restored_face, (temp_face.shape[1], temp_face.shape[0]))
+
             except Exception:
                 # fallback: coba sekali lagi pakai paste_back True untuk safety
                 try:
