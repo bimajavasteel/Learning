@@ -7,11 +7,13 @@ import insightface
 import numpy as np
 import cv2
 import os
-import onnxruntime as ort
 
 import roop.globals
 from roop.typing import Frame, Face
-from roop.utilities import conditional_download, resolve_relative_path
+from roop.utilities import resolve_relative_path
+
+# optional: kalau kamu punya occluder.onnx
+import onnxruntime as ort
 
 # =====================================================================
 #  GLOBALS
@@ -27,17 +29,17 @@ TRACKING_HISTORY: deque = deque(maxlen=30)
 
 # Threshold / hyper-parameter default (boleh kamu tuning)
 MIN_DET_SCORE = 0.30        # min score agar wajah dianggap valid (untuk get_many_faces)
-OCCLUSION_THRESHOLD = 0.40  # det_score < ini dianggap occluded (fallback basic)
+
+# fallback occlusion kalau occluder.onnx tidak ada
+OCCLUSION_THRESHOLD = 0.40  # det_score < ini dianggap occluded
+
 MAX_TRACK_GAP = 10          # frame: kalau lebih lama dari ini → track di-skip saat matching
 MAX_TRACK_AGE = 15          # frame: track dihapus bila tidak terlihat selama ini
 MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0–1)
 
-# Occluder model (ONNX) untuk deteksi occlusion yang lebih akurat
-OCCLUDER_URL = "https://huggingface.co/OwlMaster/AllFilesRope/resolve/main/occluder.onnx"
-OCCLUDER_FILENAME = "occluder.onnx"
+# Occluder ONNX (opsional)
 OCCLUDER_SESSION: Optional[ort.InferenceSession] = None
-OCCLUDER_LOCK = threading.Lock()
-OCCLUDER_SCORE_THRESHOLD = 0.5  # threshold mean score mask → occluded
+OCCLUDER_INPUT_NAME: Optional[str] = None
 
 
 # =====================================================================
@@ -46,7 +48,7 @@ OCCLUDER_SCORE_THRESHOLD = 0.5  # threshold mean score mask → occluded
 
 def get_face_analyser() -> Any:
     """
-    Lazy init insightface FaceAnalysis.
+    Lazy init insightface FaceAnalysis (buffalo_l).
     Sekali saja per proses, thread-safe.
     """
     global FACE_ANALYSER
@@ -58,34 +60,8 @@ def get_face_analyser() -> Any:
                 providers=roop.globals.execution_providers
             )
             FACE_ANALYSER.prepare(ctx_id=0)
-            print("✅ [face_analyser] Using buffalo_l with optimized settings")
+            print("✅ [face_analyser] Using buffalo_l (pose + 2d106 + 3d68)")
     return FACE_ANALYSER
-
-
-def get_occluder_session() -> Optional[ort.InferenceSession]:
-    """
-    Lazy init occluder.onnx via onnxruntime.
-    Auto-download ke folder ../models.
-    """
-    global OCCLUDER_SESSION
-
-    with OCCLUDER_LOCK:
-        if OCCLUDER_SESSION is None:
-            models_dir = resolve_relative_path('../models')
-            # auto-download file occluder.onnx
-            conditional_download(models_dir, [OCCLUDER_URL])
-            model_path = resolve_relative_path(f'../models/{OCCLUDER_FILENAME}')
-
-            providers = roop.globals.execution_providers
-            # Mapping sederhana: kalau ada CUDAExecutionProvider, pakai GPU
-            ort_providers = []
-            if 'CUDAExecutionProvider' in providers:
-                ort_providers.append('CUDAExecutionProvider')
-            ort_providers.append('CPUExecutionProvider')
-
-            OCCLUDER_SESSION = ort.InferenceSession(model_path, providers=ort_providers)
-            print("✅ [face_analyser] occluder.onnx loaded")
-    return OCCLUDER_SESSION
 
 
 def clear_face_analyser() -> None:
@@ -93,7 +69,7 @@ def clear_face_analyser() -> None:
     Reset analyser & tracking state.
     Dipanggil saat post_process / cleanup.
     """
-    global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY, OCCLUDER_SESSION
+    global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY
 
     with TRACK_LOCK:
         FACE_TRACKING.clear()
@@ -102,8 +78,77 @@ def clear_face_analyser() -> None:
     with THREAD_LOCK:
         FACE_ANALYSER = None
 
-    with OCCLUDER_LOCK:
+
+# =====================================================================
+#  OCCLUDER ONNX (opsional)
+# =====================================================================
+
+def _get_occluder_session() -> Optional[ort.InferenceSession]:
+    """
+    Lazy init occluder.onnx.
+    Kalau file tidak ada / gagal load → return None dan sistem fallback ke det_score.
+    """
+    global OCCLUDER_SESSION, OCCLUDER_INPUT_NAME
+
+    if OCCLUDER_SESSION is not None:
+        return OCCLUDER_SESSION
+
+    # Path default bisa kamu ganti via roop.globals.occluder_model_path
+    model_rel = getattr(roop.globals, "occluder_model_path", "../models/occluder.onnx")
+    model_path = resolve_relative_path(model_rel)
+
+    if not os.path.exists(model_path):
+        print(f"[face_analyser] occluder model not found at {model_path}, fallback ke det_score.")
+        return None
+
+    try:
+        OCCLUDER_SESSION = ort.InferenceSession(
+            model_path,
+            providers=roop.globals.execution_providers
+        )
+        OCCLUDER_INPUT_NAME = OCCLUDER_SESSION.get_inputs()[0].name
+        print(f"✅ [face_analyser] Loaded occluder model: {model_path}")
+    except Exception as e:
+        print(f"[face_analyser] Failed load occluder model: {e}")
         OCCLUDER_SESSION = None
+        OCCLUDER_INPUT_NAME = None
+
+    return OCCLUDER_SESSION
+
+
+def _run_occluder_onnx(crop: np.ndarray) -> float:
+    """
+    Jalankan occluder.onnx di atas crop wajah.
+    Return: occlusion score 0–1 (semakin besar artinya semakin tertutup).
+    Kalau model tidak tersedia / error → return 0.0 (anggap tidak occluded).
+    """
+    if crop is None or crop.size == 0:
+        return 0.0
+
+    session = _get_occluder_session()
+    if session is None:
+        return 0.0
+
+    try:
+        h, w = crop.shape[:2]
+        inp = cv2.resize(crop, (224, 224))
+        inp = inp.astype('float32') / 255.0
+        inp = inp.transpose(2, 0, 1)[None, ...]  # NCHW
+
+        outputs = session.run(None, {OCCLUDER_INPUT_NAME: inp})
+        pred = outputs[0]
+
+        # asumsi output [1,1,H,W] mask atau heatmap occlusion
+        if pred.ndim == 4:
+            mask = pred[0, 0]
+        else:
+            mask = pred[0]
+
+        mask = cv2.resize(mask, (w, h))
+        occl_ratio = float(np.mean(mask > 0.5))
+        return occl_ratio
+    except Exception:
+        return 0.0
 
 
 # =====================================================================
@@ -144,6 +189,24 @@ def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
         except IndexError:
             return many_faces[-1]
     return None
+
+
+def get_face_pose(face: Face) -> tuple[float, float, float]:
+    """
+    Ambil pose dari Face (pitch, yaw, roll) dalam derajat.
+    InsightFace menyimpan di face.pose dengan urutan (pitch, yaw, roll).
+    """
+    pose = getattr(face, "pose", None)
+    if pose is None:
+        return 0.0, 0.0, 0.0
+
+    try:
+        pitch = float(pose[0])
+        yaw = float(pose[1])
+        roll = float(pose[2])
+        return pitch, yaw, roll
+    except Exception:
+        return 0.0, 0.0, 0.0
 
 
 # =====================================================================
@@ -282,86 +345,50 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
 
 
 # =====================================================================
-#  OCCLUDER & OCCLUSION
+#  OCCLUSION & SIMILAR FACE
 # =====================================================================
-
-def _run_occluder_on_face(frame: Frame, face: Face) -> Optional[float]:
-    """
-    Jalankan occluder.onnx pada crop wajah.
-    Output diinterpretasikan sebagai score [0..1] (mean dari output tensor).
-    """
-    session = get_occluder_session()
-    if session is None:
-        return None
-
-    bbox = getattr(face, "bbox", None)
-    if bbox is None:
-        return None
-
-    x1, y1, x2, y2 = map(int, bbox)
-    h, w = frame.shape[:2]
-    x1 = max(0, min(w - 1, x1))
-    y1 = max(0, min(h - 1, y1))
-    x2 = max(0, min(w, x2))
-    y2 = max(0, min(h, y2))
-
-    if x2 <= x1 or y2 <= y1:
-        return None
-
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return None
-
-    # preprocess generic: 224x224 RGB, [0,1], NCHW
-    inp = cv2.resize(crop, (224, 224), interpolation=cv2.INTER_LINEAR)
-    inp = cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)
-    inp = inp.astype(np.float32) / 255.0
-    inp = np.transpose(inp, (2, 0, 1))  # CHW
-    inp = np.expand_dims(inp, 0)        # NCHW
-
-    input_name = session.get_inputs()[0].name
-    outputs = session.run(None, {input_name: inp})
-    if not outputs:
-        return None
-
-    score = float(np.mean(outputs[0]))
-    return score
-
 
 def detect_occlusion(face: Face, frame: Optional[Frame] = None) -> bool:
     """
-    Deteksi wajah yang ter-occlusion.
-    Kombinasi:
-    - det_score rendah → langsung dianggap occluded (fallback aman)
-    - jika frame tersedia & occluder siap → pakai occluder.onnx
+    Deteksi wajah yang ter-occlusion (tertutup tangan, rambut, dsb).
 
-    NOTE:
-    - Tidak fallback ke model swap lain (sesuai permintaan), hanya heuristik internal.
+    Prioritas:
+    1. Kalau occluder.onnx tersedia & frame disediakan:
+       - pakai occlusion score dari model
+    2. Kalau tidak:
+       - fallback ke det_score < OCCLUSION_THRESHOLD
     """
-    # Basic filter by det_score
-    base_score = getattr(face, "det_score", 1.0)
-    if base_score < OCCLUSION_THRESHOLD:
-        return True
+    # fallback paling aman: pakai det_score
+    base_flag = getattr(face, "det_score", 1.0) < OCCLUSION_THRESHOLD
 
-    # Kalau tidak ada frame, tidak bisa pakai occluder → anggap non-occluded.
     if frame is None:
-        return False
+        return base_flag
+
+    occl_session = _get_occluder_session()
+    if occl_session is None:
+        return base_flag
 
     try:
-        occ_score = _run_occluder_on_face(frame, face)
+        x1, y1, x2, y2 = map(int, face.bbox)
+        h, w = frame.shape[:2]
+        x1 = max(0, min(x1, w - 1))
+        x2 = max(0, min(x2, w))
+        y1 = max(0, min(y1, h - 1))
+        y2 = max(0, min(y2, h))
+
+        if x2 <= x1 or y2 <= y1:
+            return base_flag
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return base_flag
+
+        occl_score = _run_occluder_onnx(crop)
+        threshold = getattr(roop.globals, "occluder_threshold", 0.20)
+        return occl_score > threshold
     except Exception:
-        occ_score = None
+        return base_flag
 
-    if occ_score is None:
-        # tidak bisa hitung occluder → kembali ke basic
-        return False
-
-    return occ_score >= OCCLUDER_SCORE_THRESHOLD
-
-
-# =====================================================================
-#  SIMILAR FACE
-# =====================================================================
 
 def find_similar_face(frame: Frame,
                       reference_face: Face,
@@ -370,7 +397,7 @@ def find_similar_face(frame: Frame,
     Cari wajah paling mirip di frame terhadap reference_face.
     - Bisa pakai smart tracking (use_tracking=True)
     - Atau fallback ke get_many_faces biasa
-    - Menggunakan embedding distance seperti di mod kamu sebelumnya
+    - Menggunakan embedding distance seperti di mod sebelumnya
     """
     if reference_face is None:
         return None
