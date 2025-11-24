@@ -47,6 +47,8 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int)
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
+    # Di dalam def parse_args():
+    program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.8)
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
 
     args = program.parse_args()
@@ -206,7 +208,10 @@ def destroy() -> None:
 
 
 def run() -> None:
-    parse_args()
+    # Di dalam def run():
+args = parse_args()
+# ... kode lain ...
+roop.globals.face_enhancer_blend = args.face_enhancer_blend # <--- Tambahkan ini
     if not pre_check():
         return
     for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
