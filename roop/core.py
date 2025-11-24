@@ -47,8 +47,10 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int)
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
-    # Di dalam def parse_args():
-    program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.8)
+    
+    # 📌 TAMBAHAN BARU: Argument untuk mengatur blending ratio/fidelity
+    program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.6)
+    
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
 
     args = program.parse_args()
@@ -72,6 +74,9 @@ def parse_args() -> None:
     roop.globals.max_memory = args.max_memory
     roop.globals.execution_providers = decode_execution_providers(args.execution_provider)
     roop.globals.execution_threads = args.execution_threads
+    
+    # 📌 TAMBAHAN BARU: Simpan nilai blend ke roop.globals
+    roop.globals.face_enhancer_blend = args.face_enhancer_blend
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
@@ -80,7 +85,7 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
 
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
     return [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
-            if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
+             if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
 
 
 def suggest_execution_providers() -> List[str]:
@@ -98,7 +103,7 @@ def limit_resources() -> None:
     gpus = tensorflow.config.experimental.list_physical_devices('GPU')
     for gpu in gpus:
         tensorflow.config.experimental.set_virtual_device_configuration(gpu, [
-            tensorflow.config.experimental.VirtualDeviceConfiguration(memory_limit=1024)
+             tensorflow.config.experimental.VirtualDeviceConfiguration(memory_limit=1024)
         ])
     # limit memory usage
     if roop.globals.max_memory:
@@ -208,10 +213,11 @@ def destroy() -> None:
 
 
 def run() -> None:
-    # Di dalam def run():
-args = parse_args()
-# ... kode lain ...
-roop.globals.face_enhancer_blend = args.face_enhancer_blend # <--- Tambahkan ini
+    # 📌 KOREKSI INDENTASI: Panggil parse_args() hanya sekali dan ter-indentasi
+    args = parse_args()
+    
+    # Nilai face_enhancer_blend sudah diset di akhir parse_args()
+
     if not pre_check():
         return
     for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
