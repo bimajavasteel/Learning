@@ -1,11 +1,10 @@
 # =====================================================================
-#  face_swapper.py  (FULL VERSION + FIXED + RESWAPPER READY)
+#  face_swapper.py  (RESWAPPER ONLY, no fallback)
 # =====================================================================
 
 from typing import Any, List, Callable
 import os
 import cv2
-import insightface
 import threading
 import numpy as np
 
@@ -34,21 +33,18 @@ NAME = 'ROOP.FACE-SWAPPER'
 
 
 # ================================================================
-# AUTO DOWNLOAD (inswapper + reswapper)
+# AUTO DOWNLOAD (RESWAPPER ONLY)
 # ================================================================
 
 def pre_check() -> bool:
     """
-    Pastikan model sudah ter-download sebelum mulai.
-    Auto-download inswapper dan reswapper.
+    Pastikan model Reswapper sudah ter-download sebelum mulai.
+    Hanya mendownload reswapper (tidak ada fallback).
     """
     download_directory_path = resolve_relative_path('../models')
 
     conditional_download(download_directory_path, [
-        # default
-        'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx',
-
-        # reswapper
+        # hanya reswapper
         'https://huggingface.co/somanchiu/reswapper/resolve/main/reswapper_256-1567500.pth'
     ])
 
@@ -56,35 +52,30 @@ def pre_check() -> bool:
 
 
 # ================================================================
-# FACE SWAPPER LOADER (Priority: ReSwapper)
+# FACE SWAPPER LOADER (Reswapper only)
 # ================================================================
 
 from roop.processors.frame.reswapper import ReSwapperWrapper
 
 def get_face_swapper() -> Any:
     """
-    Loader utama model swappers:
-    - Jika Reswapper tersedia → gunakan itu
-    - Jika tidak → fallback ke inswapper_128.onnx
+    Loader utama: hanya ReSwapper.
+    Jika file checkpoint tidak ada → raise error supaya user tahu.
     """
     global FACE_SWAPPER
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            # cek apakah reswapper tersedia
+            # path model reswapper
             res_path = resolve_relative_path('../models/reswapper_256-1567500.pth')
 
-            if os.path.exists(res_path):
-                FACE_SWAPPER = ReSwapperWrapper(res_path)
-                return FACE_SWAPPER
+            if not os.path.exists(res_path):
+                raise FileNotFoundError(
+                    f"Reswapper checkpoint tidak ditemukan di {res_path}. "
+                    "Pastikan pre_check() sudah dijalankan atau file tersedia."
+                )
 
-            # fallback ONNX inswapper
-            model_path = resolve_relative_path('../models/inswapper_128.onnx')
-            FACE_SWAPPER = insightface.model_zoo.get_model(
-                model_path,
-                providers=roop.globals.execution_providers
-            )
-
+            FACE_SWAPPER = ReSwapperWrapper(res_path)
     return FACE_SWAPPER
 
 
