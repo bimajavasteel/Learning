@@ -237,7 +237,9 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
                 if restored_face.dtype != np.uint8:
                     restored_face = restored_face.astype(np.uint8)
 
-        mask_full = make_face_mask_from_landmarks(target_face, temp_frame.shape)
+        except Exception:
+        pass
+    mask_full = make_face_mask_from_landmarks(target_face, temp_frame.shape) = make_face_mask_from_landmarks(target_face, temp_frame.shape)
         mask_crop = mask_full[sy:ey, sx:ex]
         # feather mask (ksize bisa kamu tuning)
         alpha = feather_mask(mask_crop, ksize=41)
