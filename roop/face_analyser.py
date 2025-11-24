@@ -297,65 +297,55 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> List[Face]:
 
 def detect_occlusion(face: Face, frame: Frame) -> bool:
     """
-    Deteksi occlusion berat (tangan, rambut, benda) memakai occluder.onnx saja.
-    - Crop area bbox wajah dari frame,
-    - Resize & normalisasi,
-    - Run occluder,
-    - Hitung rasio area occluded,
-    - Bandingkan dengan threshold.
-    Tidak ada fallback ke det_score atau metode lain.
+    Deteksi occlusion menggunakan occluder.onnx (256×256).
+    Tidak ada fallback. Jika error → anggap occluded.
     """
     try:
         session, input_name = get_occluder_session()
 
-        bbox = np.array(face.bbox, dtype=int)
-        x1, y1, x2, y2 = bbox.tolist()
-
+        # ambil bbox
+        x1, y1, x2, y2 = map(int, face.bbox)
         h, w = frame.shape[:2]
+
+        # clipping aman
         x1 = max(0, x1)
         y1 = max(0, y1)
         x2 = min(w, x2)
         y2 = min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
-            # bbox tidak valid → anggap occluded (fail-closed, tanpa fallback)
             return True
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return True
 
-     target_size = 256
-crop_resized = cv2.resize(
-    crop,
-    (target_size, target_size),
-    interpolation=cv2.INTER_LINEAR
-)
+        # MODEL INI BUTUH 256×256 (bukan 224)
+        target_size = 256
+        crop_resized = cv2.resize(
+            crop,
+            (target_size, target_size),
+            interpolation=cv2.INTER_LINEAR
+        )
 
-        # asumsikan model pakai RGB, range 0–1
         crop_resized = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
         inp = crop_resized.astype('float32') / 255.0
-        inp = np.transpose(inp, (2, 0, 1))[np.newaxis, ...]  # 1x3xHxW
+        inp = np.transpose(inp, (2, 0, 1))[np.newaxis, ...]
 
         outputs = session.run(None, {input_name: inp})
-        mask = np.asarray(outputs[0])
-        mask = np.squeeze(mask)
+        mask = outputs[0]
 
+        mask = np.squeeze(mask)
         if mask.ndim == 3:
             mask = mask[0]
 
         occluded_ratio = float(np.mean(mask > 0.5))
-
-        # threshold bisa diatur dari roop.globals.occlusion_threshold kalau ada
         threshold = getattr(roop.globals, 'occlusion_threshold', 0.15)
         return occluded_ratio >= threshold
 
     except Exception as e:
-        # Tidak ada fallback; jika occluder gagal, anggap occluded
         print(f"[OCCLUDER] Error during occlusion detection: {e}")
         return True
-
-
 # =====================================================================
 #  SIMILAR FACE (EMBEDDING MATCHING)
 # =====================================================================
