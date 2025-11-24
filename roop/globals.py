@@ -19,4 +19,6 @@ output_video_quality: Optional[int] = None
 max_memory: Optional[int] = None
 execution_providers: List[str] = []
 execution_threads: Optional[int] = None
+# Tambahkan ini di roop/globals.py
+face_enhancer_blend: float = None
 log_level: str = 'error'
