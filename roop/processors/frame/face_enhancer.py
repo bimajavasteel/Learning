@@ -6,10 +6,9 @@ from gfpgan.utils import GFPGANer
 
 import roop.globals
 import roop.processors.frame.core
-# Import face_analyser untuk akses occlusion mask
-import roop.face_analyser 
 from roop.core import update_status
-from roop.face_analyser import get_many_faces
+# Import fungsi masking geometris baru
+from roop.face_analyser import get_many_faces, get_geometric_mask 
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
@@ -25,7 +24,7 @@ def get_face_enhancer() -> Any:
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
             model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
-            # todo: set models path -> https://github.com/TencentARC/GFPGAN/issues/399
+            # Pastikan path model benar sesuai setup Anda
             FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
     return FACE_ENHANCER
 
@@ -62,14 +61,16 @@ def post_process() -> None:
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Enhance wajah dengan Soft Blending & Occlusion Masking.
+    Enhance wajah menggunakan Masking Geometris (Convex Hull).
+    Hasilnya mengikuti kontur wajah asli, menghilangkan efek kotak.
     """
-    # 1. Hitung Koordinat Crop dengan Padding
+    # 1. Hitung Koordinat Crop dengan Padding (Agar GFPGAN bekerja optimal)
     start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
     
-    # Simpan koordinat asli (raw) untuk referensi mask occlusion
+    # Simpan koordinat asli (raw) untuk referensi masking
     raw_x1, raw_y1, raw_x2, raw_y2 = start_x, start_y, end_x, end_y
 
+    # Padding 20%
     padding_x = int((end_x - start_x) * 0.2)
     padding_y = int((end_y - start_y) * 0.2)
 
@@ -82,8 +83,8 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     if temp_face.size == 0:
         return temp_frame
 
-    # 2. Jalankan GFPGAN
-    # paste_back=False : Kita butuh raw result untuk manual blending
+    # 2. Jalankan GFPGAN (Restoration)
+    # paste_back=False : Kita butuh raw result untuk manual blending presisi
     with THREAD_SEMAPHORE:
         try:
             _, _, restored_face = get_face_enhancer().enhance(
@@ -91,83 +92,67 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
                 paste_back=False
             )
         except Exception:
-            # Fallback jika model gagal
             return temp_frame
 
-    # 3. Manual Blending (Soft Edge + Anti-Occlusion)
+    # 3. Manual Geometric Blending
     if restored_face is not None:
         h_crop, w_crop = temp_face.shape[:2]
         
-        # Resize hasil restore ke ukuran crop asli
+        # Resize hasil restore ke ukuran crop
         restored_face = cv2.resize(restored_face, (w_crop, h_crop))
 
-        # A. Buat Base Mask (Lingkaran/Elips Halus)
-        # Ini mengatasi masalah "Kotak Samar" di pinggiran
-        base_mask = np.zeros((h_crop, w_crop), dtype=np.float32)
-        center = (w_crop // 2, h_crop // 2)
-        axes = (int(w_crop * 0.45), int(h_crop * 0.45))
-        angle = 0
-        
-        cv2.ellipse(base_mask, center, axes, angle, 0, 360, 1.0, -1)
-        base_mask = cv2.GaussianBlur(base_mask, (51, 51), 0)
+        # --- GEOMETRIC MASKING LOGIC ---
+        # Ambil mask bentuk wajah presisi dari face_analyser
+        geo_mask_raw = get_geometric_mask(target_face, temp_frame)
 
-        # B. Ambil Mask Occlusion (Tangan/Objek)
-        final_mask = base_mask
-        
-        # Cek apakah modul face_analyser punya fungsi yang kita buat
-        if hasattr(roop.face_analyser, 'get_occlusion_mask'):
-            raw_occ_mask = roop.face_analyser.get_occlusion_mask(target_face, temp_frame)
+        if geo_mask_raw is not None:
+            # geo_mask_raw ukurannya sesuai bbox asli (raw_x1..raw_x2)
+            # Kita perlu menaruhnya di dalam kanvas crop yang lebih besar (start_x..end_x)
             
-            if raw_occ_mask is not None:
-                # raw_occ_mask seukuran bbox asli (raw_x1...raw_x2)
-                # Kita perlu menaruhnya di dalam crop yang sudah di-padding (start_x...end_x)
+            # Buat kanvas mask kosong seukuran crop padding
+            final_mask = np.zeros((h_crop, w_crop), dtype=np.float32)
+            
+            # Hitung offset (pergeseran) bbox asli di dalam crop padding
+            off_x = raw_x1 - start_x
+            off_y = raw_y1 - start_y
+            
+            h_geo, w_geo = geo_mask_raw.shape[:2]
+            
+            # Pastikan koordinat paste valid (tidak keluar batas)
+            y1_p = max(0, off_y)
+            y2_p = min(h_crop, off_y + h_geo)
+            x1_p = max(0, off_x)
+            x2_p = min(w_crop, off_x + w_geo)
+            
+            # Ambil area source yang sesuai
+            sy1 = y1_p - off_y
+            sy2 = sy1 + (y2_p - y1_p)
+            sx1 = x1_p - off_x
+            sx2 = sx1 + (x2_p - x1_p)
+            
+            if (y2_p > y1_p) and (x2_p > x1_p):
+                paste_area = geo_mask_raw[sy1:sy2, sx1:sx2]
                 
-                full_crop_occ = np.zeros((h_crop, w_crop), dtype=np.float32)
+                # Resize kecil jika ada selisih pembulatan
+                th, tw = y2_p - y1_p, x2_p - x1_p
+                if paste_area.shape[:2] != (th, tw):
+                    paste_area = cv2.resize(paste_area, (tw, th))
                 
-                # Hitung offset posisi bbox asli di dalam crop padding
-                off_x = raw_x1 - start_x
-                off_y = raw_y1 - start_y
-                
-                h_occ, w_occ = raw_occ_mask.shape[:2]
-                
-                # Pastikan tidak out of bounds
-                y1_paste = max(0, off_y)
-                y2_paste = min(h_crop, off_y + h_occ)
-                x1_paste = max(0, off_x)
-                x2_paste = min(w_crop, off_x + w_occ)
-                
-                # Hitung area source yang sesuai
-                sy1 = y1_paste - off_y
-                sy2 = sy1 + (y2_paste - y1_paste)
-                sx1 = x1_paste - off_x
-                sx2 = sx1 + (x2_paste - x1_paste)
+                # Tempel mask wajah ke kanvas
+                final_mask[y1_p:y2_p, x1_p:x2_p] = paste_area
 
-                if (y2_paste > y1_paste) and (x2_paste > x1_paste):
-                    paste_area = raw_occ_mask[sy1:sy2, sx1:sx2]
-                    # Resize kecil jika ada selisih pembulatan 1-2 pixel
-                    target_h = y2_paste - y1_paste
-                    target_w = x2_paste - x1_paste
-                    
-                    if paste_area.shape[:2] != (target_h, target_w):
-                         paste_area = cv2.resize(paste_area, (target_w, target_h))
+            # Expand dimensi mask untuk blending RGB
+            final_mask = final_mask[:, :, np.newaxis] # HxWx1
 
-                    full_crop_occ[y1_paste:y2_paste, x1_paste:x2_paste] = paste_area
-                
-                # Blur mask tangan sedikit
-                full_crop_occ = cv2.GaussianBlur(full_crop_occ, (15, 15), 0)
-                
-                # LOGIC: Mask Final = Base Mask * (1 - Mask Tangan)
-                # Artinya: Enhance area lingkaran KECUALI yang ada tangannya
-                final_mask = base_mask * (1.0 - full_crop_occ)
+            # BLEND: (Enhanced * Mask) + (Original * (1-Mask))
+            # Mask ini sudah di-blur di face_analyser, jadi transisi halus
+            temp_face = (restored_face * final_mask + temp_face * (1.0 - final_mask)).astype(np.uint8)
+        
+        else:
+            # Fallback jika geometric mask gagal (jarang): Blending lingkaran sederhana
+            pass
 
-        # C. Apply Blending
-        final_mask = np.clip(final_mask, 0.0, 1.0)
-        final_mask = final_mask[:, :, np.newaxis] # HxWx1 channel
-
-        # Blend: (Enhanced * Mask) + (Original * (1-Mask))
-        temp_face = (restored_face * final_mask + temp_face * (1.0 - final_mask)).astype(np.uint8)
-
-    # Kembalikan ke frame utama
+    # Kembalikan potongan wajah yang sudah di-enhance ke frame utama
     temp_frame[start_y:end_y, start_x:end_x] = temp_face
     return temp_frame
 
