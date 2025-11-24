@@ -325,12 +325,13 @@ def detect_occlusion(face: Face, frame: Frame) -> bool:
         if crop.size == 0:
             return True
 
-        target_size = 224
-        crop_resized = cv2.resize(
-            crop,
-            (target_size, target_size),
-            interpolation=cv2.INTER_LINEAR
-        )
+     target_size = 256
+crop_resized = cv2.resize(
+    crop,
+    (target_size, target_size),
+    interpolation=cv2.INTER_LINEAR
+)
+
         # asumsikan model pakai RGB, range 0–1
         crop_resized = cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB)
         inp = crop_resized.astype('float32') / 255.0
