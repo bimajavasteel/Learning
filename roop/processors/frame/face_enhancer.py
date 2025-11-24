@@ -1,7 +1,7 @@
 from typing import Any, List, Callable
 import cv2
 import threading
-import numpy as np  # <--- Tambahkan library numpy
+import numpy as np
 from gfpgan.utils import GFPGANer
 
 import roop.globals
@@ -57,10 +57,10 @@ def post_process() -> None:
     clear_face_enhancer()
 
 
-def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.ndarray) -> np.ndarray:
+def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.ndarray, fidelity: float = 0.6) -> np.ndarray:
     """
-    Fungsi Helper: Melakukan color transfer untuk anti-flickering dan 
-    elliptical masking untuk menghilangkan kotak samar/artifact occlusion.
+    Menggabungkan hasil enhance dengan frame asli.
+    Fidelity 0.6 = 60% AI (Tajam) + 40% Asli (Ekspresi/Bayangan).
     """
     try:
         # 1. Validasi Dimensi
@@ -68,44 +68,43 @@ def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.nda
         if enhanced_crop.shape[:2] != (h, w):
             enhanced_crop = cv2.resize(enhanced_crop, (w, h))
 
-        # 2. Color Matching (Anti-Flickering)
-        # Menyesuaikan rata-rata warna hasil enhance agar sama dengan frame asli
-        # Ini mencegah wajah 'berkedip' karena perubahan pencahayaan dari model GAN
+        # 2. Color Matching (Anti-Flicker)
+        # Menyamakan tone warna AI dengan tone warna asli
         original_mean = np.mean(original_crop, axis=(0, 1))
         enhanced_mean = np.mean(enhanced_crop, axis=(0, 1))
         color_diff = original_mean - enhanced_mean
         
-        # Terapkan koreksi warna
         corrected_crop = enhanced_crop.astype(np.float32) + color_diff
         corrected_crop = np.clip(corrected_crop, 0, 255).astype(np.uint8)
 
-        # 3. Masking (Occlusion & Box Removal)
-        # Membuat masker elips (bukan kotak) dengan pinggiran blur (feathering)
+        # 3. Fidelity Blending (Menjaga Mimik Wajah)
+        # Mencampur pixel AI yang sudah dikoreksi warnanya dengan pixel asli
+        # cv2.addWeighted(src1, alpha, src2, beta, gamma)
+        blended_expression = cv2.addWeighted(corrected_crop, fidelity, original_crop, 1.0 - fidelity, 0)
+
+        # 4. Masking (Occlusion & Box Removal)
+        # Membuat masker elips agar pinggiran tidak kotak dan aman dari occlusion
         mask = np.zeros((h, w), dtype=np.float32)
         center = (w // 2, h // 2)
         
-        # Gunakan area sedikit lebih kecil dari kotak (misal 45% dari width/height) 
-        # agar tidak menimpa objek di sudut kotak (occlusion handling dasar)
+        # Area masking 45% dari pusat (aman untuk tangan/rambut di pinggir)
         axes = (int(w * 0.45), int(h * 0.45)) 
-        
         cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
         
-        # Blur mask untuk blending halus (menghilangkan garis kotak)
+        # Blur masker untuk transisi halus (Soft Blending)
         blur_radius = int(min(w, h) * 0.1) 
-        if blur_radius % 2 == 0: blur_radius += 1 # Harus ganjil
+        if blur_radius % 2 == 0: blur_radius += 1
         mask = cv2.GaussianBlur(mask, (blur_radius, blur_radius), 0)
-        
-        # Expand mask ke 3 channel (BGR)
         mask_3ch = np.dstack([mask] * 3)
 
-        # 4. Alpha Blending
-        # Rumus: Result = (Enhanced * Mask) + (Original * (1 - Mask))
-        blended = (corrected_crop * mask_3ch + original_crop * (1.0 - mask_3ch)).astype(np.uint8)
+        # 5. Final Compositing
+        # Tempel wajah yang sudah di-blend ekspresinya ke background menggunakan mask
+        final_result = (blended_expression * mask_3ch + original_crop * (1.0 - mask_3ch)).astype(np.uint8)
         
-        return blended
+        return final_result
         
     except Exception as e:
-        # Fallback aman: jika terjadi error, kembalikan original agar proses tidak crash
+        # Fallback aman
         print(f"Error in blending: {e}")
         return original_crop
 
@@ -115,28 +114,24 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     padding_x = int((end_x - start_x) * 0.2)
     padding_y = int((end_y - start_y) * 0.2)
     
-    # Pastikan koordinat tidak keluar batas frame (clipping)
     h_frame, w_frame = temp_frame.shape[:2]
     start_x = max(0, start_x - padding_x)
     start_y = max(0, start_y - padding_y)
     end_x = min(w_frame, end_x + padding_x)
     end_y = min(h_frame, end_y + padding_y)
     
-    # Crop area wajah asli
     temp_face = temp_frame[start_y:end_y, start_x:end_x]
     
     if temp_face.size:
         with THREAD_SEMAPHORE:
-            # enhance mengembalikan (cropped_faces, restored_faces, restored_img)
             _, _, enhanced_face = get_face_enhancer().enhance(
                 temp_face,
                 paste_back=True
             )
         
-        # Terapkan blending pintar (Mask + Color Match)
-        result_face = apply_blend_and_color_match(enhanced_face, temp_face)
+        # Panggil fungsi blending dengan fidelity 0.6
+        result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=0.6)
         
-        # Tempel kembali ke frame utama
         temp_frame[start_y:end_y, start_x:end_x] = result_face
         
     return temp_frame
