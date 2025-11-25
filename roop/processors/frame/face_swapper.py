@@ -1,10 +1,11 @@
-import copy
 import threading
 from typing import Any, List, Callable, Optional
 
 import cv2
 import insightface
 import numpy as np
+# [FIX] Import class Face secara eksplisit untuk manual cloning
+from insightface.app.common import Face as InsightFaceObject 
 
 import roop.globals
 import roop.processors.frame.core
@@ -12,7 +13,6 @@ from roop.core import update_status
 from roop.face_analyser import (
     get_one_face,
     get_many_faces,
-    find_similar_face,
     smart_face_tracking,
     detect_occlusion,
     get_face_pose,
@@ -27,11 +27,7 @@ NAME = 'ROOP.FACE-SWAPPER'
 
 
 def get_face_swapper() -> Any:
-    """
-    Inisialisasi model inswapper.
-    """
     global FACE_SWAPPER
-
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
             model_path = resolve_relative_path('../models/inswapper_128.onnx')
@@ -128,9 +124,7 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
 
 def adapt_kps_for_pose(face: Face) -> None:
     """
-    [BARU] Modifikasi KPS (Landmarks) untuk mengatasi 'masker lepas'.
-    Saat wajah menoleh ekstrem, kita 'lebarkan' (expand) titik landmark
-    agar inswapper meng-crop area yang lebih luas (termasuk pipi samping).
+    Modifikasi KPS (Landmarks) untuk mengatasi 'masker lepas'.
     """
     pitch, yaw, roll = get_face_pose(face)
 
@@ -146,10 +140,9 @@ def adapt_kps_for_pose(face: Face) -> None:
         return
 
     kps = face.kps
-    # Hitung pusat wajah rata-rata
     center = np.mean(kps, axis=0)
 
-    # Dorong titik menjauh dari pusat (zoom-out effect pada crop)
+    # Dorong titik menjauh dari pusat
     new_kps = kps + (kps - center) * strength
     
     face.kps = new_kps.astype(np.float32)
@@ -170,18 +163,35 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
     # 2. Adaptasi KPS (agar masker tidak lepas di pinggir)
-    # Kita copy object face agar tidak merusak data tracking asli
-    target_face_adj = copy.copy(target_face)
-    if hasattr(target_face, 'kps'):
-        target_face_adj.kps = np.array(target_face.kps, dtype=np.float32).copy()
-        target_face_adj.bbox = np.array(target_face.bbox, dtype=np.float32).copy()
-    
-    # Jalankan logika fix KPS
+    # [FIX] JANGAN GUNAKAN COPY.COPY
+    # Kita buat object Face baru secara manual agar tidak error pickle/NoneType
+    try:
+        # Clone manual hanya data yang dibutuhkan
+        target_face_adj = InsightFaceObject(
+            bbox=target_face.bbox.copy(),
+            kps=target_face.kps.copy(),
+            det_score=target_face.det_score,
+            embedding=target_face.embedding
+        )
+        
+        # Salin atribut lain jika ada (opsional, untuk safety)
+        if hasattr(target_face, 'landmark_3d_68'):
+            target_face_adj.landmark_3d_68 = target_face.landmark_3d_68
+        if hasattr(target_face, 'pose'):
+            target_face_adj.pose = target_face.pose
+        if hasattr(target_face, 'landmark_2d_106'):
+            target_face_adj.landmark_2d_106 = target_face.landmark_2d_106
+            
+    except Exception as e:
+        print(f"Warning: Failed to clone face manually: {e}. Using original.")
+        target_face_adj = target_face # Fallback jika cloning gagal (resiko: tracking terganggu dikit)
+
+    # Jalankan logika fix KPS pada face hasil clone
     adapt_kps_for_pose(target_face_adj)
 
     return get_face_swapper().get(
         temp_frame,
-        target_face_adj,  # Gunakan face yang sudah dimodifikasi KPS-nya
+        target_face_adj, 
         source_face,
         paste_back=True
     )
