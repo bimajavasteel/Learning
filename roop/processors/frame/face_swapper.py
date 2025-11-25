@@ -276,7 +276,7 @@ def standard_face_blending(swapped_frame: Frame, original_frame: Frame, face: Fa
 
 
 # =====================================================================
-#  CORE SWAP WITH ENHANCED BLENDING
+#  CORE SWAP WITH ENHANCED BLENDING (FIXED COPY ISSUE)
 # =====================================================================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
@@ -293,26 +293,34 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # Simpan frame original untuk blending
     original_frame = temp_frame.copy()
     
-    # Enhanced BBOX adjustment (TANPA modifikasi KPS)
+    # Simpan bbox asli untuk restore nanti
+    original_bbox = target_face.bbox.copy() if hasattr(target_face, 'bbox') else None
+    
+    # Enhanced BBOX adjustment
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
-    # Copy face object untuk safety
-    target_face_adj = copy.copy(target_face)
-    target_face_adj.bbox = np.array(target_face.bbox, dtype=np.float32).copy()
+    try:
+        # Perform swap
+        swapped_frame = get_face_swapper().get(
+            temp_frame,
+            target_face,
+            source_face,
+            paste_back=True
+        )
 
-    # Perform swap
-    swapped_frame = get_face_swapper().get(
-        temp_frame,
-        target_face_adj,
-        source_face,
-        paste_back=True
-    )
-
-    # Pilih blending strategy berdasarkan angle
-    if is_extreme_angle:
-        return enhanced_face_blending(swapped_frame, original_frame, target_face_adj)
-    else:
-        return standard_face_blending(swapped_frame, original_frame, target_face_adj)
+        # Pilih blending strategy berdasarkan angle
+        if is_extreme_angle:
+            return enhanced_face_blending(swapped_frame, original_frame, target_face)
+        else:
+            return standard_face_blending(swapped_frame, original_frame, target_face)
+    
+    except Exception as e:
+        print(f"Swap face error: {e}")
+        return temp_frame
+    finally:
+        # Restore original bbox untuk menjaga konsistensi tracking
+        if original_bbox is not None:
+            target_face.bbox = original_bbox
 
 
 def _select_best_target_by_embedding(
