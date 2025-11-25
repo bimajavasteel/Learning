@@ -5,7 +5,6 @@ import copy
 import cv2
 import insightface
 import numpy as np
-# [FIX] Import class Face untuk cloning manual
 from insightface.app.common import Face as InsightFaceObject 
 
 import roop.globals
@@ -25,7 +24,7 @@ from roop.utilities import conditional_download, resolve_relative_path, is_image
 FACE_SWAPPER: Any = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
-MASK_TEMPLATE = None  # Cache untuk mask
+MASK_TEMPLATE = None
 
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
@@ -67,29 +66,55 @@ def post_process() -> None:
     clear_face_reference()
 
 # =====================================================================
-#  ADVANCED MASKING & BLENDING (SOLUSI GARIS KASAR)
+#  COLOR TRANSFER & MASKING
 # =====================================================================
 
+def apply_color_transfer(source_img, target_img):
+    """
+    [BARU] Mencocokkan warna wajah hasil swap (source) 
+    agar sama dengan wajah asli di video (target).
+    Menggunakan teknik Mean/Std deviasi di color space LAB.
+    """
+    try:
+        # Convert ke LAB color space (L=Lightness, A/B=Color channels)
+        s_lab = cv2.cvtColor(source_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        t_lab = cv2.cvtColor(target_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        # Hitung rata-rata (mean) dan sebaran (std) warna
+        s_mean, s_std = cv2.meanStdDev(s_lab)
+        t_mean, t_std = cv2.meanStdDev(t_lab)
+
+        # Reshape agar bisa dikalikan matrix
+        s_mean = s_mean.reshape((1, 1, 3))
+        s_std = s_std.reshape((1, 1, 3))
+        t_mean = t_mean.reshape((1, 1, 3))
+        t_std = t_std.reshape((1, 1, 3))
+
+        # Rumus Color Transfer: (Source - S_Mean) * (T_Std / S_Std) + T_Mean
+        # Menyesuaikan kontras dan brightness source ke target
+        res_lab = (s_lab - s_mean) * (t_std / (s_std + 1e-6)) + t_mean
+        
+        # Clip nilai agar tidak error saat convert balik (0-255)
+        res_lab = np.clip(res_lab, 0, 255).astype(np.uint8)
+        
+        return cv2.cvtColor(res_lab, cv2.COLOR_LAB2BGR)
+    except Exception as e:
+        # Jika gagal, kembalikan gambar asli
+        return source_img
+
 def get_soft_mask_template(size=128):
-    """
-    Membuat mask dasar 128x128 dengan pinggiran blur (feathered).
-    Ini akan menghilangkan efek kotak tajam pada wajah.
-    """
     global MASK_TEMPLATE
     if MASK_TEMPLATE is not None:
         return MASK_TEMPLATE
     
-    # 1. Buat kanvas hitam
     mask = np.zeros((size, size), dtype=np.float32)
-    
-    # 2. Gambar lingkaran putih di tengah (sedikit lebih kecil dari 128 agar ada ruang blur)
     center = (size // 2, size // 2)
-    radius = (size // 2) - 8  # Kurangi 8 pixel dari pinggir
+    # Sedikit diperkecil radiusnya agar blending lebih seamless
+    radius = (size // 2) - 10 
     cv2.circle(mask, center, radius, (1.0), -1)
     
-    # 3. Blur mask tersebut secara masif untuk efek halus
-    # Semakin besar kernel (21,21), semakin halus gradasinya
-    mask = cv2.GaussianBlur(mask, (21, 21), 0)
+    # Blur yang cukup kuat
+    mask = cv2.GaussianBlur(mask, (25, 25), 0)
     
     MASK_TEMPLATE = mask
     return MASK_TEMPLATE
@@ -107,7 +132,7 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
 
     if abs(yaw) > 20.0:
         extra = (abs(yaw) - 20.0) * 0.02
-        extra = min(extra, 0.25) # Max 25% padding
+        extra = min(extra, 0.25)
         pad_x = w * extra
 
     if pitch < -15.0:
@@ -131,7 +156,7 @@ def adapt_kps_for_pose(face: Face) -> None:
     if abs(yaw) < 20.0:
         return
     strength = (abs(yaw) - 20.0) * 0.005
-    strength = min(strength, 0.20) # Sedikit lebih agresif (20%)
+    strength = min(strength, 0.20)
     if strength <= 0: return
 
     kps = face.kps
@@ -140,21 +165,16 @@ def adapt_kps_for_pose(face: Face) -> None:
     face.kps = new_kps.astype(np.float32)
 
 # =====================================================================
-#  CORE SWAP DENGAN MANUAL BLENDING
+#  CORE SWAP
 # =====================================================================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    """
-    Melakukan swap dengan manual warping dan soft blending.
-    Tidak lagi menggunakan paste_back=True bawaan yang kasar.
-    """
     if source_face is None or target_face is None:
         return temp_frame
 
     # 1. Pose Adjustments
     adapt_bbox_for_pose(target_face, temp_frame.shape)
     
-    # Cloning face object secara aman (tanpa copy.copy)
     try:
         target_face_adj = InsightFaceObject(
             bbox=target_face.bbox.copy(),
@@ -171,53 +191,45 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     adapt_kps_for_pose(target_face_adj)
 
-    # 2. Jalankan Model (Dapatkan wajah 128x128 dan Matrix Transformasi)
-    # paste_back=False penting agar kita bisa blend sendiri!
+    # 2. Inference (Get 128x128 face)
+    # paste_back=False wajib
     res = get_face_swapper().get(temp_frame, target_face_adj, source_face, paste_back=False)
     
-    # Handle variasi output library insightface
     if isinstance(res, tuple):
         bgr_fake, M = res
     else:
-        # Beberapa versi library langsung return bgr_fake, 
-        # tapi biasanya butuh paste_back=False untuk dapat M.
-        # Jika gagal mendapatkan M, kita fallback ke built-in (jarang terjadi)
+        # Fallback jika library versi lama
         return get_face_swapper().get(temp_frame, target_face_adj, source_face, paste_back=True)
 
-    # 3. Manual Warping & Blending
-    # Hitung Inverse Matrix (IM) untuk memindahkan wajah dari kotak 128px kembali ke frame video
-    IM = cv2.invertAffineTransform(M)
+    # 3. [BARU] Color Matching
+    # Kita ambil wajah asli (target) dengan ukuran 128x128 menggunakan Matrix M yang sama
+    # Ini memberikan kita 'apa yang ada di belakang' wajah palsu
+    target_128 = cv2.warpAffine(temp_frame, M, (128, 128), borderMode=cv2.BORDER_REPLICATE)
     
+    # Terapkan color transfer: Ubah warna bgr_fake mengikuti target_128
+    bgr_fake_corrected = apply_color_transfer(bgr_fake, target_128)
+
+    # 4. Warping & Blending
+    IM = cv2.invertAffineTransform(M)
     h_frame, w_frame = temp_frame.shape[:2]
 
-    # Warp wajah palsu ke posisi target
+    # Warp wajah palsu yang SUDAH dikoreksi warnanya
     warped_face = cv2.warpAffine(
-        bgr_fake, IM, (w_frame, h_frame), borderMode=cv2.BORDER_TRANSPARENT
+        bgr_fake_corrected, IM, (w_frame, h_frame), borderMode=cv2.BORDER_TRANSPARENT
     )
 
-    # Buat dan warp mask (agar pinggiran halus)
     mask_template = get_soft_mask_template()
     warped_mask = cv2.warpAffine(
         mask_template, IM, (w_frame, h_frame), borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
     )
 
-    # Expand dims mask untuk perkalian matrix (H,W,1)
     warped_mask = np.expand_dims(warped_mask, axis=-1)
 
-    # 4. Final Composition
-    # Rumus: Result = (Background * (1 - Mask)) + (Foreground * Mask)
-    # Gunakan astype float agar blending presisi, lalu convert balik ke uint8
-    
-    # Optimasi: Kita hanya blend di area bounding box + margin agar cepat
-    # Tapi untuk safety dan kemudahan, kita blend full frame (sedikit lebih berat tapi rapi)
-    
-    # Pastikan tipe data compatible
+    # 5. Composition
     temp_frame_float = temp_frame.astype(np.float32)
     warped_face_float = warped_face.astype(np.float32)
 
-    # Lakukan blending hanya di area di mana mask > 0 (optimasi sederhana)
-    # Area hitam di mask berarti pixel asli frame dipertahankan sepenuhnya
-    
+    # Blending
     output = temp_frame_float * (1.0 - warped_mask) + warped_face_float * warped_mask
     
     return output.astype(np.uint8)
