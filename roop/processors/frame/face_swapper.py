@@ -1,288 +1,355 @@
-# ======= FULL FACE MORPH BLEND (DELAUNAY) - Integrasi ROOP (Siap Paste) =======
-# Persyaratan: insightface buffalo_l sudah ada (provides 68-landmark). Tidak perlu library tambahan.
-# Pastikan file ini diimport di modul yang sama dengan fungsi process_frame/process_video.
-
-from typing import Any, List, Callable, Optional, Tuple
-import copy
-import math
-import threading
+from typing import Any, List, Callable, Optional
 import cv2
+import insightface
+import threading
 import numpy as np
 
-# --- jika modul lain sudah diimport di file utama, jangan ulangi. Ini lengkap untuk ditempel. ---
-# Mengasumsikan roop.globals, get_face_swapper(), adapt_bbox_for_pose() sudah ada di file utama.
+import roop.globals
+import roop.processors.frame.core
+from roop.core import update_status
+from roop.face_analyser import (
+    get_one_face,
+    get_many_faces,
+    find_similar_face,
+    smart_face_tracking,
+    detect_occlusion,
+    get_face_pose,
+)
+from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
+from roop.typing import Face, Frame
+from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-# ----------------- Helper untuk landmark 68 (InsightFace buffalo_l) -----------------
-def _ensure_68_kps_from_face(face: Any) -> Optional[np.ndarray]:
+FACE_SWAPPER = None
+THREAD_LOCK = threading.Lock()
+NAME = 'ROOP.FACE-SWAPPER'
+
+
+def get_face_swapper() -> Any:
     """
-    Ambil 68 landmark 2D dari objek face (InsightFace buffalo_l).
-    Prioritas:
-    - face.landmark_3d_68 (3D projected) -> gunakan x,y
-    - face.kps (jika sudah ada 68) -> gunakan
-    Return: numpy array shape (68,2) float32 atau None
+    Inisialisasi model inswapper.
     """
-    if face is None:
-        return None
+    global FACE_SWAPPER
 
-    # Cek landmark_3d_68 (InsightFace buffalo_l biasanya punya)
-    if hasattr(face, "landmark_3d_68") and face.landmark_3d_68 is not None:
-        kps = np.array(face.landmark_3d_68, dtype=np.float32)
-        if kps.ndim == 2 and kps.shape[0] >= 68:
-            # ambil 68, gunakan kolom (x,y)
-            return kps[:68, :2].copy()
+    with THREAD_LOCK:
+        if FACE_SWAPPER is None:
+            model_path = resolve_relative_path('../models/inswapper_128.onnx')
+            FACE_SWAPPER = insightface.model_zoo.get_model(
+                model_path,
+                providers=roop.globals.execution_providers
+            )
+    return FACE_SWAPPER
 
-    # fallback: face.kps (sering face.kps berisi 106 atau 68)
-    if hasattr(face, "kps") and face.kps is not None:
-        kps = np.array(face.kps, dtype=np.float32)
-        if kps.ndim == 2 and kps.shape[0] >= 68:
-            return kps[:68, :2].copy()
 
-    return None
+def clear_face_swapper() -> None:
+    global FACE_SWAPPER
+    FACE_SWAPPER = None
 
-def _rect_from_points(points: np.ndarray) -> Tuple[int,int,int,int]:
-    x_min = int(np.min(points[:, 0]))
-    y_min = int(np.min(points[:, 1]))
-    x_max = int(np.max(points[:, 0]))
-    y_max = int(np.max(points[:, 1]))
-    return (x_min, y_min, x_max, y_max)
 
-def _get_delaunay_triangles(rect: Tuple[int,int,int,int], points: np.ndarray) -> List[Tuple[int,int,int]]:
-    """
-    rect: (x,y,w,h)
-    points: Nx2 (float)
-    return: list of index triplet per triangle
-    """
-    subdiv = cv2.Subdiv2D(rect)
-    for p in points:
-        subdiv.insert((float(p[0]), float(p[1])))
+def pre_check() -> bool:
+    download_directory_path = resolve_relative_path('../models')
+    conditional_download(download_directory_path, [
+        'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx'
+    ])
+    return True
 
-    triangle_list = subdiv.getTriangleList()
-    pts = points.tolist()
-    triangles_idx = []
 
-    def _find_index(pt):
-        # cari index terdekat
-        best_i = -1
-        best_d = 1e9
-        for i, p in enumerate(pts):
-            d = (p[0]-pt[0])**2 + (p[1]-pt[1])**2
-            if d < best_d:
-                best_d = d
-                best_i = i
-        return best_i
+def pre_start() -> bool:
+    if not is_image(roop.globals.source_path):
+        update_status('Select an image for source path.', NAME)
+        return False
 
-    for t in triangle_list:
-        p1 = (t[0], t[1])
-        p2 = (t[2], t[3])
-        p3 = (t[4], t[5])
-        i1 = _find_index(p1)
-        i2 = _find_index(p2)
-        i3 = _find_index(p3)
-        if i1 is None or i2 is None or i3 is None:
-            continue
-        if i1 != i2 and i2 != i3 and i1 != i3:
-            triangles_idx.append((i1, i2, i3))
+    source_img = cv2.imread(roop.globals.source_path)
+    if not get_one_face(source_img):
+        update_status('No face in source path detected.', NAME)
+        return False
 
-    # dedup
-    unique = []
-    seen = set()
-    for tri in triangles_idx:
-        key = tuple(sorted(tri))
-        if key not in seen:
-            seen.add(key)
-            unique.append(tri)
-    return unique
+    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
+        update_status('Select an image or video for target path.', NAME)
+        return False
 
-def _warp_triangle(img_src: np.ndarray, img_dst: np.ndarray, t_src: np.ndarray, t_dst: np.ndarray) -> None:
-    """
-    Warp triangle region dari img_src -> img_dst in-place pada img_dst.
-    t_src, t_dst: (3,2) float32
-    """
-    r1 = cv2.boundingRect(np.float32([t_src]))
-    r2 = cv2.boundingRect(np.float32([t_dst]))
-    x1, y1, w1, h1 = r1
-    x2, y2, w2, h2 = r2
-    if w1 == 0 or h1 == 0 or w2 == 0 or h2 == 0:
+    return True
+
+
+def post_process() -> None:
+    clear_face_swapper()
+    clear_face_reference()
+
+
+# =====================================================================
+#  POSE-AWARE BBOX ADJUSTMENT
+# =====================================================================
+
+def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
+    pitch, yaw, roll = get_face_pose(face)
+
+    h_frame, w_frame = frame_shape[:2]
+    bbox = np.array(face.bbox, dtype=np.float32)
+    x1, y1, x2, y2 = bbox
+    w = x2 - x1
+    h = y2 - y1
+
+    pad_x = 0.0
+    pad_y_top = 0.0
+    pad_y_bottom = 0.0
+
+    # Logic adaptasi padding (diperkuat sedikit untuk memberi ruang morphing)
+    if abs(yaw) > 25.0:
+        extra = (abs(yaw) - 25.0) * 0.04  
+        extra = min(extra, 0.40)          
+        pad_x = w * extra
+
+    if pitch < -15.0:
+        extra = (abs(pitch) - 15.0) * 0.03
+        extra = min(extra, 0.35)
+        pad_y_top = h * extra
+    elif pitch > 20.0:
+        extra = (pitch - 20.0) * 0.025
+        extra = min(extra, 0.25)
+        pad_y_bottom = h * extra
+
+    # Padding statis minimal
+    pad_x += w * 0.05
+    pad_y_top += h * 0.05
+    pad_y_bottom += h * 0.05
+
+    nx1 = int(max(0, x1 - pad_x))
+    nx2 = int(min(w_frame - 1, x2 + pad_x))
+    ny1 = int(max(0, y1 - pad_y_top))
+    ny2 = int(min(h_frame - 1, y2 + pad_y_bottom))
+
+    if nx2 <= nx1 or ny2 <= ny1:
         return
 
-    t1_rect = []
-    t2_rect = []
-    for i in range(3):
-        t1_rect.append(((t_src[i][0] - x1), (t_src[i][1] - y1)))
-        t2_rect.append(((t_dst[i][0] - x2), (t_dst[i][1] - y2)))
+    face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
 
-    t1_rect = np.float32(t1_rect)
-    t2_rect = np.float32(t2_rect)
 
-    # crop source patch
-    src_patch = img_src[y1:y1+h1, x1:x1+w1]
-    if src_patch.size == 0:
-        return
+# =====================================================================
+#  SHAPE MORPHING MODULE (BARU: Untuk Mengecilkan Hidung)
+# =====================================================================
 
-    # Affine transform
-    M = cv2.getAffineTransform(t1_rect, t2_rect)
-    warped_patch = cv2.warpAffine(src_patch, M, (w2, h2), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
-
-    # mask untuk triangle dst
-    mask = np.zeros((h2, w2), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, np.int32(t2_rect), 255)
-
-    dst_area = img_dst[y2:y2+h2, x2:x2+w2]
-    if dst_area.shape[0] != h2 or dst_area.shape[1] != w2:
-        # shape mismatch safety
-        dst_area = cv2.resize(dst_area, (w2, h2))
-
-    mask_3ch = cv2.merge([mask, mask, mask])
-    masked_dst = cv2.bitwise_and(dst_area, cv2.bitwise_not(mask_3ch))
-    masked_src = cv2.bitwise_and(warped_patch, mask_3ch)
-    result = cv2.add(masked_dst, masked_src)
-    img_dst[y2:y2+h2, x2:x2+w2] = result
-
-# ----------------- Fungsi morph utama -----------------
-def morph_target_to_source(full_frame: np.ndarray, target_face: Any, source_face: Any, shape_mix: float = 1.0) -> np.ndarray:
+def apply_nose_morph(img: np.ndarray, face_landmarks: np.ndarray, strength: float = 0.4) -> np.ndarray:
     """
-    Lakukan full Delaunay face morph: geometri wajah target dimodifikasi
-    ke intermediate shape = target + shape_mix * (source - target)
-    Return frame baru (np.uint8)
+    Melakukan warping lokal (pinch effect) pada area hidung.
+    strength: 0.0 - 1.0 (Semakin tinggi, hidung semakin kecil/ramping).
     """
-    # ambil kps 68
-    src_kps = _ensure_68_kps_from_face(source_face)
-    tgt_kps = _ensure_68_kps_from_face(target_face)
-    if src_kps is None or tgt_kps is None:
-        # fallback: return original
-        return full_frame
-
-    img = full_frame.copy().astype(np.uint8)
-    h, w = img.shape[:2]
-
-    # clamp kps ke image bounds
-    src_kps[:,0] = np.clip(src_kps[:,0], 0, w-1)
-    src_kps[:,1] = np.clip(src_kps[:,1], 0, h-1)
-    tgt_kps[:,0] = np.clip(tgt_kps[:,0], 0, w-1)
-    tgt_kps[:,1] = np.clip(tgt_kps[:,1], 0, h-1)
-
-    # intermediate points
-    pts_inter = tgt_kps + shape_mix * (src_kps - tgt_kps)
-
-    # bounding rect from target points with margin
-    x_min, y_min, x_max, y_max = _rect_from_points(tgt_kps)
-    margin = max(10, int(0.02 * max(w, h)))
-    rect = (int(x_min - margin), int(y_min - margin), int(x_max - x_min + 2*margin), int(y_max - y_min + 2*margin))
-
-    # build Delaunay triangles using target points (so triangles map source->intermediate)
     try:
-        triangles = _get_delaunay_triangles(rect, tgt_kps)
-    except Exception:
-        return full_frame
+        if face_landmarks is None or len(face_landmarks) < 5:
+            return img
 
-    morphed = img.copy()
+        h, w = img.shape[:2]
+        
+        # Landmark index 2 adalah ujung hidung
+        nose_x, nose_y = face_landmarks[2]
+        
+        # Radius efek berdasarkan jarak mata
+        eye_dist = np.linalg.norm(face_landmarks[0] - face_landmarks[1])
+        radius = eye_dist * 0.9 
+        
+        # Buat grid map
+        map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
+        map_x = map_x.astype(np.float32)
+        map_y = map_y.astype(np.float32)
 
-    for tri in triangles:
-        i1, i2, i3 = tri
-        t_src = np.array([tgt_kps[i1], tgt_kps[i2], tgt_kps[i3]], dtype=np.float32)  # from target pos
-        t_dst = np.array([pts_inter[i1], pts_inter[i2], pts_inter[i3]], dtype=np.float32) # to intermediate
-        try:
-            _warp_triangle(img, morphed, t_src, t_dst)
-        except Exception:
-            continue
+        # Jarak pixel ke pusat hidung
+        dx = map_x - nose_x
+        dy = map_y - nose_y
+        dist = np.sqrt(dx*dx + dy*dy)
+        dist = np.maximum(dist, 1.0) # hindari div by zero
 
-    # blending area wajah (feather)
-    hull = cv2.convexHull(np.int32(pts_inter))
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull, 255)
-    mask_blur = cv2.GaussianBlur(mask, (31,31), 0)
+        # Masking area hidung
+        mask = np.exp(-(dist**2) / (2 * (radius**2)))
+        
+        # Hitung pergeseran pixel (menjauh dari pusat -> pinch effect)
+        warp_amount = mask * strength * (radius * 0.6)
+        
+        map_x += (dx / dist) * warp_amount
+        map_y += (dy / dist) * warp_amount
+        
+        # Remap
+        warped_img = cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        
+        return warped_img
+    except Exception as e:
+        print(f"[Morph Error] {e}")
+        return img
 
-    mask_f = mask_blur.astype(np.float32) / 255.0
-    mask_f = cv2.merge([mask_f, mask_f, mask_f])
 
-    out = (morphed.astype(np.float32)*mask_f + img.astype(np.float32)*(1.0-mask_f)).astype(np.uint8)
-    return out
+# =====================================================================
+#  CORE SWAP (DIMODIFIKASI)
+# =====================================================================
 
-# ----------------- Integrasi swap_face (replace existing) -----------------
-def swap_face(source_face: Any, target_face: Any, temp_frame: np.ndarray) -> np.ndarray:
+def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Flow:
-    1) adapt_bbox_for_pose(target_face)
-    2) morph target geometry -> intermediate (mengikuti source) (shape_mix configurable)
-    3) run inswapper on morphed frame
-    4) colour-correct & seamlessClone blending (mengembalikan ke tone morphed_frame)
+    Melakukan swap wajah, kemudian menerapkan shape morphing pada hasilnya.
     """
     if source_face is None or target_face is None:
         return temp_frame
 
-    # adapt bbox dulu
+    # 1. Adaptasi BBox (Anti Masker/Topeng)
+    adapt_bbox_for_pose(target_face, temp_frame.shape)
+
+    # 2. Lakukan Swap Standard
+    swapped_frame = get_face_swapper().get(
+        temp_frame,
+        target_face,
+        source_face,
+        paste_back=True
+    )
+
+    # 3. Post-Process: Nose Morphing (Merampingkan hidung hasil swap)
     try:
-        adapt_bbox_for_pose(target_face, temp_frame.shape)
-    except Exception:
-        pass
-
-    # ambil shape_mix dari globals jika ada (default 0.9)
-    shape_mix = getattr(roop.globals, 'shape_mix', 0.9)
-    # clamp
-    shape_mix = float(max(0.0, min(1.0, shape_mix)))
-
-    # morph target geometry dulu (hasil: morphed_frame)
-    try:
-        morphed_frame = morph_target_to_source(temp_frame, target_face, source_face, shape_mix=shape_mix)
-    except Exception:
-        morphed_frame = temp_frame.copy()
-
-    # jalankan inswapper pada morphed frame
-    try:
-        swapped_frame = get_face_swapper().get(
-            morphed_frame,
-            target_face,
-            source_face,
-            paste_back=True
-        )
-    except Exception:
-        # fallback ke swap pada original jika inswapper error
-        try:
-            swapped_frame = get_face_swapper().get(
-                temp_frame,
-                target_face,
-                source_face,
-                paste_back=True
-            )
-        except Exception:
-            return temp_frame
-
-    # lakukan colour correction / seamless clone dari swapped_frame -> morphed_frame
-    # gunakan hull dari target_face kps (intermediate) jika ada
-    try:
-        tgt_kps = _ensure_68_kps_from_face(target_face)
-        if tgt_kps is not None:
-            # setelah morph, center clone di bbox center target_face
-            x1, y1, x2, y2 = target_face.bbox.astype(int)
-            x1 = max(0, x1); y1 = max(0, y1)
-            x2 = min(swapped_frame.shape[1], x2); y2 = min(swapped_frame.shape[0], y2)
-            center = ((x1 + x2)//2, (y1 + y2)//2)
-
-            hull = cv2.convexHull(np.int32(tgt_kps))
-            mask = np.zeros(swapped_frame.shape[:2], dtype=np.uint8)
-            cv2.fillConvexPoly(mask, hull, 255)
-
-            # ensure mask non-empty
-            if mask.sum() > 0:
-                # seamless clone swapped_frame onto morphed_frame using mask
-                try:
-                    seamless = cv2.seamlessClone(swapped_frame, morphed_frame, mask, center, cv2.NORMAL_CLONE)
-                    return seamless
-                except Exception:
-                    # fallback simple alpha blend
-                    mask_f = cv2.GaussianBlur(mask, (31,31), 0).astype(np.float32)/255.0
-                    mask_3 = cv2.merge([mask_f, mask_f, mask_f])
-                    blended = (swapped_frame.astype(np.float32)*mask_3 + morphed_frame.astype(np.float32)*(1-mask_3)).astype(np.uint8)
-                    return blended
-    except Exception:
+        # Ambil bbox target untuk memproses area wajah saja
+        bbox = target_face.bbox.astype(int)
+        x1, y1, x2, y2 = bbox
+        
+        h_frm, w_frm = swapped_frame.shape[:2]
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(w_frm, x2)
+        y2 = min(h_frm, y2)
+        
+        face_crop = swapped_frame[y1:y2, x1:x2]
+        
+        if face_crop.size > 0:
+            # Konversi landmark global ke lokal crop
+            if hasattr(target_face, 'kps'):
+                local_kps = target_face.kps.copy()
+                local_kps[:, 0] -= x1
+                local_kps[:, 1] -= y1
+                
+                # Terapkan Morphing
+                # Strength 0.5 cukup kuat untuk merampingkan hidung mancung
+                morphed_crop = apply_nose_morph(face_crop, local_kps, strength=0.5)
+                
+                # Tempel kembali
+                swapped_frame[y1:y2, x1:x2] = morphed_crop
+                
+    except Exception as e:
+        # Jika error, lanjut saja dengan hasil swap biasa
         pass
 
     return swapped_frame
 
-# -----------------------------------------------------------------------------
-# NOTE:
-# - Jika kamu ingin tracking/face_reference tetap valid setelah morph (mis. untuk tracking di frame selanjutnya),
-#   kamu bisa mengupdate target_face.kps menjadi pts_inter hasil morph. Itu butuh perubahan kecil di process_frames/process_video.
-# - Parameter roop.globals.shape_mix dapat ditambahkan di konfigurasi UI agar mudah tuning.
-# -----------------------------------------------------------------------------
-# END OF MORPH BLEND MODULE
+
+def _select_best_target_by_embedding(faces: List[Face], reference_face: Face) -> Optional[Face]:
+    if not faces or reference_face is None:
+        return None
+
+    if not hasattr(reference_face, 'normed_embedding'):
+        return None
+
+    ref_emb = reference_face.normed_embedding
+    best_face = None
+    best_distance = float('inf')
+    similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
+
+    for f in faces:
+        if not hasattr(f, 'normed_embedding'):
+            continue
+        try:
+            distance = np.sum(np.square(f.normed_embedding - ref_emb))
+        except Exception:
+            continue
+
+        if distance < similar_threshold and distance < best_distance:
+            best_distance = distance
+            best_face = f
+
+    return best_face
+
+
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, frame_number: int = 0) -> Frame:
+    if source_face is None:
+        return temp_frame
+
+    if roop.globals.many_faces:
+        faces = smart_face_tracking(temp_frame, frame_number)
+        if not faces:
+            faces = get_many_faces(temp_frame)
+
+        if not faces:
+            return temp_frame
+
+        for target_face in faces:
+            if detect_occlusion(target_face, temp_frame):
+                continue
+            temp_frame = swap_face(source_face, target_face, temp_frame)
+
+        return temp_frame
+
+    tracked_faces = smart_face_tracking(temp_frame, frame_number)
+    if not tracked_faces:
+        tracked_faces = get_many_faces(temp_frame)
+
+    if not tracked_faces:
+        return temp_frame
+
+    valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
+    if not valid_faces:
+        return temp_frame
+
+    best_target = None
+    if reference_face is not None:
+        best_target = _select_best_target_by_embedding(valid_faces, reference_face)
+
+    if best_target is None:
+        best_target = valid_faces[0]
+
+    temp_frame = swap_face(source_face, best_target, temp_frame)
+    return temp_frame
+
+
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    source_img = cv2.imread(source_path)
+    source_face = get_one_face(source_img)
+    reference_face = None if roop.globals.many_faces else get_face_reference()
+
+    for idx, temp_frame_path in enumerate(temp_frame_paths):
+        temp_frame = cv2.imread(temp_frame_path)
+        result = process_frame(
+            source_face=source_face,
+            reference_face=reference_face,
+            temp_frame=temp_frame,
+            frame_number=idx
+        )
+        cv2.imwrite(temp_frame_path, result)
+        if update:
+            update()
+
+
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
+    source_img = cv2.imread(source_path)
+    target_frame = cv2.imread(target_path)
+    source_face = get_one_face(source_img)
+
+    reference_face = None
+    if not roop.globals.many_faces:
+        reference_face = get_one_face(target_frame, roop.globals.reference_face_position)
+
+    result = process_frame(
+        source_face=source_face,
+        reference_face=reference_face,
+        temp_frame=target_frame,
+        frame_number=0
+    )
+    cv2.imwrite(output_path, result)
+
+
+def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
+    if not roop.globals.many_faces and not get_face_reference():
+        try:
+            ref_idx = roop.globals.reference_frame_number
+            reference_frame = cv2.imread(temp_frame_paths[ref_idx])
+            reference_face = get_one_face(
+                reference_frame,
+                roop.globals.reference_face_position
+            )
+            set_face_reference(reference_face)
+        except Exception:
+            set_face_reference(None)
+
+    roop.processors.frame.core.process_video(
+        source_path,
+        temp_frame_paths,
+        process_frames
+    )
