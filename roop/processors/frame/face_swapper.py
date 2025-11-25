@@ -1,10 +1,11 @@
 import threading
 from typing import Any, List, Callable, Optional
+import copy
 
 import cv2
 import insightface
 import numpy as np
-# [FIX] Import class Face secara eksplisit untuk manual cloning
+# [FIX] Import class Face untuk cloning manual
 from insightface.app.common import Face as InsightFaceObject 
 
 import roop.globals
@@ -24,7 +25,7 @@ from roop.utilities import conditional_download, resolve_relative_path, is_image
 FACE_SWAPPER: Any = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
-
+MASK_TEMPLATE = None  # Cache untuk mask
 
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
@@ -37,11 +38,9 @@ def get_face_swapper() -> Any:
             )
     return FACE_SWAPPER
 
-
 def clear_face_swapper() -> None:
     global FACE_SWAPPER
     FACE_SWAPPER = None
-
 
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
@@ -50,58 +49,67 @@ def pre_check() -> bool:
     ])
     return True
 
-
 def pre_start() -> bool:
     if not is_image(roop.globals.source_path):
         update_status('Select an image for source path.', NAME)
         return False
-
     source_img = cv2.imread(roop.globals.source_path)
     if not get_one_face(source_img):
         update_status('No face in source path detected.', NAME)
         return False
-
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
         update_status('Select an image or video for target path.', NAME)
         return False
-
     return True
-
 
 def post_process() -> None:
     clear_face_swapper()
     clear_face_reference()
 
+# =====================================================================
+#  ADVANCED MASKING & BLENDING (SOLUSI GARIS KASAR)
+# =====================================================================
 
-# =====================================================================
-#  POSE-AWARE ADJUSTMENTS (FIX MASKER LEPAS)
-# =====================================================================
+def get_soft_mask_template(size=128):
+    """
+    Membuat mask dasar 128x128 dengan pinggiran blur (feathered).
+    Ini akan menghilangkan efek kotak tajam pada wajah.
+    """
+    global MASK_TEMPLATE
+    if MASK_TEMPLATE is not None:
+        return MASK_TEMPLATE
+    
+    # 1. Buat kanvas hitam
+    mask = np.zeros((size, size), dtype=np.float32)
+    
+    # 2. Gambar lingkaran putih di tengah (sedikit lebih kecil dari 128 agar ada ruang blur)
+    center = (size // 2, size // 2)
+    radius = (size // 2) - 8  # Kurangi 8 pixel dari pinggir
+    cv2.circle(mask, center, radius, (1.0), -1)
+    
+    # 3. Blur mask tersebut secara masif untuk efek halus
+    # Semakin besar kernel (21,21), semakin halus gradasinya
+    mask = cv2.GaussianBlur(mask, (21, 21), 0)
+    
+    MASK_TEMPLATE = mask
+    return MASK_TEMPLATE
 
 def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
-    """
-    Sesuaikan bbox target berdasarkan pose:
-    - yaw besar -> tambah padding kiri/kanan
-    - pitch -> tambah padding atas/bawah
-    """
     pitch, yaw, roll = get_face_pose(face)
-
     h_frame, w_frame = frame_shape[:2]
     bbox = np.array(face.bbox, dtype=np.float32)
     x1, y1, x2, y2 = bbox
     w = x2 - x1
     h = y2 - y1
-
     pad_x = 0.0
     pad_y_top = 0.0
     pad_y_bottom = 0.0
 
-    # Yaw adjustment
-    if abs(yaw) > 25.0:
-        extra = (abs(yaw) - 25.0) * 0.02
-        extra = min(extra, 0.20)
+    if abs(yaw) > 20.0:
+        extra = (abs(yaw) - 20.0) * 0.02
+        extra = min(extra, 0.25) # Max 25% padding
         pad_x = w * extra
 
-    # Pitch adjustment
     if pitch < -15.0:
         extra = (abs(pitch) - 15.0) * 0.02
         extra = min(extra, 0.25)
@@ -115,225 +123,179 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     nx2 = int(min(w_frame - 1, x2 + pad_x))
     ny1 = int(max(0, y1 - pad_y_top))
     ny2 = int(min(h_frame - 1, y2 + pad_y_bottom))
-
-    if nx2 <= nx1 or ny2 <= ny1:
-        return
-
-    face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-
+    if nx2 > nx1 and ny2 > ny1:
+        face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
 
 def adapt_kps_for_pose(face: Face) -> None:
-    """
-    Modifikasi KPS (Landmarks) untuk mengatasi 'masker lepas'.
-    """
     pitch, yaw, roll = get_face_pose(face)
-
-    # Hanya aktif jika yaw cukup ekstrem (> 25 derajat)
-    if abs(yaw) < 25.0:
+    if abs(yaw) < 20.0:
         return
-
-    # Tuning factor: 0.15 = 15% pelebaran maksimal
-    strength = (abs(yaw) - 25.0) * 0.005
-    strength = min(strength, 0.15)
-
-    if strength <= 0:
-        return
+    strength = (abs(yaw) - 20.0) * 0.005
+    strength = min(strength, 0.20) # Sedikit lebih agresif (20%)
+    if strength <= 0: return
 
     kps = face.kps
     center = np.mean(kps, axis=0)
-
-    # Dorong titik menjauh dari pusat
     new_kps = kps + (kps - center) * strength
-    
     face.kps = new_kps.astype(np.float32)
 
-
 # =====================================================================
-#  CORE SWAP
+#  CORE SWAP DENGAN MANUAL BLENDING
 # =====================================================================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Eksekusi swap wajah dengan perbaikan pose.
+    Melakukan swap dengan manual warping dan soft blending.
+    Tidak lagi menggunakan paste_back=True bawaan yang kasar.
     """
     if source_face is None or target_face is None:
         return temp_frame
 
-    # 1. Adaptasi BBox (agar kotak tidak terlalu sempit)
+    # 1. Pose Adjustments
     adapt_bbox_for_pose(target_face, temp_frame.shape)
-
-    # 2. Adaptasi KPS (agar masker tidak lepas di pinggir)
-    # [FIX] JANGAN GUNAKAN COPY.COPY
-    # Kita buat object Face baru secara manual agar tidak error pickle/NoneType
+    
+    # Cloning face object secara aman (tanpa copy.copy)
     try:
-        # Clone manual hanya data yang dibutuhkan
         target_face_adj = InsightFaceObject(
             bbox=target_face.bbox.copy(),
             kps=target_face.kps.copy(),
             det_score=target_face.det_score,
             embedding=target_face.embedding
         )
-        
-        # Salin atribut lain jika ada (opsional, untuk safety)
-        if hasattr(target_face, 'landmark_3d_68'):
-            target_face_adj.landmark_3d_68 = target_face.landmark_3d_68
-        if hasattr(target_face, 'pose'):
-            target_face_adj.pose = target_face.pose
         if hasattr(target_face, 'landmark_2d_106'):
             target_face_adj.landmark_2d_106 = target_face.landmark_2d_106
-            
-    except Exception as e:
-        print(f"Warning: Failed to clone face manually: {e}. Using original.")
-        target_face_adj = target_face # Fallback jika cloning gagal (resiko: tracking terganggu dikit)
+        if hasattr(target_face, 'pose'):
+            target_face_adj.pose = target_face.pose
+    except:
+        target_face_adj = target_face
 
-    # Jalankan logika fix KPS pada face hasil clone
     adapt_kps_for_pose(target_face_adj)
 
-    return get_face_swapper().get(
-        temp_frame,
-        target_face_adj, 
-        source_face,
-        paste_back=True
+    # 2. Jalankan Model (Dapatkan wajah 128x128 dan Matrix Transformasi)
+    # paste_back=False penting agar kita bisa blend sendiri!
+    res = get_face_swapper().get(temp_frame, target_face_adj, source_face, paste_back=False)
+    
+    # Handle variasi output library insightface
+    if isinstance(res, tuple):
+        bgr_fake, M = res
+    else:
+        # Beberapa versi library langsung return bgr_fake, 
+        # tapi biasanya butuh paste_back=False untuk dapat M.
+        # Jika gagal mendapatkan M, kita fallback ke built-in (jarang terjadi)
+        return get_face_swapper().get(temp_frame, target_face_adj, source_face, paste_back=True)
+
+    # 3. Manual Warping & Blending
+    # Hitung Inverse Matrix (IM) untuk memindahkan wajah dari kotak 128px kembali ke frame video
+    IM = cv2.invertAffineTransform(M)
+    
+    h_frame, w_frame = temp_frame.shape[:2]
+
+    # Warp wajah palsu ke posisi target
+    warped_face = cv2.warpAffine(
+        bgr_fake, IM, (w_frame, h_frame), borderMode=cv2.BORDER_TRANSPARENT
     )
 
+    # Buat dan warp mask (agar pinggiran halus)
+    mask_template = get_soft_mask_template()
+    warped_mask = cv2.warpAffine(
+        mask_template, IM, (w_frame, h_frame), borderMode=cv2.BORDER_CONSTANT, borderValue=0.0
+    )
 
-def _select_best_target_by_embedding(
-    faces: List[Face],
-    reference_face: Face
-) -> Optional[Face]:
-    if not faces or reference_face is None:
-        return None
+    # Expand dims mask untuk perkalian matrix (H,W,1)
+    warped_mask = np.expand_dims(warped_mask, axis=-1)
 
-    if not hasattr(reference_face, 'normed_embedding'):
-        return None
+    # 4. Final Composition
+    # Rumus: Result = (Background * (1 - Mask)) + (Foreground * Mask)
+    # Gunakan astype float agar blending presisi, lalu convert balik ke uint8
+    
+    # Optimasi: Kita hanya blend di area bounding box + margin agar cepat
+    # Tapi untuk safety dan kemudahan, kita blend full frame (sedikit lebih berat tapi rapi)
+    
+    # Pastikan tipe data compatible
+    temp_frame_float = temp_frame.astype(np.float32)
+    warped_face_float = warped_face.astype(np.float32)
 
+    # Lakukan blending hanya di area di mana mask > 0 (optimasi sederhana)
+    # Area hitam di mask berarti pixel asli frame dipertahankan sepenuhnya
+    
+    output = temp_frame_float * (1.0 - warped_mask) + warped_face_float * warped_mask
+    
+    return output.astype(np.uint8)
+
+
+def _select_best_target_by_embedding(faces: List[Face], reference_face: Face) -> Optional[Face]:
+    if not faces or reference_face is None: return None
+    if not hasattr(reference_face, 'normed_embedding'): return None
     ref_emb = reference_face.normed_embedding
     best_face = None
     best_distance = float('inf')
-
     similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
-
     for f in faces:
-        if not hasattr(f, 'normed_embedding'):
-            continue
+        if not hasattr(f, 'normed_embedding'): continue
         try:
             distance = np.sum(np.square(f.normed_embedding - ref_emb))
-        except Exception:
-            continue
-
+        except: continue
         if distance < similar_threshold and distance < best_distance:
             best_distance = distance
             best_face = f
-
     return best_face
 
-
-def process_frame(
-    source_face: Face,
-    reference_face: Face,
-    temp_frame: Frame,
-    frame_number: int = 0
-) -> Frame:
-    if source_face is None:
-        return temp_frame
-
-    # MODE: Many Faces
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, frame_number: int = 0) -> Frame:
+    if source_face is None: return temp_frame
+    
     if roop.globals.many_faces:
         faces = smart_face_tracking(temp_frame, frame_number)
-        if not faces:
-            faces = get_many_faces(temp_frame)
-
-        if not faces:
-            return temp_frame
-
+        if not faces: faces = get_many_faces(temp_frame)
+        if not faces: return temp_frame
         for target_face in faces:
-            if detect_occlusion(target_face, temp_frame):
-                continue
+            if detect_occlusion(target_face, temp_frame): continue
             temp_frame = swap_face(source_face, target_face, temp_frame)
-
         return temp_frame
 
-    # MODE: Single Face
     tracked_faces = smart_face_tracking(temp_frame, frame_number)
-    if not tracked_faces:
-        tracked_faces = get_many_faces(temp_frame)
-
-    if not tracked_faces:
-        return temp_frame
-
+    if not tracked_faces: tracked_faces = get_many_faces(temp_frame)
+    if not tracked_faces: return temp_frame
+    
     valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
-    if not valid_faces:
-        return temp_frame
+    if not valid_faces: return temp_frame
 
     best_target = None
     if reference_face is not None:
         best_target = _select_best_target_by_embedding(valid_faces, reference_face)
-
     if best_target is None:
         best_target = valid_faces[0]
 
     temp_frame = swap_face(source_face, best_target, temp_frame)
     return temp_frame
 
-
-def process_frames(
-    source_path: str,
-    temp_frame_paths: List[str],
-    update: Callable[[], None]
-) -> None:
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
     reference_face = None if roop.globals.many_faces else get_face_reference()
 
     for idx, temp_frame_path in enumerate(temp_frame_paths):
         temp_frame = cv2.imread(temp_frame_path)
-        result = process_frame(
-            source_face=source_face,
-            reference_face=reference_face,
-            temp_frame=temp_frame,
-            frame_number=idx
-        )
+        result = process_frame(source_face, reference_face, temp_frame, idx)
         cv2.imwrite(temp_frame_path, result)
-        if update:
-            update()
-
+        if update: update()
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     source_img = cv2.imread(source_path)
     target_frame = cv2.imread(target_path)
     source_face = get_one_face(source_img)
-
     reference_face = None
     if not roop.globals.many_faces:
-        reference_face = get_one_face(
-            target_frame,
-            roop.globals.reference_face_position
-        )
-
-    result = process_frame(
-        source_face=source_face,
-        reference_face=reference_face,
-        temp_frame=target_frame,
-        frame_number=0
-    )
+        reference_face = get_one_face(target_frame, roop.globals.reference_face_position)
+    result = process_frame(source_face, reference_face, target_frame, 0)
     cv2.imwrite(output_path, result)
-
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     if not roop.globals.many_faces and not get_face_reference():
         try:
             ref_idx = roop.globals.reference_frame_number
             reference_frame = cv2.imread(temp_frame_paths[ref_idx])
-            reference_face = get_one_face(
-                reference_frame,
-                roop.globals.reference_face_position
-            )
+            reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
             set_face_reference(reference_face)
-        except Exception:
+        except:
             set_face_reference(None)
-
-    roop.processors.frame.core.process_video(
-        source_path,
-        temp_frame_paths,
-        process_frames
-    )
+    roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
