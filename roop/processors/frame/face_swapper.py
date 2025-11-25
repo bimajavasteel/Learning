@@ -1,7 +1,9 @@
+import copy
+import threading
 from typing import Any, List, Callable, Optional
+
 import cv2
 import insightface
-import threading
 import numpy as np
 
 import roop.globals
@@ -10,7 +12,6 @@ from roop.core import update_status
 from roop.face_analyser import (
     get_one_face,
     get_many_faces,
-    find_similar_face,
     smart_face_tracking,
     detect_occlusion,
     get_face_pose,
@@ -19,7 +20,7 @@ from roop.face_reference import get_face_reference, set_face_reference, clear_fa
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-FACE_SWAPPER = None
+FACE_SWAPPER: Any = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
@@ -76,10 +77,13 @@ def post_process() -> None:
 
 
 # =====================================================================
-#  POSE-AWARE BBOX ADJUSTMENT
+#  ENHANCED POSE-AWARE BBOX ADJUSTMENT
 # =====================================================================
 
 def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
+    """
+    Enhanced pose-aware bbox adjustment dengan ekspansi lebih agresif untuk sudut ekstrim.
+    """
     pitch, yaw, roll = get_face_pose(face)
 
     h_frame, w_frame = frame_shape[:2]
@@ -88,150 +92,233 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     w = x2 - x1
     h = y2 - y1
 
-    pad_x = 0.0
-    pad_y_top = 0.0
-    pad_y_bottom = 0.0
+    # BASE PADDING + POSE-AWARE EXPANSION
+    base_pad = 0.20  # Increased base padding
+    pad_x = base_pad
+    pad_y_top = base_pad  
+    pad_y_bottom = base_pad
 
-    # Logic adaptasi padding (diperkuat sedikit untuk memberi ruang morphing)
-    if abs(yaw) > 25.0:
-        extra = (abs(yaw) - 25.0) * 0.04  
-        extra = min(extra, 0.40)          
-        pad_x = w * extra
+    # EXTREME ANGLE COMPENSATION
+    yaw_abs = abs(yaw)
+    if yaw_abs > 30.0:
+        # More aggressive expansion for extreme angles
+        extra = (yaw_abs - 30.0) * 0.025  # Increased from 0.02
+        extra = min(extra, 0.35)  # Increased max from 0.20
+        pad_x += extra
 
-    if pitch < -15.0:
-        extra = (abs(pitch) - 15.0) * 0.03
+    # Enhanced pitch compensation
+    if pitch < -20.0:  # Looking up
+        extra = (abs(pitch) - 20.0) * 0.025
         extra = min(extra, 0.35)
-        pad_y_top = h * extra
-    elif pitch > 20.0:
-        extra = (pitch - 20.0) * 0.025
+        pad_y_top += extra
+    elif pitch > 25.0:  # Looking down  
+        extra = (pitch - 25.0) * 0.02
         extra = min(extra, 0.25)
-        pad_y_bottom = h * extra
+        pad_y_bottom += extra
 
-    # Padding statis minimal
-    pad_x += w * 0.05
-    pad_y_top += h * 0.05
-    pad_y_bottom += h * 0.05
+    # Roll compensation (untuk kepala miring)
+    roll_abs = abs(roll)
+    if roll_abs > 25.0:
+        roll_factor = min(roll_abs * 0.01, 0.15)
+        pad_x += roll_factor
+        pad_y_top += roll_factor * 0.5
+        pad_y_bottom += roll_factor * 0.5
 
-    nx1 = int(max(0, x1 - pad_x))
-    nx2 = int(min(w_frame - 1, x2 + pad_x))
-    ny1 = int(max(0, y1 - pad_y_top))
-    ny2 = int(min(h_frame - 1, y2 + pad_y_bottom))
+    # Apply padding
+    pad_x_pixels = int(w * pad_x)
+    pad_y_top_pixels = int(h * pad_y_top)
+    pad_y_bottom_pixels = int(h * pad_y_bottom)
 
-    if nx2 <= nx1 or ny2 <= ny1:
-        return
+    nx1 = max(0, x1 - pad_x_pixels)
+    nx2 = min(w_frame, x2 + pad_x_pixels)
+    ny1 = max(0, y1 - pad_y_top_pixels)
+    ny2 = min(h_frame, y2 + pad_y_bottom_pixels)
 
-    face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
+    if nx2 > nx1 and ny2 > ny1:
+        face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
 
 
 # =====================================================================
-#  SHAPE MORPHING MODULE (BARU: Untuk Mengecilkan Hidung)
+#  ROTATION-AWARE BLENDING SYSTEM
 # =====================================================================
 
-def apply_nose_morph(img: np.ndarray, face_landmarks: np.ndarray, strength: float = 0.4) -> np.ndarray:
+def create_rotated_ellipse_mask(shape, center, axes, roll_angle):
     """
-    Melakukan warping lokal (pinch effect) pada area hidung.
-    strength: 0.0 - 1.0 (Semakin tinggi, hidung semakin kecil/ramping).
+    Buat elliptical mask yang dirotasi sesuai roll wajah.
+    """
+    h, w = shape[:2]
+    mask = np.zeros((h, w), dtype=np.float32)
+    
+    # Ellipse dengan rotasi berdasarkan roll
+    cv2.ellipse(mask, center, axes, roll_angle, 0, 360, 1.0, -1)
+    return mask
+
+def enhanced_face_blending(swapped_frame: Frame, original_frame: Frame, face: Face) -> Frame:
+    """
+    Enhanced blending dengan rotated elliptical mask.
     """
     try:
-        if face_landmarks is None or len(face_landmarks) < 5:
-            return img
-
-        h, w = img.shape[:2]
+        x1, y1, x2, y2 = map(int, face.bbox)
+        swapped_region = swapped_frame[y1:y2, x1:x2]
+        original_region = original_frame[y1:y2, x1:x2]
         
-        # Landmark index 2 adalah ujung hidung
-        nose_x, nose_y = face_landmarks[2]
+        if swapped_region.size == 0 or original_region.size == 0:
+            return swapped_frame
+            
+        h, w = swapped_region.shape[:2]
         
-        # Radius efek berdasarkan jarak mata
-        eye_dist = np.linalg.norm(face_landmarks[0] - face_landmarks[1])
-        radius = eye_dist * 0.9 
+        # Dapatkan pose wajah untuk rotasi
+        pitch, yaw, roll = get_face_pose(face)
         
-        # Buat grid map
-        map_x, map_y = np.meshgrid(np.arange(w), np.arange(h))
-        map_x = map_x.astype(np.float32)
-        map_y = map_y.astype(np.float32)
-
-        # Jarak pixel ke pusat hidung
-        dx = map_x - nose_x
-        dy = map_y - nose_y
-        dist = np.sqrt(dx*dx + dy*dy)
-        dist = np.maximum(dist, 1.0) # hindari div by zero
-
-        # Masking area hidung
-        mask = np.exp(-(dist**2) / (2 * (radius**2)))
+        # Buat mask dengan rotasi sesuai roll wajah
+        center = (w // 2, h // 2)
+        ellipse_w = int(w * 0.38)
+        ellipse_h = int(h * 0.38)
         
-        # Hitung pergeseran pixel (menjauh dari pusat -> pinch effect)
-        warp_amount = mask * strength * (radius * 0.6)
+        # Mask utama dengan rotasi
+        mask = create_rotated_ellipse_mask((h, w), center, (ellipse_w, ellipse_h), roll)
         
-        map_x += (dx / dist) * warp_amount
-        map_y += (dy / dist) * warp_amount
+        # Feathering dengan mempertimbangkan orientasi wajah
+        feather_size = int(min(w, h) * 0.18)
+        if feather_size % 2 == 0:
+            feather_size += 1
+            
+        # Multiple blur passes
+        mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
+        mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
         
-        # Remap
-        warped_img = cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        # Adaptive dilation berdasarkan yaw (untuk wajah samping)
+        if abs(yaw) > 30.0:
+            dilation_factor = min(abs(yaw) * 0.01, 0.3)
+            kernel_size = max(3, int(min(w, h) * dilation_factor))
+            kernel = np.ones((kernel_size, kernel_size), np.uint8)
+            mask = cv2.dilate(mask, kernel)
+            mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
         
-        return warped_img
+        mask_3ch = np.dstack([mask] * 3)
+        
+        # Apply blending
+        blended_region = (swapped_region * mask_3ch + 
+                         original_region * (1.0 - mask_3ch)).astype(np.uint8)
+        
+        # Border smoothing yang juga mengikuti rotasi
+        border_size = int(min(w, h) * 0.08)
+        if border_size > 1:
+            border_mask = np.zeros((h, w), dtype=np.float32)
+            # Inner ellipse (rotated)
+            cv2.ellipse(border_mask, center, 
+                       (ellipse_w - border_size, ellipse_h - border_size), 
+                       roll, 0, 360, 1, -1)
+            # Outer ellipse (rotated)  
+            cv2.ellipse(border_mask, center, (ellipse_w, ellipse_h), 
+                       roll, 0, 360, 0, -1)
+            
+            border_blur = border_size * 2 + 1
+            border_mask = cv2.GaussianBlur(border_mask, (border_blur, border_blur), 0)
+            border_mask_3ch = np.dstack([border_mask] * 3)
+            
+            blended_region = (blended_region * (1 - border_mask_3ch) + 
+                            original_region * border_mask_3ch).astype(np.uint8)
+        
+        result_frame = swapped_frame.copy()
+        result_frame[y1:y2, x1:x2] = blended_region
+        
+        return result_frame
+        
     except Exception as e:
-        print(f"[Morph Error] {e}")
-        return img
+        print(f"Enhanced blending error: {e}")
+        return swapped_frame
+
+
+def standard_face_blending(swapped_frame: Frame, original_frame: Frame, face: Face) -> Frame:
+    """
+    Standard blending dengan rotasi dasar.
+    """
+    try:
+        x1, y1, x2, y2 = map(int, face.bbox)
+        swapped_region = swapped_frame[y1:y2, x1:x2]
+        original_region = original_frame[y1:y2, x1:x2]
+        
+        if swapped_region.size == 0:
+            return swapped_frame
+            
+        h, w = swapped_region.shape[:2]
+        
+        # Dapatkan roll untuk rotasi
+        pitch, yaw, roll = get_face_pose(face)
+        
+        center = (w // 2, h // 2)
+        ellipse_w = int(w * 0.42)
+        ellipse_h = int(h * 0.42)
+        
+        # Rotated ellipse mask
+        mask = np.zeros((h, w), dtype=np.float32)
+        cv2.ellipse(mask, center, (ellipse_w, ellipse_h), roll, 0, 360, 1.0, -1)
+        
+        feather_size = int(min(w, h) * 0.12)
+        if feather_size % 2 == 0:
+            feather_size += 1
+        mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
+        
+        mask_3ch = np.dstack([mask] * 3)
+        
+        blended_region = (swapped_region * mask_3ch + 
+                         original_region * (1.0 - mask_3ch)).astype(np.uint8)
+        
+        result_frame = swapped_frame.copy()
+        result_frame[y1:y2, x1:x2] = blended_region
+        
+        return result_frame
+        
+    except Exception as e:
+        print(f"Standard blending error: {e}")
+        return swapped_frame
 
 
 # =====================================================================
-#  CORE SWAP (DIMODIFIKASI)
+#  CORE SWAP WITH ENHANCED BLENDING
 # =====================================================================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Melakukan swap wajah, kemudian menerapkan shape morphing pada hasilnya.
+    Enhanced swap dengan advanced blending system.
     """
     if source_face is None or target_face is None:
         return temp_frame
 
-    # 1. Adaptasi BBox (Anti Masker/Topeng)
+    # Deteksi angle untuk menentukan blending strategy
+    pitch, yaw, roll = get_face_pose(target_face)
+    is_extreme_angle = abs(yaw) > 45.0 or abs(pitch) > 35.0
+
+    # Simpan frame original untuk blending
+    original_frame = temp_frame.copy()
+    
+    # Enhanced BBOX adjustment (TANPA modifikasi KPS)
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
-    # 2. Lakukan Swap Standard
+    # Copy face object untuk safety
+    target_face_adj = copy.copy(target_face)
+    target_face_adj.bbox = np.array(target_face.bbox, dtype=np.float32).copy()
+
+    # Perform swap
     swapped_frame = get_face_swapper().get(
         temp_frame,
-        target_face,
+        target_face_adj,
         source_face,
         paste_back=True
     )
 
-    # 3. Post-Process: Nose Morphing (Merampingkan hidung hasil swap)
-    try:
-        # Ambil bbox target untuk memproses area wajah saja
-        bbox = target_face.bbox.astype(int)
-        x1, y1, x2, y2 = bbox
-        
-        h_frm, w_frm = swapped_frame.shape[:2]
-        x1 = max(0, x1)
-        y1 = max(0, y1)
-        x2 = min(w_frm, x2)
-        y2 = min(h_frm, y2)
-        
-        face_crop = swapped_frame[y1:y2, x1:x2]
-        
-        if face_crop.size > 0:
-            # Konversi landmark global ke lokal crop
-            if hasattr(target_face, 'kps'):
-                local_kps = target_face.kps.copy()
-                local_kps[:, 0] -= x1
-                local_kps[:, 1] -= y1
-                
-                # Terapkan Morphing
-                # Strength 0.5 cukup kuat untuk merampingkan hidung mancung
-                morphed_crop = apply_nose_morph(face_crop, local_kps, strength=0.5)
-                
-                # Tempel kembali
-                swapped_frame[y1:y2, x1:x2] = morphed_crop
-                
-    except Exception as e:
-        # Jika error, lanjut saja dengan hasil swap biasa
-        pass
-
-    return swapped_frame
+    # Pilih blending strategy berdasarkan angle
+    if is_extreme_angle:
+        return enhanced_face_blending(swapped_frame, original_frame, target_face_adj)
+    else:
+        return standard_face_blending(swapped_frame, original_frame, target_face_adj)
 
 
-def _select_best_target_by_embedding(faces: List[Face], reference_face: Face) -> Optional[Face]:
+def _select_best_target_by_embedding(
+    faces: List[Face],
+    reference_face: Face
+) -> Optional[Face]:
     if not faces or reference_face is None:
         return None
 
@@ -241,6 +328,7 @@ def _select_best_target_by_embedding(faces: List[Face], reference_face: Face) ->
     ref_emb = reference_face.normed_embedding
     best_face = None
     best_distance = float('inf')
+
     similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
 
     for f in faces:
@@ -258,10 +346,16 @@ def _select_best_target_by_embedding(faces: List[Face], reference_face: Face) ->
     return best_face
 
 
-def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, frame_number: int = 0) -> Frame:
+def process_frame(
+    source_face: Face,
+    reference_face: Face,
+    temp_frame: Frame,
+    frame_number: int = 0
+) -> Frame:
     if source_face is None:
         return temp_frame
 
+    # MODE: Many Faces
     if roop.globals.many_faces:
         faces = smart_face_tracking(temp_frame, frame_number)
         if not faces:
@@ -277,6 +371,7 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, fr
 
         return temp_frame
 
+    # MODE: Single Face
     tracked_faces = smart_face_tracking(temp_frame, frame_number)
     if not tracked_faces:
         tracked_faces = get_many_faces(temp_frame)
@@ -299,7 +394,11 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, fr
     return temp_frame
 
 
-def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+def process_frames(
+    source_path: str,
+    temp_frame_paths: List[str],
+    update: Callable[[], None]
+) -> None:
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
     reference_face = None if roop.globals.many_faces else get_face_reference()
@@ -324,7 +423,10 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
     reference_face = None
     if not roop.globals.many_faces:
-        reference_face = get_one_face(target_frame, roop.globals.reference_face_position)
+        reference_face = get_one_face(
+            target_frame,
+            roop.globals.reference_face_position
+        )
 
     result = process_frame(
         source_face=source_face,
