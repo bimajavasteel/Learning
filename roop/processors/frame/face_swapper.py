@@ -16,7 +16,7 @@ from roop.face_analyser import (
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
-from roop.blending import apply_blend_and_color_match  # Import custom blending
+from roop.blending import apply_blend_and_color_match
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -143,14 +143,22 @@ def swap_face_with_blending(
     adapt_bbox_for_pose(target_face, temp_frame.shape)
     
     # Get swapped frame (without paste_back)
-    swapped_frame = get_face_swapper().get(
+    swapped_result = get_face_swapper().get(
         temp_frame,
         target_face,
         source_face,
         paste_back=False
     )
     
-    # Extract swapped crop
+    # FIX: Handle different return types from inswapper
+    if isinstance(swapped_result, tuple):
+        # Some versions return (frame, matrix)
+        swapped_frame = swapped_result[0]
+    else:
+        # Standard return is just the frame
+        swapped_frame = swapped_result
+    
+    # Extract swapped crop using NEW bbox
     x1_new, y1_new, x2_new, y2_new = map(int, target_face.bbox)
     x1_new = max(0, min(x1_new, w_frame - 1))
     x2_new = max(0, min(x2_new, w_frame))
@@ -160,7 +168,14 @@ def swap_face_with_blending(
     if x2_new <= x1_new or y2_new <= y1_new:
         return temp_frame
     
-    swapped_crop = swapped_frame[y1_new:y2_new, x1_new:x2_new]
+    # FIX: Handle potential tuple return for crop
+    try:
+        swapped_crop = swapped_frame[y1_new:y2_new, x1_new:x2_new]
+    except TypeError:
+        # Fallback if indexing fails
+        if isinstance(swapped_frame, tuple):
+            swapped_frame = swapped_frame[0]
+        swapped_crop = swapped_frame[y1_new:y2_new, x1_new:x2_new]
     
     # Blend with original crop
     blended_crop = apply_blend_and_color_match(
@@ -170,7 +185,7 @@ def swap_face_with_blending(
         fidelity=0.7  # Good balance for most cases
     )
     
-    # Paste back blended result
+    # Paste back blended result using ORIGINAL bbox
     temp_frame[y1:y2, x1:x2] = cv2.resize(blended_crop, (x2-x1, y2-y1))
     return temp_frame
 
