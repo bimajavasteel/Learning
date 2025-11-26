@@ -1,8 +1,7 @@
 # ============================================================
-#   FACE SWAPPER — FINAL FIXED VERSION
-#   Compatible with ROOP pipeline & Kaggle multiprocessing
-#   Fix landmark boolean error, indentation error,
-#   pose-aware bbox, hair-mask, occlusion-aware blending
+#   FACE SWAPPER — FINAL VERSION (with last_swap_mask integration)
+#   - Menyimpan roop.globals.last_swap_mask (full-frame uint8 mask)
+#   - Aman untuk multiprocessing/threading (pakai lock)
 # ============================================================
 
 from typing import Any, List, Callable
@@ -30,6 +29,9 @@ from roop.utilities import conditional_download, resolve_relative_path, is_image
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
+
+# lock untuk update last_swap_mask agar thread-safe
+SWAP_MASK_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -183,6 +185,7 @@ def adapt_bbox_for_pose(face: Face, frame_shape):
 
 # ============================================================
 #   SWAP FACE (CORE FUNCTION)
+#   - Juga meng-update roop.globals.last_swap_mask (full-frame uint8)
 # ============================================================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
@@ -202,7 +205,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     )
 
     # ------------------------------------------------------------
-    # SAFE LANDMARK EXTRACTION (FIXES ERROR)
+    # SAFE LANDMARK EXTRACTION
     # ------------------------------------------------------------
     landmarks = None
     for key in ["landmark_2d_106", "landmark_2d_68", "landmark"]:
@@ -213,37 +216,33 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
 
     # ------------------------------------------------------------
-    # BUILD MASK
+    # BUILD MASK (alpha: single-channel [0..1])
     # ------------------------------------------------------------
     if landmarks is not None:
         lms = np.array(landmarks)
-        
         if lms.max() <= 1.1:  # relative coords
             H, W = temp_frame.shape[:2]
             lms = (lms * np.array([W, H])).astype(np.int32)
 
         mask_u8 = landmarks_to_hair_mask(temp_frame.shape, lms, scale=1.15)
         alpha = mask_u8.astype(np.float32) / 255.0
-
         alpha = cv2.GaussianBlur(alpha, (41, 41), 0)
         alpha = np.clip(alpha, 0.0, 1.0)
 
     else:
-        # fallback ellipse
         x1, y1, x2, y2 = map(int, target_face.bbox)
         mask = np.zeros(temp_frame.shape[:2], dtype=np.float32)
         cx, cy = (x1 + x2)//2, (y1 + y2)//2
         axes = (int((x2-x1)*0.55), int((y2-y1)*0.65))
         cv2.ellipse(mask, (cx,cy), axes, 0, 0, 360, 1.0, -1)
         alpha = cv2.GaussianBlur(mask, (31,31), 0)
-
+        alpha = np.clip(alpha, 0.0, 1.0)
 
     # ------------------------------------------------------------
-    # OCCLUSION-AWARE BLENDING
+    # OCCLUSION-AWARE BLENDING (intensity scalar)
     # ------------------------------------------------------------
     occluded = detect_occlusion(target_face, temp_frame)
     intensity = 1.0
-
     if occluded:
         intensity = 0.45
     else:
@@ -251,7 +250,9 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         if det < 0.55:
             intensity = 0.85
 
-    alpha_final = np.expand_dims(alpha * intensity, axis=2)
+    # alpha_single adalah mask single-channel final (0..1) untuk area ini
+    alpha_single = np.clip(alpha * intensity, 0.0, 1.0)
+    alpha_final = np.expand_dims(alpha_single, axis=2)  # untuk compositing 3-channel
 
     # ------------------------------------------------------------
     # FINAL COMPOSITING
@@ -260,6 +261,25 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         swapped.astype(np.float32) * alpha_final +
         temp_frame.astype(np.float32) * (1.0 - alpha_final)
     ).astype(np.uint8)
+
+    # ------------------------------------------------------------
+    # UPDATE roop.globals.last_swap_mask (uint8 full-frame)
+    # - gunakan lock supaya aman multi-thread
+    # - akumulasi dengan np.maximum sehingga beberapa wajah ter-cover
+    # ------------------------------------------------------------
+    try:
+        mask_uint8 = (alpha_single * 255.0).astype(np.uint8)
+        with SWAP_MASK_LOCK:
+            existing = getattr(roop.globals, "last_swap_mask", None)
+            if existing is None or existing.shape != mask_uint8.shape:
+                # inisialisasi ulang kalau belum ada atau ukuran beda
+                roop.globals.last_swap_mask = np.zeros_like(mask_uint8, dtype=np.uint8)
+                existing = roop.globals.last_swap_mask
+            # akumulasi area (ambil nilai maksimum per pixel)
+            roop.globals.last_swap_mask = np.maximum(existing, mask_uint8)
+    except Exception:
+        # jangan ganggu pipeline kalau update mask gagal
+        pass
 
     return result
 
@@ -298,12 +318,22 @@ def _select_best_target_by_embedding(faces: List[Face], reference_face: Face):
 
 # ============================================================
 #   PROCESS EACH FRAME
+#   - init roop.globals.last_swap_mask per frame
 # ============================================================
 
 def process_frame(source_face, reference_face, temp_frame, frame_number=0):
 
     if source_face is None:
         return temp_frame
+
+    # inisialisasi last_swap_mask full-frame untuk frame ini (uint8)
+    try:
+        h, w = temp_frame.shape[:2]
+        with SWAP_MASK_LOCK:
+            roop.globals.last_swap_mask = np.zeros((h, w), dtype=np.uint8)
+    except Exception:
+        # ignore failure to init mask (pipeline tetap jalan)
+        pass
 
     # MULTI FACE MODE
     if roop.globals.many_faces:
