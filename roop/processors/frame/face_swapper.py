@@ -1,23 +1,23 @@
-from typing import Any, List, Callable, Optional
+# face-swapper-v2.py
+from typing import Any, List, Callable
 import cv2
 import insightface
 import threading
 import numpy as np
+
 import roop.globals
 import roop.processors.frame.core
 from roop.core import update_status
 from roop.face_analyser import (
     get_one_face,
     get_many_faces,
-    get_face_pose,
     smart_face_tracking,
-    get_occlusion_mask,
-    detect_occlusion
+    detect_occlusion,
+    get_face_pose,
 )
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
-from roop.blending import apply_blend_and_color_match
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -50,9 +50,6 @@ def pre_start() -> bool:
         update_status('Select an image for source path.', NAME)
         return False
     source_img = cv2.imread(roop.globals.source_path)
-    if source_img is None or source_img.size == 0:
-        update_status('Failed to read source image.', NAME)
-        return False
     if not get_one_face(source_img):
         update_status('No face in source path detected.', NAME)
         return False
@@ -65,325 +62,147 @@ def post_process() -> None:
     clear_face_swapper()
     clear_face_reference()
 
-# =====================================================================
-#  POSE-AWARE BBOX ADJUSTMENT (ENHANCED)
-# =====================================================================
+# --- OPTIMASI 1: Smart Bbox Adjustment (Anti-Jitter) ---
 def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
-    """
-    Enhanced bbox adjustment untuk pose ekstrem
-    """
     pitch, yaw, roll = get_face_pose(face)
     h_frame, w_frame = frame_shape[:2]
     bbox = np.array(face.bbox, dtype=np.float32)
     x1, y1, x2, y2 = bbox
     w = x2 - x1
     h = y2 - y1
-    
-    # Base padding factors
+
+    # Logic padding lebih halus
     pad_x = 0.0
     pad_y_top = 0.0
     pad_y_bottom = 0.0
-    
-    # Handle yaw (side poses)
-    if yaw > 30:  # Looking right → expand left side untuk rambut
-        pad_x = w * 0.3
-        pad_y_top = h * 0.1
-    elif yaw < -30:  # Looking left → expand right side
-        pad_x = w * 0.3
-        pad_y_top = h * 0.1
-    
-    # Handle pitch (up/down)
-    if pitch < -20:  # Looking up → lebih banyak dahi
-        pad_y_top = h * 0.3
-    elif pitch > 25:  # Looking down → lebih banyak dagu
-        pad_y_bottom = h * 0.25
-    
-    # Calculate new bbox
+
+    # Yaw (Noled): Tambah padding samping jika menoleh
+    if abs(yaw) > 20.0:
+        extra = (abs(yaw) - 20.0) * 0.01
+        extra = min(extra, 0.15)
+        pad_x = w * extra
+
+    # Pitch (Nunduk/Dangak)
+    if pitch < -10.0: # Lihat atas
+        extra = (abs(pitch) - 10.0) * 0.015
+        extra = min(extra, 0.20)
+        pad_y_top = h * extra
+    elif pitch > 15.0: # Lihat bawah
+        extra = (pitch - 15.0) * 0.015
+        extra = min(extra, 0.15)
+        pad_y_bottom = h * extra
+
     nx1 = int(max(0, x1 - pad_x))
     nx2 = int(min(w_frame - 1, x2 + pad_x))
     ny1 = int(max(0, y1 - pad_y_top))
     ny2 = int(min(h_frame - 1, y2 + pad_y_bottom))
-    
-    # Safety check
-    if nx2 <= nx1 or ny2 <= ny1 or nx1 < 0 or ny1 < 0 or nx2 >= w_frame or ny2 >= h_frame:
-        return
-    
-    face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
 
-# =====================================================================
-#  CUSTOM BLENDING SWAP
-# =====================================================================
-def swap_face_with_blending(
-    source_face: Face, 
-    target_face: Face, 
-    temp_frame: Frame,
-    frame_number: int = 0
-) -> Frame:
-    """
-    Enhanced swap dengan custom blending dan occlusion awareness
-    """
-    if source_face is None or target_face is None or temp_frame is None or temp_frame.size == 0:
+    if nx2 > nx1 and ny2 > ny1:
+        face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
+
+# --- CORE SWAP LOGIC ---
+def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
+    if source_face is None or target_face is None:
         return temp_frame
+
+    # 1. Cek Sudut Ekstrem (Extreme Angle Filter)
+    pitch, yaw, roll = get_face_pose(target_face)
     
-    # Simpan crop asli sebelum modifikasi
-    bbox = np.array(target_face.bbox, dtype=np.int32)
-    x1, y1, x2, y2 = bbox
-    h_frame, w_frame = temp_frame.shape[:2]
-    
-    # Validasi bbox
-    x1 = max(0, min(x1, w_frame - 1))
-    x2 = max(0, min(x2, w_frame))
-    y1 = max(0, min(y1, h_frame - 1))
-    y2 = max(0, min(y2, h_frame))
-    
-    if x2 <= x1 or y2 <= y1 or (x2 - x1) < 10 or (y2 - y1) < 10:
-        return temp_frame
-    
-    # Ambil crop asli dengan validasi
-    try:
-        original_crop = temp_frame[y1:y2, x1:x2].copy()
-        if original_crop.size == 0:
-            return temp_frame
-    except Exception as e:
-        print(f"Error extracting original crop: {e}")
-        return temp_frame
-    
-    # Dapatkan occlusion mask
-    try:
-        occlusion_mask = get_occlusion_mask(target_face, temp_frame)
-    except Exception as e:
-        print(f"Error getting occlusion mask: {e}")
-        occlusion_mask = None
-    
-    # Enhanced bbox untuk pose
-    original_bbox = target_face.bbox.copy()
+    # Jika wajah target menoleh > 45 derajat atau nunduk/dangak ekstrem -> SKIP SWAP
+    # Ini mencegah hasil "wajah gepeng" atau glitch pada profil samping.
+    if abs(yaw) > 50.0 or abs(pitch) > 40.0:
+        return temp_frame 
+
     adapt_bbox_for_pose(target_face, temp_frame.shape)
-    
-    # Dapatkan frame hasil swap (tanpa paste_back)
-    try:
-        swapped_result = get_face_swapper().get(
-            temp_frame,
-            target_face,
-            source_face,
-            paste_back=False
-        )
-    except Exception as e:
-        print(f"Swap error: {e}")
-        target_face.bbox = original_bbox  # Restore original bbox
+
+    return get_face_swapper().get(
+        temp_frame,
+        target_face,
+        source_face,
+        paste_back=True
+    )
+
+def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, frame_number: int = 0) -> Frame:
+    if source_face is None:
         return temp_frame
-    
-    # Handle return value dari inswapper
-    if isinstance(swapped_result, tuple):
-        swapped_frame = swapped_result[0]
-    else:
-        swapped_frame = swapped_result
-    
-    if swapped_frame is None or swapped_frame.size == 0:
-        target_face.bbox = original_bbox
-        return temp_frame
-    
-    # Ekstrak crop hasil swap menggunakan bbox yang sudah disesuaikan
-    bbox_new = np.array(target_face.bbox, dtype=np.int32)
-    x1_new, y1_new, x2_new, y2_new = bbox_new
-    
-    # Validasi bbox baru
-    x1_new = max(0, min(x1_new, w_frame - 1))
-    x2_new = max(0, min(x2_new, w_frame))
-    y1_new = max(0, min(y1_new, h_frame - 1))
-    y2_new = max(0, min(y2_new, h_frame))
-    
-    if x2_new <= x1_new or y2_new <= y1_new or (x2_new - x1_new) < 5 or (y2_new - y1_new) < 5:
-        target_face.bbox = original_bbox
-        return temp_frame
-    
-    # Ambil crop hasil swap dengan validasi
-    try:
-        swapped_crop = swapped_frame[y1_new:y2_new, x1_new:x2_new]
-        if swapped_crop.size == 0:
-            target_face.bbox = original_bbox
+
+    if roop.globals.many_faces:
+        faces = smart_face_tracking(temp_frame, frame_number)
+        if not faces:
+            faces = get_many_faces(temp_frame)
+        if not faces:
             return temp_frame
-    except Exception as e:
-        print(f"Error extracting swapped crop: {e}")
-        target_face.bbox = original_bbox
+
+        for target_face in faces:
+            if detect_occlusion(target_face, temp_frame):
+                continue
+            temp_frame = swap_face(source_face, target_face, temp_frame)
         return temp_frame
+
+    # Single Face Mode
+    tracked_faces = smart_face_tracking(temp_frame, frame_number)
+    if not tracked_faces:
+        tracked_faces = get_many_faces(temp_frame)
+    if not tracked_faces:
+        return temp_frame
+
+    valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
+    if not valid_faces:
+        return temp_frame
+
+    best_target = None
+    if reference_face is not None:
+        # Gunakan logic similarity dari analyser
+        from roop.face_analyser import find_similar_face
+        # Kita panggil find_similar manual logic di sini agar efisien
+        ref_emb = getattr(reference_face, 'normed_embedding', None)
+        if ref_emb is not None:
+            best_dist = float('inf')
+            thresh = getattr(roop.globals, 'similar_face_distance', 1.0)
+            for f in valid_faces:
+                curr_emb = getattr(f, 'normed_embedding', None)
+                if curr_emb is None: continue
+                dist = np.sum(np.square(curr_emb - ref_emb))
+                if dist < thresh and dist < best_dist:
+                    best_dist = dist
+                    best_target = f
     
-    # Blending dengan occlusion awareness
-    try:
-        blended_crop = apply_blend_and_color_match(
-            enhanced_crop=swapped_crop,
-            original_crop=original_crop,
-            occlusion_mask=occlusion_mask,
-            fidelity=0.7
-        )
-    except Exception as e:
-        print(f"Blending error: {e}")
-        blended_crop = swapped_crop
-    
-    # Tempel kembali ke frame menggunakan bbox asli (bukan yang sudah disesuaikan)
-    try:
-        if blended_crop.shape[:2] != (y2-y1, x2-x1):
-            blended_crop = cv2.resize(blended_crop, (x2-x1, y2-y1), interpolation=cv2.INTER_LANCZOS4)
-        temp_frame[y1:y2, x1:x2] = blended_crop
-    except Exception as e:
-        print(f"Error pasting blended crop: {e}")
-    
+    if best_target is None:
+        best_target = valid_faces[0]
+
+    temp_frame = swap_face(source_face, best_target, temp_frame)
     return temp_frame
 
-# =====================================================================
-#  CORE PROCESSING
-# =====================================================================
-def process_frame(
-    source_face: Face,
-    reference_face: Face,
-    temp_frame: Frame,
-    frame_number: int = 0
-) -> Frame:
-    if source_face is None or temp_frame is None or temp_frame.size == 0:
-        return temp_frame
-    
-    # Dapatkan wajah dengan tracking
-    if roop.globals.many_faces:
-        try:
-            faces = smart_face_tracking(temp_frame, frame_number)
-            if not faces:
-                faces = get_many_faces(temp_frame)
-            if not faces:
-                return temp_frame
-            
-            for target_face in faces:
-                # Skip wajah yang ter-occlusion berat
-                if detect_occlusion(target_face, temp_frame):
-                    continue
-                temp_frame = swap_face_with_blending(source_face, target_face, temp_frame, frame_number)
-            return temp_frame
-        except Exception as e:
-            print(f"Error processing many faces: {e}")
-            return temp_frame
-    
-    # Mode single face
-    try:
-        tracked_faces = smart_face_tracking(temp_frame, frame_number)
-        if not tracked_faces:
-            tracked_faces = get_many_faces(temp_frame)
-        if not tracked_faces:
-            return temp_frame
-        
-        # Filter wajah yang ter-occlusion
-        valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
-        if not valid_faces:
-            return temp_frame
-        
-        # Pilih wajah terbaik berdasarkan reference atau wajah pertama yang valid
-        best_target = None
-        if reference_face is not None and hasattr(reference_face, 'normed_embedding'):
-            best_similarity = -1
-            for face in valid_faces:
-                if hasattr(face, 'normed_embedding'):
-                    similarity = 1.0 - np.dot(face.normed_embedding, reference_face.normed_embedding)
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_target = face
-        
-        if best_target is None:
-            best_target = valid_faces[0]
-        
-        return swap_face_with_blending(source_face, best_target, temp_frame, frame_number)
-    except Exception as e:
-        print(f"Error in single face processing: {e}")
-        return temp_frame
-
-def process_frames(
-    source_path: str,
-    temp_frame_paths: List[str],
-    update: Callable[[], None]
-) -> None:
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     source_img = cv2.imread(source_path)
-    if source_img is None or source_img.size == 0:
-        print(f"Failed to read source image: {source_path}")
-        return
-    
     source_face = get_one_face(source_img)
     reference_face = None if roop.globals.many_faces else get_face_reference()
-    
+
     for idx, temp_frame_path in enumerate(temp_frame_paths):
-        # Cek apakah file ada sebelum membaca
-        import os
-        if not os.path.exists(temp_frame_path):
-            print(f"Frame file not found: {temp_frame_path}")
-            continue
-        
         temp_frame = cv2.imread(temp_frame_path)
-        if temp_frame is None or temp_frame.size == 0:
-            print(f"Failed to read frame: {temp_frame_path}")
-            continue
-        
-        result = process_frame(
-            source_face=source_face,
-            reference_face=reference_face,
-            temp_frame=temp_frame,
-            frame_number=idx
-        )
-        
-        # Validasi sebelum menulis
-        if result is not None and result.size > 0:
-            cv2.imwrite(temp_frame_path, result)
-        else:
-            print(f"Skipping empty result for frame: {temp_frame_path}")
-        
+        result = process_frame(source_face, reference_face, temp_frame, idx)
+        cv2.imwrite(temp_frame_path, result)
         if update:
             update()
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     source_img = cv2.imread(source_path)
-    if source_img is None or source_img.size == 0:
-        print(f"Failed to read source image: {source_path}")
-        return
-    
     target_frame = cv2.imread(target_path)
-    if target_frame is None or target_frame.size == 0:
-        print(f"Failed to read target image: {target_path}")
-        return
-    
     source_face = get_one_face(source_img)
     reference_face = None
-    
     if not roop.globals.many_faces:
-        reference_face = get_one_face(
-            target_frame,
-            roop.globals.reference_face_position
-        )
-    
-    result = process_frame(
-        source_face=source_face,
-        reference_face=reference_face,
-        temp_frame=target_frame,
-        frame_number=0
-    )
-    
-    if result is not None and result.size > 0:
-        cv2.imwrite(output_path, result)
-    else:
-        print(f"Failed to generate result for image")
+        reference_face = get_one_face(target_frame, roop.globals.reference_face_position)
+
+    result = process_frame(source_face, reference_face, target_frame, frame_number=0)
+    cv2.imwrite(output_path, result)
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     if not roop.globals.many_faces and not get_face_reference():
         try:
             ref_idx = roop.globals.reference_frame_number
-            if 0 <= ref_idx < len(temp_frame_paths):
-                reference_frame_path = temp_frame_paths[ref_idx]
-                reference_frame = cv2.imread(reference_frame_path)
-                if reference_frame is not None and reference_frame.size > 0:
-                    reference_face = get_one_face(
-                        reference_frame,
-                        roop.globals.reference_face_position
-                    )
-                    set_face_reference(reference_face)
-        except Exception as e:
-            print(f"Error setting face reference: {e}")
+            reference_frame = cv2.imread(temp_frame_paths[ref_idx])
+            reference_face = get_one_face(reference_frame, roop.globals.reference_face_position)
+            set_face_reference(reference_face)
+        except Exception:
             set_face_reference(None)
-    
-    roop.processors.frame.core.process_video(
-        source_path,
-        temp_frame_paths,
-        process_frames
-    )
+    roop.processors.frame.core.process_video(source_path, temp_frame_paths, process_frames)
