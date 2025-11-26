@@ -26,7 +26,7 @@ def get_face_swapper() -> Any:
     global FACE_SWAPPER
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            model_path = resolve_relative_path('../models/inswapper_128.onnx')
+            model_path = resolve_relative_path('../models/inswapper_128v2.fp16.onnx')
             FACE_SWAPPER = insightface.model_zoo.get_model(
                 model_path,
                 providers=roop.globals.execution_providers
@@ -40,7 +40,7 @@ def clear_face_swapper() -> None:
 def pre_check() -> bool:
     download_directory_path = resolve_relative_path('../models')
     conditional_download(download_directory_path, [
-        'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx'
+        'https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/inswapper_128v2.fp16.onnx'
     ])
     return True
 
