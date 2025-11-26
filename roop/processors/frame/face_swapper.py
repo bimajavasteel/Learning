@@ -181,7 +181,14 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     swapped = swapper.get(temp_frame.copy(), target_face, source_face, paste_back=True)
 
     # Buat soft mask berdasarkan landmarks kalau ada
-    landmarks = getattr(target_face, "landmark_2d_106", None) or getattr(target_face, "landmark_2d_68", None) or getattr(target_face, "landmark", None)
+    # Ambil landmarks dengan aman tanpa boolean OR
+landmarks = None
+for key in ["landmark_2d_106", "landmark_2d_68", "landmark"]:
+    lm = getattr(target_face, key, None)
+    if lm is not None and hasattr(lm, "__len__") and len(lm) > 0:
+        landmarks = lm
+        break
+
     if landmarks is None:
         # fallback: gunakan bounding box with ellipse
         x1, y1, x2, y2 = map(int, target_face.bbox)
