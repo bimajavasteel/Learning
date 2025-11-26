@@ -25,6 +25,7 @@ MAX_TRACK_AGE = 15
 MIN_EMBED_SIMILARITY = 0.70
 OCCLUDER_SESSION: Optional[ort.InferenceSession] = None
 OCCLUDER_INPUT_NAME: Optional[str] = None
+OCCLUDER_INPUT_SIZE: int = 256  # Fix: ukuran input yang benar untuk occluder model
 # =====================================================================
 #  MODEL HANDLING
 # =====================================================================
@@ -47,7 +48,7 @@ def clear_face_analyser() -> None:
     with THREAD_LOCK:
         FACE_ANALYSER = None
 # =====================================================================
-#  OCCLUDER ONNX (enhanced)
+#  OCCLUDER ONNX (diperbaiki dimensi input)
 # =====================================================================
 def _get_occluder_session() -> Optional[ort.InferenceSession]:
     global OCCLUDER_SESSION, OCCLUDER_INPUT_NAME
@@ -64,7 +65,12 @@ def _get_occluder_session() -> Optional[ort.InferenceSession]:
             providers=roop.globals.execution_providers
         )
         OCCLUDER_INPUT_NAME = OCCLUDER_SESSION.get_inputs()[0].name
-        print(f"✅ [face_analyser] Loaded occluder model: {model_path}")
+        # Get input size from model
+        global OCCLUDER_INPUT_SIZE
+        input_shape = OCCLUDER_SESSION.get_inputs()[0].shape
+        if isinstance(input_shape, list) and len(input_shape) >= 4:
+            OCCLUDER_INPUT_SIZE = input_shape[2]  # height
+        print(f"✅ [face_analyser] Loaded occluder model: {model_path}, input size: {OCCLUDER_INPUT_SIZE}x{OCCLUDER_INPUT_SIZE}")
     except Exception as e:
         print(f"[face_analyser] Failed load occluder model: {e}")
         OCCLUDER_SESSION = None
@@ -73,6 +79,7 @@ def _get_occluder_session() -> Optional[ort.InferenceSession]:
 def get_occlusion_mask(face: Face, frame: Frame) -> np.ndarray:
     """
     Return detailed occlusion mask (0.0 = visible, 1.0 = fully occluded)
+    Fixed for correct input size
     """
     if frame is None or face is None:
         return np.zeros((128, 128), dtype=np.float32)
@@ -95,12 +102,12 @@ def get_occlusion_mask(face: Face, frame: Frame) -> np.ndarray:
     
     session = _get_occluder_session()
     if session is None:
-        # Fallback to simple gradient-based occlusion estimation
         return _estimate_occlusion_fallback(crop)
     
     try:
         h_crop, w_crop = crop.shape[:2]
-        inp = cv2.resize(crop, (224, 224))
+        # FIX: Resize ke ukuran yang benar sesuai model (256x256)
+        inp = cv2.resize(crop, (OCCLUDER_INPUT_SIZE, OCCLUDER_INPUT_SIZE))
         inp = inp.astype('float32') / 255.0
         inp = inp.transpose(2, 0, 1)[None, ...]
         
