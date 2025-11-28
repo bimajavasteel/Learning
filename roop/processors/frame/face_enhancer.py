@@ -17,6 +17,9 @@ THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-ENHANCER'
 
 
+# ============================================================
+#  LOAD GFPGAN
+# ============================================================
 def get_face_enhancer() -> Any:
     global FACE_ENHANCER
 
@@ -57,79 +60,134 @@ def post_process() -> None:
     clear_face_enhancer()
 
 
-def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.ndarray, fidelity: float) -> np.ndarray:
+# ============================================================
+#  AGE–BASED WRINKLE BOOSTER
+# ============================================================
+def apply_age_wrinkle_boost(crop: np.ndarray, age: float) -> np.ndarray:
     """
-    Menggabungkan hasil enhance dengan frame asli menggunakan Fidelity Blending,
-    Color Matching (Anti-Flicker), dan Masking (Anti-Box/Occlusion).
+    Tambah kerutan berdasarkan umur buffalo_l:
+    - < 40: 0%
+    - 40: 5%
+    - 50+: 10%
+    - interpolasi linear 40–50
     """
     try:
-        # 1. Validasi Dimensi
+        if crop is None or crop.size == 0:
+            return crop
+
+        # tentukan faktor kerutan
+        if age < 40:
+            factor = 0.0
+        elif 40 <= age < 50:
+            factor = 0.05 + (age - 40) * (0.10 - 0.05) / 10
+        else:
+            factor = 0.10  # maksimum
+
+        if factor <= 0:
+            return crop
+
+        base = crop.astype(np.float32)
+
+        # high-pass filter untuk menarik detail wrinkle
+        blur = cv2.GaussianBlur(base, (0, 0), sigmaX=3)
+        high_pass = cv2.addWeighted(base, 1.0 + factor, blur, -1.0 * factor, 0)
+
+        # sharpening
+        sharpen = cv2.addWeighted(base, 1.0, high_pass, factor, 0)
+
+        # blend natural
+        result = cv2.addWeighted(base, 1.0 - factor, sharpen, factor, 0)
+
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    except Exception:
+        return crop
+
+
+# ============================================================
+#  BLENDING UTAMA (anti flicker, color-match, anti box)
+# ============================================================
+def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.ndarray, fidelity: float) -> np.ndarray:
+    """
+    Smooth blending dengan color match + ellipse mask anti kotak
+    """
+    try:
         h, w = original_crop.shape[:2]
         if enhanced_crop.shape[:2] != (h, w):
             enhanced_crop = cv2.resize(enhanced_crop, (w, h))
 
-        # 2. Color Matching (Anti-Flicker)
+        # color matching anti flicker
         original_mean = np.mean(original_crop, axis=(0, 1))
         enhanced_mean = np.mean(enhanced_crop, axis=(0, 1))
         color_diff = original_mean - enhanced_mean
-        
+
         corrected_crop = enhanced_crop.astype(np.float32) + color_diff
         corrected_crop = np.clip(corrected_crop, 0, 255).astype(np.uint8)
 
-        # 3. Fidelity Blending (Menjaga Mimik Wajah)
+        # fidelity blend
         blended_expression = cv2.addWeighted(corrected_crop, fidelity, original_crop, 1.0 - fidelity, 0)
 
-        # 4. Masking (Occlusion & Box Removal)
+        # ellipse mask
         mask = np.zeros((h, w), dtype=np.float32)
         center = (w // 2, h // 2)
-        axes = (int(w * 0.45), int(h * 0.45)) 
+        axes = (int(w * 0.45), int(h * 0.45))
         cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
-        
-        blur_radius = int(min(w, h) * 0.1) 
-        if blur_radius % 2 == 0: blur_radius += 1
+
+        blur_radius = int(min(w, h) * 0.1)
+        if blur_radius % 2 == 0:
+            blur_radius += 1
         mask = cv2.GaussianBlur(mask, (blur_radius, blur_radius), 0)
         mask_3ch = np.dstack([mask] * 3)
 
-        # 5. Final Compositing
         final_result = (blended_expression * mask_3ch + original_crop * (1.0 - mask_3ch)).astype(np.uint8)
-        
         return final_result
-        
+
     except Exception as e:
         update_status(f"Error in blending: {e}", NAME)
         return original_crop
 
 
+# ============================================================
+#  ENHANCER UTAMA
+# ============================================================
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
     padding_x = int((end_x - start_x) * 0.2)
     padding_y = int((end_y - start_y) * 0.2)
-    
+
     h_frame, w_frame = temp_frame.shape[:2]
     start_x = max(0, start_x - padding_x)
     start_y = max(0, start_y - padding_y)
     end_x = min(w_frame, end_x + padding_x)
     end_y = min(h_frame, end_y + padding_y)
-    
+
     temp_face = temp_frame[start_y:end_y, start_x:end_x]
-    
+
     if temp_face.size:
         with THREAD_SEMAPHORE:
             _, _, enhanced_face = get_face_enhancer().enhance(
                 temp_face,
                 paste_back=True
             )
-        
-        # 📌 AMBIL NILAI BLEND DARI GLOBAL (0.6 default jika CLI tidak diisi)
+
+        # 🔥 AMBIL UMUR DARI BUFFALO_L
+        age = getattr(target_face, "age", 30)
+
+        # 🔥 TAMBAH KERUTAN BERDASARKAN UMUR
+        enhanced_face = apply_age_wrinkle_boost(enhanced_face, age)
+
+        # blending
         blend_amount = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.6
-        
         result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
-        
+
         temp_frame[start_y:end_y, start_x:end_x] = result_face
-        
+
     return temp_frame
 
 
+# ============================================================
+#  FRAME PIPELINE
+# ============================================================
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
     many_faces = get_many_faces(temp_frame)
     if many_faces:
