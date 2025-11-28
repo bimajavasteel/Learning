@@ -239,6 +239,16 @@ def enhance_face_quality(face: Frame) -> Frame:
     except Exception:
         return face
 
+# ------------------- face enhancer wrapper (kept for compatibility)
+
+def face_enhancer(frame: Frame) -> Frame:
+    try:
+        # Placeholder: integrate your GFPGAN/CodeFormer enhancer-final here
+        # This ensures the processor name 'face_enhancer' still exists and avoids CLI errors.
+        return frame
+    except Exception:
+        return frame
+
 # ------------------- core hybrid swapping -------------------
 
 def swap_face_hybrid(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
