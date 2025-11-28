@@ -1,8 +1,9 @@
 # ============================================================
-#  FACE SWAPPER – UNIFACE_256 + AUTO DOWNLOAD FIXED
+#  FACE SWAPPER – UNIFACE_256 + AUTO DOWNLOAD (FINAL FIXED)
 # ============================================================
 
 from typing import Any, List, Callable
+import os                       # <<< FIX PENTING
 import cv2
 import insightface
 import threading
@@ -39,16 +40,19 @@ UNIFACE_URL = [
 def ensure_uniface_model() -> str:
     """
     Auto-download uniface_256.onnx menggunakan conditional_download()
-    sesuai versi project ini (tanpa file_names).
+    (tanpa parameter file_names karena project kamu tidak mendukung itu).
     """
+
     model_dir = resolve_relative_path("../models")
     conditional_download(model_dir, UNIFACE_URL)
 
-    model_path = f"{model_dir}/uniface_256.onnx"
+    model_path = os.path.join(model_dir, "uniface_256.onnx")
+
     if not os.path.exists(model_path):
         raise FileNotFoundError(
             f"Gagal download uniface_256.onnx ke {model_path}"
         )
+
     return model_path
 
 
