@@ -61,6 +61,7 @@ def get_face_analyser() -> Any:
             )
             FACE_ANALYSER.prepare(ctx_id=0)
             print("✅ [face_analyser] Using buffalo_l (pose + 2d106 + 3d68)")
+            print("✅ [genderage] genderage.onnx loaded (age & gender head from buffalo_l)"
     return FACE_ANALYSER
 
 
