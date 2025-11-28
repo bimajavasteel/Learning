@@ -1,9 +1,15 @@
-#face-swpper support new
+#!/usr/bin/env python3
+
+# face-swapper (modifikasi: age-based wrinkle augmentation)
+# Basis & banyak fungsi asli berasal dari implementasi ROOP yang kamu miliki.
+# Referensi asli: face_swapper (buffalo_l pipeline). :contentReference[oaicite:3]{index=3}
+
 from typing import Any, List, Callable
 import cv2
 import insightface
 import threading
 import numpy as np
+import os
 
 import roop.globals
 import roop.processors.frame.core
@@ -20,10 +26,132 @@ from roop.face_reference import get_face_reference, set_face_reference, clear_fa
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
+# tambahan untuk age model
+import onnxruntime as ort
+
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
+# =========================
+# AGE-BASED WRINKLE MODULE
+# =========================
+
+AGE_SESSION: Any = None
+AGE_INPUT_NAME: str | None = None
+
+def _load_age_model() -> Any:
+    """
+    Lazy load genderage.onnx (model harus diletakkan di ../models/genderage.onnx).
+    Tidak memodifikasi face_analyser; model dipanggil terpisah.
+    """
+    global AGE_SESSION, AGE_INPUT_NAME
+    if AGE_SESSION is not None:
+        return AGE_SESSION
+
+    model_rel = getattr(roop.globals, "genderage_model_path", "../models/genderage.onnx")
+    model_path = resolve_relative_path(model_rel)
+
+    if not os.path.exists(model_path):
+        # Tidak fatal — hanya log warning dan lanjut tanpa age-estimation.
+        print(f"[face-swapper] genderage model not found at {model_path}, age estimation disabled.")
+        return None
+
+    try:
+        AGE_SESSION = ort.InferenceSession(model_path, providers=roop.globals.execution_providers)
+        AGE_INPUT_NAME = AGE_SESSION.get_inputs()[0].name
+        print(f"✅ [face-swapper] Loaded age model: {model_path}")
+    except Exception as e:
+        print(f"[face-swapper] Failed to load age model: {e}")
+        AGE_SESSION = None
+        AGE_INPUT_NAME = None
+
+    return AGE_SESSION
+
+
+def estimate_age_from_face(face: Face, frame: np.ndarray) -> int:
+    """
+    Kembalikan estimasi umur (int). Jika gagal atau model tidak tersedia -> -1.
+    Asumsi model mengembalikan array [age, ...] atau single value pada index 0.
+    Sesuaikan jika genderage.onnx output berbeda.
+    """
+    try:
+        session = _load_age_model()
+        if session is None or AGE_INPUT_NAME is None:
+            return -1
+
+        x1, y1, x2, y2 = map(int, face.bbox)
+        h_frame, w_frame = frame.shape[:2]
+        # safety clamp
+        x1 = max(0, min(x1, w_frame - 1))
+        x2 = max(0, min(x2, w_frame))
+        y1 = max(0, min(y1, h_frame - 1))
+        y2 = max(0, min(y2, h_frame))
+
+        if x2 <= x1 or y2 <= y1:
+            return -1
+
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return -1
+
+        # resize & normalize sesuai kebanyakan age models (112x112 / 0-1)
+        inp = cv2.resize(crop, (112, 112))
+        # convert BGR -> RGB
+        inp = inp[:, :, ::-1].astype("float32") / 255.0
+        inp = np.transpose(inp, (2, 0, 1))[None, ...]  # NCHW
+
+        outputs = session.run(None, {AGE_INPUT_NAME: inp})
+        pred = outputs[0]
+
+        # interpretasi output: jika scalar -> ambil pertama, jika vector -> ambil index 0
+        if pred is None:
+            return -1
+
+        # pred bisa shape (1,1) atau (1,) atau (1,N). Ambil elemen pertama yang valid.
+        try:
+            age_val = float(pred.flatten()[0])
+            age_int = int(round(age_val))
+            return age_int
+        except Exception:
+            return -1
+    except Exception:
+        return -1
+
+
+def apply_wrinkle_boost(crop: np.ndarray, percent: float) -> np.ndarray:
+    """
+    Terapkan peningkatan detail (wrinkle) ringan menggunakan filter high-pass.
+    percent: fraksi (0.05 = 5%, 0.10 = 10%).
+    Kembalikan crop yang diubah (dtype uint8).
+    """
+    try:
+        if crop is None or crop.size == 0 or percent <= 0:
+            return crop
+
+        # Gaussian blur sebagai low-frequency content
+        # sigma relatif ke ukuran: gunakan fixed sigma untuk stabilitas
+        sigma = 3.0
+        blurred = cv2.GaussianBlur(crop, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        # high-pass-ish: tambah detail dengan addWeighted
+        # menjaga nilai tetap dalam 0..255
+        alpha = 1.0 + percent   # e.g., 1.05 atau 1.10
+        beta = -percent         # e.g., -0.05 or -0.10
+        enhanced = cv2.addWeighted(crop.astype("float32"), alpha, blurred.astype("float32"), beta, 0.0)
+        enhanced = np.clip(enhanced, 0, 255).astype("uint8")
+
+        # optional: sedikit unsharp masking sharpening untuk accentuate wrinkles
+        # gunakan kernel kecil agar tidak menghasilkan artefak
+        # kita blend sangat ringan dengan original untuk menjaga natural look
+        sharpen = cv2.addWeighted(enhanced, 0.7, crop, 0.3, 0)
+        return sharpen
+    except Exception:
+        return crop
+
+
+# =========================
+# ORIGINAL FACE SWAPPER
+# =========================
 
 def get_face_swapper() -> Any:
     """
@@ -205,6 +333,47 @@ def _select_best_target_by_embedding(
     return best_face
 
 
+def _maybe_apply_age_wrinkle(target_face: Face, temp_frame: Frame) -> Frame:
+    """
+    Cek umur target_face; jika memenuhi kriteria, aplikasikan wrinkle boost pada crop.
+    Dipanggil sebelum swap atau sebelum enhancer (post-swap/pre-enhance lebih direkomendasikan).
+    """
+    try:
+        age = estimate_age_from_face(target_face, temp_frame)
+        if age < 0:
+            return temp_frame
+
+        wrinkle_factor = 0.0
+        if 40 <= age < 50:
+            wrinkle_factor = 0.05
+        elif age >= 50:
+            wrinkle_factor = 0.10
+
+        if wrinkle_factor <= 0:
+            return temp_frame
+
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        # clamp bbox
+        h_frame, w_frame = temp_frame.shape[:2]
+        x1 = max(0, min(x1, w_frame - 1))
+        x2 = max(0, min(x2, w_frame))
+        y1 = max(0, min(y1, h_frame - 1))
+        y2 = max(0, min(y2, h_frame))
+
+        if x2 <= x1 or y2 <= y1:
+            return temp_frame
+
+        crop = temp_frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return temp_frame
+
+        boosted = apply_wrinkle_boost(crop, wrinkle_factor)
+        temp_frame[y1:y2, x1:x2] = boosted
+        return temp_frame
+    except Exception:
+        return temp_frame
+
+
 def process_frame(
     source_face: Face,
     reference_face: Face,
@@ -215,6 +384,8 @@ def process_frame(
     Proses 1 frame dengan strategi:
     - many_faces = True  → swap ke semua wajah yang lolos filter & tidak occluded
     - many_faces = False → cari wajah paling mirip + stabil (tracking + embedding) + pose-aware
+
+    Modifikasi: sebelum swap/enhance kita coba apply age-based wrinkle augmentation.
     """
     if source_face is None:
         # Safety guard: sudah dicek di pre_start, tapi buat jaga-jaga.
@@ -234,6 +405,9 @@ def process_frame(
             # skip wajah yang ter-occlusion berat (tangan, rambut, dsb)
             if detect_occlusion(target_face, temp_frame):
                 continue
+
+            # APPLY wrinkle berdasarkan usia sebelum swap (opsional, bisa dipindah ke pre-enhance)
+            temp_frame = _maybe_apply_age_wrinkle(target_face, temp_frame)
 
             temp_frame = swap_face(source_face, target_face, temp_frame)
 
@@ -261,6 +435,9 @@ def process_frame(
     # Kalau belum ketemu, fallback ke wajah pertama yang valid
     if best_target is None:
         best_target = valid_faces[0]
+
+    # APPLY wrinkle berdasarkan usia sebelum swap (untuk single mode)
+    temp_frame = _maybe_apply_age_wrinkle(best_target, temp_frame)
 
     temp_frame = swap_face(source_face, best_target, temp_frame)
     return temp_frame
