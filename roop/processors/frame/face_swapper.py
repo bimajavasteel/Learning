@@ -1,7 +1,10 @@
-# face_swapper.py (hybrid v2)
-# Hybrid design: smart tracking & occlusion (from new analyser) + OneEuro smoothing,
-# robust landmark alignment, enhanced landmark selection (68), mouth-aware handling,
-# improved pose bbox smoothing, stronger GFPGAN fidelity default.
+# face_swapper.py (hybrid v3)
+# Hybrid v3: improvements over v2
+# - profile/side-pose handling (jawline weighting + horizontal scaling)
+# - explicit mouth-aware local warp before swap
+# - adaptive mask that shifts based on yaw/pitch
+# - GFPGAN fidelity auto-scheduler based on pose/expression
+# - noise re-introduction to avoid "waxy" skin
 
 from typing import Any, List, Callable, Optional, Tuple, Dict
 import threading
@@ -72,9 +75,11 @@ FACE_SWAPPER: Any = None
 THREAD_LOCK = threading.Lock()
 LANDMARK_FILTERS: Dict[str, Any] = {}
 ONE_EURO_CONFIG = getattr(roop.globals, 'one_euro_config', {
-    'freq': 30.0, 'min_cutoff': 1.0, 'beta': 0.01, 'd_cutoff': 1.0
+    'freq': 30.0, 'min_cutoff': 1.0, 'beta': 0.012, 'd_cutoff': 1.0
 })
-GFPGAN_DEFAULT_FIDELITY = float(getattr(roop.globals, 'face_enhancer_blend', 0.8))
+
+# GFPGAN defaults
+GFPGAN_BASE = float(getattr(roop.globals, 'face_enhancer_blend', 0.8))
 
 # ----------------- model init -----------------
 def get_face_swapper() -> Any:
@@ -140,6 +145,12 @@ def safe_get_landmarks(face: Face) -> Optional[np.ndarray]:
                 return np.asarray(lm, dtype=float)
     return None
 
+# ----------------- pose helpers -----------------
+def compute_pose_severity(face: Face) -> float:
+    pitch, yaw, roll = get_face_pose(face)
+    # severity 0..1 based on yaw magnitude
+    return min(1.0, abs(yaw) / 60.0)
+
 # ----------------- pose-aware bbox (softer) -----------------
 def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     try:
@@ -151,21 +162,22 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
         pad_x = 0.0
         pad_y_top = 0.0
         pad_y_bottom = 0.0
-        if abs(yaw) > 25.0:
-            extra = (abs(yaw) - 25.0) * 0.02
-            extra = min(extra, 0.20)
+        if abs(yaw) > 20.0:
+            extra = (abs(yaw) - 20.0) * 0.02
+            extra = min(extra, 0.28)
             pad_x = w * extra
-        if pitch < -15.0:
-            extra = (abs(pitch) - 15.0) * 0.02
-            extra = min(extra, 0.25)
+        if pitch < -12.0:
+            extra = (abs(pitch) - 12.0) * 0.02
+            extra = min(extra, 0.30)
             pad_y_top = h * extra
-        elif pitch > 20.0:
-            extra = (pitch - 20.0) * 0.015
+        elif pitch > 18.0:
+            extra = (pitch - 18.0) * 0.015
             extra = min(extra, 0.18)
             pad_y_bottom = h * extra
-        # soften aggressive padding by 30% to avoid overcrop
-        soften = 0.7
-        pad_x *= soften
+        # soften but scale with pose severity
+        severity = compute_pose_severity(face)
+        soften = 0.75
+        pad_x *= soften * (1.0 + severity*0.25)
         pad_y_top *= soften
         pad_y_bottom *= soften
         nx1 = int(max(0, x1 - pad_x))
@@ -178,7 +190,70 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     except Exception:
         pass
 
-# ----------------- alignment (68-focused + mouth-aware) -----------------
+# ----------------- mouth-aware local warp -----------------
+def mouth_open_ratio(landmarks: np.ndarray) -> float:
+    try:
+        # indices approximate for 68/106 mapping; guard bounds
+        if len(landmarks) > 66:
+            top = landmarks[62]
+            bottom = landmarks[66]
+        elif len(landmarks) > 48:
+            top = landmarks[51]
+            bottom = landmarks[57]
+        else:
+            return 0.0
+        vert = np.linalg.norm(bottom - top)
+        eye_dist = np.linalg.norm(landmarks[36] - landmarks[45]) if len(landmarks) > 45 else 1.0
+        return float(vert / max(1e-6, eye_dist))
+    except Exception:
+        return 0.0
+
+def local_mouth_warp(frame: Frame, landmarks: np.ndarray, strength: float = 0.6) -> Frame:
+    try:
+        ratio = mouth_open_ratio(landmarks)
+        if ratio < 0.18:
+            return frame
+        # compute mouth bbox (use inner lip indices if available)
+        if len(landmarks) > 66:
+            pts = landmarks[60:68]
+        elif len(landmarks) > 57:
+            pts = landmarks[48:60]
+        else:
+            return frame
+        pts = np.array(pts, dtype=np.int32)
+        x, y, w, h = cv2.boundingRect(pts)
+        pad = int(max(4, 0.25 * max(w, h)))
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(frame.shape[1], x + w + pad), min(frame.shape[0], y + h + pad)
+        crop = frame[y1:y2, x1:x2].copy()
+        if crop.size == 0:
+            return frame
+        # apply a subtle vertical scaling to match mouth opening
+        scale = 1.0 + (ratio - 0.18) * strength
+        ch, cw = crop.shape[:2]
+        new_h = max(1, int(ch * scale))
+        resized = cv2.resize(crop, (cw, new_h), interpolation=cv2.INTER_LINEAR)
+        # place center-aligned
+        y_off = y1 - (new_h - ch)//2
+        y_off = max(0, min(frame.shape[0]-new_h, y_off))
+        # blend resized into frame using feathered mask
+        mask = np.ones((new_h, cw), dtype=np.float32)
+        k = int(max(3, min(cw, new_h) * 0.1))
+        if k % 2 == 0: k += 1
+        mask = cv2.GaussianBlur(mask, (k,k), 0)
+        mask_3 = np.dstack([mask]*3)
+        res = frame.copy()
+        tgt_region = res[y_off:y_off+new_h, x1:x1+cw]
+        if tgt_region.shape[:2] != resized.shape[:2]:
+            resized = cv2.resize(resized, (tgt_region.shape[1], tgt_region.shape[0]))
+            mask_3 = cv2.resize(mask_3, (tgt_region.shape[1], tgt_region.shape[0]))
+        blended = (resized.astype(np.float32)*mask_3 + tgt_region.astype(np.float32)*(1-mask_3)).astype(np.uint8)
+        res[y_off:y_off+blended.shape[0], x1:x1+blended.shape[1]] = blended
+        return res
+    except Exception:
+        return frame
+
+# ----------------- alignment (68-focused + jawline weighting + side scaling) -----------------
 def robust_face_alignment(source_face: Face, target_face: Face, temp_frame: Frame) -> Tuple[Frame, np.ndarray]:
     try:
         source_landmarks = safe_get_landmarks(source_face)
@@ -191,23 +266,41 @@ def robust_face_alignment(source_face: Face, target_face: Face, temp_frame: Fram
         sm_source = smooth_landmarks(source_landmarks, 'source', timestamp)
         if sm_source is None or sm_target is None:
             return temp_frame, np.eye(2, 3, dtype=np.float32)
-        # Prefer up to 68 landmarks if available (more points: jaw + mouth)
         max_k = min(68, len(sm_source), len(sm_target))
         if max_k < 3:
             return temp_frame, np.eye(2, 3, dtype=np.float32)
-        # Choose dense subset prioritizing eyes, nose, mouth, jaw
-        # fallback: take first max_k
-        key_points = list(range(max_k))
-        src_points = np.array([sm_source[i] for i in key_points], dtype=np.float32)
-        dst_points = np.array([sm_target[i] for i in key_points], dtype=np.float32)
-        # If mouth opens widely, include extra mouth emphasis by duplicating mouth points
+        # prioritize: eyes(36-45), nose(27-35), mouth(48-67), jaw(0-16)
+        indices = []
+        # eyes
+        for i in range(36,46):
+            if i < max_k: indices.append(i)
+        # nose
+        for i in range(27,36):
+            if i < max_k: indices.append(i)
+        # mouth
+        for i in range(48,68):
+            if i < max_k: indices.append(i)
+        # jaw (only a few)
+        for i in range(0,9):
+            if i < max_k: indices.append(i)
+        if len(indices) < 3:
+            indices = list(range(max_k))
+        src_points = np.array([sm_source[i] for i in indices], dtype=np.float32)
+        dst_points = np.array([sm_target[i] for i in indices], dtype=np.float32)
+        # side-pose scaling: if yaw large, apply horizontal scale to source points to compensate
+        pitch, yaw, roll = get_face_pose(target_face)
+        yaw_abs = abs(yaw)
+        if yaw_abs > 30 and src_points.shape[0] > 3:
+            # scale X of source toward center to reduce profile collapse
+            cx = np.mean(dst_points[:,0])
+            scale = 1.0 + (yaw_abs - 30)/70.0  # modest scaling
+            src_points[:,0] = cx + (src_points[:,0] - cx) * (1.0/scale)
+        # mouth duplication for better mouth alignment
         try:
             if len(sm_target) >= 67:
-                # indices following 68-landmark mapping (approx): 62 upper inner lip, 66 lower inner lip
-                mouth_open = np.linalg.norm(sm_target[66] - sm_target[62]) > (np.linalg.norm(sm_target[36] - sm_target[45]) * 0.25)
+                mouth_open = mouth_open_ratio(sm_target) > 0.2
                 if mouth_open:
-                    # duplicate mouth points to bias alignment
-                    extra_idx = [62,63,64,65,66]
+                    extra_idx = [60,62,64,66]
                     extra_src = np.array([sm_source[i] for i in extra_idx if i < len(sm_source)], dtype=np.float32)
                     extra_dst = np.array([sm_target[i] for i in extra_idx if i < len(sm_target)], dtype=np.float32)
                     if extra_src.size and extra_dst.size:
@@ -224,43 +317,18 @@ def robust_face_alignment(source_face: Face, target_face: Face, temp_frame: Fram
     except Exception:
         return temp_frame, np.eye(2, 3, dtype=np.float32)
 
-# ----------------- color correction & adaptive mask -----------------
-def fast_color_correction(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+# ----------------- masks & blending -----------------
+def create_adaptive_mask(face: Face, frame_shape: Tuple[int,int]) -> np.ndarray:
     try:
-        if target_face is None or swapped_face is None:
-            return swapped_face
-        x1, y1, x2, y2 = map(int, target_face.bbox)
-        h, w = target_frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        target_region = target_frame[y1:y2, x1:x2]
-        if target_region.size == 0 or swapped_face.size == 0:
-            return swapped_face
-        if swapped_face.shape[:2] != target_region.shape[:2]:
-            swapped_face = cv2.resize(swapped_face, (target_region.shape[1], target_region.shape[0]))
-        swapped_lab = cv2.cvtColor(swapped_face, cv2.COLOR_BGR2LAB)
-        target_lab = cv2.cvtColor(target_region, cv2.COLOR_BGR2LAB)
-        swapped_mean = np.mean(swapped_lab, axis=(0,1)); swapped_std = np.std(swapped_lab, axis=(0,1))
-        target_mean = np.mean(target_lab, axis=(0,1)); target_std = np.std(target_lab, axis=(0,1))
-        swapped_std = np.where(swapped_std == 0, 1, swapped_std)
-        target_std = np.where(target_std == 0, 1, target_std)
-        corrected_lab = np.zeros_like(swapped_lab)
-        for i in range(3):
-            corrected_lab[:,:,i] = (swapped_lab[:,:,i] - swapped_mean[i]) * (target_std[i] / swapped_std[i]) + target_mean[i]
-        corrected_lab = np.clip(corrected_lab, 0, 255).astype(np.uint8)
-        corrected_face = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
-        # slightly increase weight to preserve target luminance
-        result_face = cv2.addWeighted(swapped_face, 0.35, corrected_face, 0.65, 0)
-        return result_face
-    except Exception:
-        return swapped_face
-
-def create_feathered_mask(face: Face, frame_shape: Tuple[int,int]) -> np.ndarray:
-    try:
+        pitch, yaw, roll = get_face_pose(face)
         x1, y1, x2, y2 = map(int, face.bbox)
         w = x2 - x1; h = y2 - y1
         mask = np.zeros(frame_shape[:2], dtype=np.float32)
-        center_x = x1 + w//2; center_y = y1 + h//2
+        # shift ellipse center slightly toward camera-facing side
+        yaw_sign = -1 if yaw < 0 else 1
+        shift = int(w * 0.08 * np.sign(yaw_sign))
+        center_x = int((x1 + x2)//2 + shift*(abs(yaw)/60.0))
+        center_y = int((y1 + y2)//2)
         axes = (int(w*0.55), int(h*0.6))
         cv2.ellipse(mask, (center_x, center_y), axes, 0, 0, 360, 1.0, -1)
         k = int(max(11, min(w,h) * 0.12))
@@ -289,8 +357,7 @@ def seamless_face_blending(swapped_face: Frame, target_frame: Frame, target_face
         try:
             return cv2.seamlessClone(swapped_face, target_frame, mask, center, cv2.NORMAL_CLONE)
         except Exception:
-            # fallback to feathered mask blending
-            maskf = create_feathered_mask(target_face, target_frame.shape)
+            maskf = create_adaptive_mask(target_face, target_frame.shape)
             mask_region = maskf[y1:y2, x1:x2]
             if mask_region.shape != swapped_face.shape[:2]:
                 mask_region = cv2.resize(mask_region, (swapped_face.shape[1], swapped_face.shape[0]))
@@ -303,21 +370,81 @@ def seamless_face_blending(swapped_face: Frame, target_frame: Frame, target_face
     except Exception:
         return target_frame
 
-# ----------------- enhancement -----------------
+# ----------------- color correction & enhance -----------------
+def fast_color_correction(swapped_face: Frame, target_frame: Frame, target_face: Face) -> Frame:
+    try:
+        if target_face is None or swapped_face is None:
+            return swapped_face
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+        h, w = target_frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        target_region = target_frame[y1:y2, x1:x2]
+        if target_region.size == 0 or swapped_face.size == 0:
+            return swapped_face
+        if swapped_face.shape[:2] != target_region.shape[:2]:
+            swapped_face = cv2.resize(swapped_face, (target_region.shape[1], target_region.shape[0]))
+        swapped_lab = cv2.cvtColor(swapped_face, cv2.COLOR_BGR2LAB)
+        target_lab = cv2.cvtColor(target_region, cv2.COLOR_BGR2LAB)
+        swapped_mean = np.mean(swapped_lab, axis=(0,1)); swapped_std = np.std(swapped_lab, axis=(0,1))
+        target_mean = np.mean(target_lab, axis=(0,1)); target_std = np.std(target_lab, axis=(0,1))
+        swapped_std = np.where(swapped_std == 0, 1, swapped_std)
+        target_std = np.where(target_std == 0, 1, target_std)
+        corrected_lab = np.zeros_like(swapped_lab)
+        for i in range(3):
+            corrected_lab[:,:,i] = (swapped_lab[:,:,i] - swapped_mean[i]) * (target_std[i] / swapped_std[i]) + target_mean[i]
+        corrected_lab = np.clip(corrected_lab, 0, 255).astype(np.uint8)
+        corrected_face = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+        result_face = cv2.addWeighted(swapped_face, 0.33, corrected_face, 0.67, 0)
+        return result_face
+    except Exception:
+        return swapped_face
+
 def enhance_face_quality(face: Frame) -> Frame:
     try:
-        kernel = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]]) * 0.18
+        kernel = np.array([[-1,-1,-1],[-1,11,-1],[-1,-1,-1]]) * 0.12
         sharpened = cv2.filter2D(face, -1, kernel)
-        denoised = cv2.bilateralFilter(sharpened, 5, 15, 15)
+        denoised = cv2.bilateralFilter(sharpened, 5, 12, 12)
         return denoised
     except Exception:
         return face
 
-# ----------------- swap core -----------------
+# ----------------- noise reintroduction -----------------
+def reintroduce_noise(face: Frame, strength: float = 0.02) -> Frame:
+    try:
+        if strength <= 0:
+            return face
+        noise = np.random.normal(loc=0.0, scale=25.0*strength, size=face.shape).astype(np.float32)
+        res = face.astype(np.float32) + noise
+        res = np.clip(res, 0, 255).astype(np.uint8)
+        return res
+    except Exception:
+        return face
+
+# ----------------- GFPGAN fidelity scheduler -----------------
+def compute_enhancer_fidelity(face: Face, landmarks: Optional[np.ndarray]) -> float:
+    try:
+        base = GFPGAN_BASE
+        severity = compute_pose_severity(face)
+        mouth_r = mouth_open_ratio(landmarks) if landmarks is not None else 0.0
+        # heuristics: more mouth -> higher fidelity, more profile -> lower fidelity
+        fidelity = base
+        fidelity += min(0.18, mouth_r * 0.8)
+        fidelity -= min(0.25, severity * 0.35)
+        fidelity = float(max(0.45, min(0.95, fidelity)))
+        return fidelity
+    except Exception:
+        return float(base)
+
+# ----------------- swap core (v3) -----------------
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if source_face is None or target_face is None:
         return temp_frame
     adapt_bbox_for_pose(target_face, temp_frame.shape)
+    # mouth-aware prewarp
+    target_lm = safe_get_landmarks(target_face)
+    if target_lm is not None:
+        temp_frame = local_mouth_warp(temp_frame, target_lm, strength=0.8)
     aligned_frame, _ = robust_face_alignment(source_face, target_face, temp_frame)
     try:
         inswapper = get_face_swapper()
@@ -332,8 +459,10 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         return temp_frame
     swapped_frame = fast_color_correction(swapped_frame, temp_frame, target_face)
     swapped_frame = enhance_face_quality(swapped_frame)
+    # slight noise to avoid waxy look
+    swapped_frame = reintroduce_noise(swapped_frame, strength=0.015)
     result = seamless_face_blending(swapped_frame, temp_frame, target_face)
-    # post-enhancer (GFPGAN) if available
+    # post-enhancer (GFPGAN) with fidelity scheduler
     try:
         if get_face_enhancer is not None:
             enhancer = get_face_enhancer()
@@ -346,11 +475,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 with threading.Semaphore():
                     try:
                         _, _, enhanced = enhancer.enhance(crop, paste_back=False)
-                        fidelity = float(getattr(roop.globals, 'face_enhancer_blend', GFPGAN_DEFAULT_FIDELITY))
+                        fidelity = compute_enhancer_fidelity(target_face, target_lm)
                         if enhanced is not None and enhanced.size:
                             if enhanced.shape[:2] != crop.shape[:2]:
                                 enhanced = cv2.resize(enhanced, (crop.shape[1], crop.shape[0]))
                             blended = (enhanced.astype(np.float32)*fidelity + crop.astype(np.float32)*(1.0-fidelity)).astype(np.uint8)
+                            blended = reintroduce_noise(blended, strength=0.008)
                             result[y1:y2, x1:x2] = blended
                     except Exception:
                         pass
