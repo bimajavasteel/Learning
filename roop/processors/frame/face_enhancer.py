@@ -9,34 +9,61 @@ import roop.processors.frame.core
 from roop.core import update_status
 from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
-from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+from roop.utilities import (
+    conditional_download,
+    resolve_relative_path,
+    is_image,
+    is_video
+)
+
+# ==========================
+#  SINGLE WRINKLE MODULE
+# ==========================
+from roop.processors.frame.smart_wrinkle_map import (
+    detect_expression,
+    compute_wrinkle_strength,
+    full_face_wrinkle,
+    apply_expression_wrinkle,
+    apply_smart_wrinkle_map
+)
+
+# ==========================
+#  PERLIN MICRO NOISE
+# ==========================
 from roop.processors.frame.perlin_skin_noise import add_subtle_skin_noise
+
 
 FACE_ENHANCER = None
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
-NAME = 'ROOP.FACE-ENHANCER'
+NAME = "ROOP.FACE-ENHANCER"
 
 
 # ============================================================
-#  LOAD GFPGAN
+# DEVICE
+# ============================================================
+def get_device() -> str:
+    if "CUDAExecutionProvider" in roop.globals.execution_providers:
+        return "cuda"
+    if "CoreMLExecutionProvider" in roop.globals.execution_providers:
+        return "mps"
+    return "cpu"
+
+
+# ============================================================
+# LOAD GFPGAN
 # ============================================================
 def get_face_enhancer() -> Any:
     global FACE_ENHANCER
-
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
-            model_path = resolve_relative_path('../models/GFPGANv1.4.pth')
-            FACE_ENHANCER = GFPGANer(model_path=model_path, upscale=1, device=get_device())
+            model_path = resolve_relative_path("../models/GFPGANv1.4.pth")
+            FACE_ENHANCER = GFPGANer(
+                model_path=model_path,
+                upscale=1,
+                device=get_device()
+            )
     return FACE_ENHANCER
-
-
-def get_device() -> str:
-    if 'CUDAExecutionProvider' in roop.globals.execution_providers:
-        return 'cuda'
-    if 'CoreMLExecutionProvider' in roop.globals.execution_providers:
-        return 'mps'
-    return 'cpu'
 
 
 def clear_face_enhancer() -> None:
@@ -45,14 +72,16 @@ def clear_face_enhancer() -> None:
 
 
 def pre_check() -> bool:
-    download_directory_path = resolve_relative_path('../models')
-    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'])
+    download_directory_path = resolve_relative_path("../models")
+    conditional_download(download_directory_path, [
+        "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth"
+    ])
     return True
 
 
 def pre_start() -> bool:
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status('Select an image or video for target path.', NAME)
+        update_status("Select an image or video for target path.", NAME)
         return False
     return True
 
@@ -62,155 +91,168 @@ def post_process() -> None:
 
 
 # ============================================================
-#  AGE–BASED WRINKLE BOOSTER
+# COLOR-MATCH + ELLIPSE MASK BLENDING
 # ============================================================
-def apply_age_wrinkle_boost(crop: np.ndarray, age: float) -> np.ndarray:
-    """
-    Tambah kerutan berdasarkan umur buffalo_l:
-    - < 40: 0%
-    - 40: 5%
-    - 50+: 10%
-    - interpolasi linear 40–50
-    """
-    try:
-        if crop is None or crop.size == 0:
-            return crop
+def apply_blend_and_color_match(
+    enhanced_crop: np.ndarray,
+    original_crop: np.ndarray,
+    fidelity: float
+) -> np.ndarray:
 
-        # tentukan faktor kerutan
-        if age < 40:
-            factor = 0.0
-        elif 40 <= age < 50:
-            factor = 0.05 + (age - 40) * (0.10 - 0.05) / 10
-        else:
-            factor = 0.10  # maksimum
-
-        if factor <= 0:
-            return crop
-
-        base = crop.astype(np.float32)
-
-        # high-pass filter untuk menarik detail wrinkle
-        blur = cv2.GaussianBlur(base, (0, 0), sigmaX=3)
-        high_pass = cv2.addWeighted(base, 1.0 + factor, blur, -1.0 * factor, 0)
-
-        # sharpening
-        sharpen = cv2.addWeighted(base, 1.0, high_pass, factor, 0)
-
-        # blend natural
-        result = cv2.addWeighted(base, 1.0 - factor, sharpen, factor, 0)
-
-        return np.clip(result, 0, 255).astype(np.uint8)
-
-    except Exception:
-        return crop
-
-
-# ============================================================
-#  BLENDING UTAMA (anti flicker, color-match, anti box)
-# ============================================================
-def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.ndarray, fidelity: float) -> np.ndarray:
-    """
-    Smooth blending dengan color match + ellipse mask anti kotak
-    """
     try:
         h, w = original_crop.shape[:2]
+
         if enhanced_crop.shape[:2] != (h, w):
             enhanced_crop = cv2.resize(enhanced_crop, (w, h))
 
-        # color matching anti flicker
-        original_mean = np.mean(original_crop, axis=(0, 1))
-        enhanced_mean = np.mean(enhanced_crop, axis=(0, 1))
-        color_diff = original_mean - enhanced_mean
+        # Color correction
+        orig_mean = np.mean(original_crop, axis=(0, 1))
+        enh_mean = np.mean(enhanced_crop, axis=(0, 1))
+        diff = orig_mean - enh_mean
 
-        corrected_crop = enhanced_crop.astype(np.float32) + color_diff
-        corrected_crop = np.clip(corrected_crop, 0, 255).astype(np.uint8)
+        corrected = enhanced_crop.astype(np.float32) + diff
+        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
 
-        # fidelity blend
-        blended_expression = cv2.addWeighted(corrected_crop, fidelity, original_crop, 1.0 - fidelity, 0)
+        # Blend
+        blended = cv2.addWeighted(corrected, fidelity, original_crop, 1 - fidelity, 0)
 
-        # ellipse mask
-        mask = np.zeros((h, w), dtype=np.float32)
+        # Anti-box mask
+        mask = np.zeros((h, w), np.float32)
         center = (w // 2, h // 2)
         axes = (int(w * 0.45), int(h * 0.45))
         cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
 
-        blur_radius = int(min(w, h) * 0.1)
-        if blur_radius % 2 == 0:
-            blur_radius += 1
-        mask = cv2.GaussianBlur(mask, (blur_radius, blur_radius), 0)
-        mask_3ch = np.dstack([mask] * 3)
+        br = int(min(w, h) * 0.1)
+        if br % 2 == 0:
+            br += 1
+        mask = cv2.GaussianBlur(mask, (br, br), 0)
+        mask3 = np.dstack([mask] * 3)
 
-        final_result = (blended_expression * mask_3ch + original_crop * (1.0 - mask_3ch)).astype(np.uint8)
-        return final_result
+        out = blended * mask3 + original_crop * (1 - mask3)
+        return out.astype(np.uint8)
 
-    except Exception as e:
-        update_status(f"Error in blending: {e}", NAME)
+    except Exception:
         return original_crop
 
 
 # ============================================================
-#  ENHANCER UTAMA
+# FACE ENHANCER CORE
 # ============================================================
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
-    padding_x = int((end_x - start_x) * 0.2)
-    padding_y = int((end_y - start_y) * 0.2)
 
-    h_frame, w_frame = temp_frame.shape[:2]
-    start_x = max(0, start_x - padding_x)
-    start_y = max(0, start_y - padding_y)
-    end_x = min(w_frame, end_x + padding_x)
-    end_y = min(h_frame, end_y + padding_y)
+    try:
+        # BBOX + padding
+        x1, y1, x2, y2 = map(int, target_face["bbox"])
 
-    temp_face = temp_frame[start_y:end_y, start_x:end_x]
+        pad_x = int((x2 - x1) * 0.2)
+        pad_y = int((y2 - y1) * 0.2)
 
-    if temp_face.size:
+        H, W = temp_frame.shape[:2]
+        x1 = max(0, x1 - pad_x); y1 = max(0, y1 - pad_y)
+        x2 = min(W, x2 + pad_x); y2 = min(H, y2 + pad_y)
+
+        crop = temp_frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return temp_frame
+
+        # ----------------------------------------------------
+        # 1) GFPGAN
+        # ----------------------------------------------------
         with THREAD_SEMAPHORE:
-            _, _, enhanced_face = get_face_enhancer().enhance(
-                temp_face,
-                paste_back=True
-            )
+            try:
+                _, _, enhanced = get_face_enhancer().enhance(crop, paste_back=True)
+            except Exception:
+                enhanced = crop.copy()
 
-        # 🔥 AMBIL UMUR DARI BUFFALO_L
+        # ----------------------------------------------------
+        # 2) BLENDING
+        # ----------------------------------------------------
+        fidelity = getattr(roop.globals, "face_enhancer_blend", 0.6)
+        try:
+            fidelity = float(fidelity)
+        except:
+            fidelity = 0.6
+
+        result = apply_blend_and_color_match(enhanced, crop, fidelity)
+
+        # ----------------------------------------------------
+        # 3) WRINKLE BASELINE (AGE)
+        # ----------------------------------------------------
         age = getattr(target_face, "age", 30)
+        try:
+            age_val = float(age)
+        except:
+            age_val = 30.0
 
-        # 🔥 TAMBAH KERUTAN BERDASARKAN UMUR
-        enhanced_face = apply_age_wrinkle_boost(enhanced_face, age)
+        wrinkle_strength = compute_wrinkle_strength(age_val)
 
-        # blending
-        blend_amount = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.6
-        result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
+        if wrinkle_strength > 0:
+            result = full_face_wrinkle(result, target_face, wrinkle_strength)
 
-        temp_frame[start_y:end_y, start_x:end_x] = result_face
+        # ----------------------------------------------------
+        # 4) WRINKLE BOOSTER (EXPRESSION)
+        # ----------------------------------------------------
+        expression = detect_expression(target_face)
+        result = apply_expression_wrinkle(
+            result, target_face, expression, wrinkle_strength
+        )
 
-    return temp_frame
+        # ----------------------------------------------------
+        # 5) SMART WRINKLE MAP (crow’s feet, nasolabial, forehead, glabella)
+        # ----------------------------------------------------
+        result = apply_smart_wrinkle_map(
+            result, target_face, expression, wrinkle_strength
+        )
+
+        # ----------------------------------------------------
+        # 6) PERLIN MICRO NOISE
+        # ----------------------------------------------------
+        perlin_strength = getattr(roop.globals, "perlin_noise_strength", 0.07)
+        try:
+            perlin_strength = float(perlin_strength)
+        except:
+            perlin_strength = 0.07
+
+        result = add_subtle_skin_noise(result, strength=perlin_strength)
+
+        # paste
+        temp_frame[y1:y2, x1:x2] = result
+        return temp_frame
+
+    except Exception as e:
+        update_status(f"[Enhancer Error] {e}", NAME)
+        return temp_frame
 
 
 # ============================================================
-#  FRAME PIPELINE
+# FRAME PROCESSORS
 # ============================================================
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
-    many_faces = get_many_faces(temp_frame)
-    if many_faces:
-        for target_face in many_faces:
-            temp_frame = enhance_face(target_face, temp_frame)
+    faces = get_many_faces(temp_frame)
+    if faces:
+        for face in faces:
+            temp_frame = enhance_face(face, temp_frame)
     return temp_frame
 
 
 def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-    for temp_frame_path in temp_frame_paths:
-        temp_frame = cv2.imread(temp_frame_path)
-        result = process_frame(None, None, temp_frame)
-        cv2.imwrite(temp_frame_path, result)
+    for fp in temp_frame_paths:
+        frame = cv2.imread(fp)
+        if frame is None:
+            continue
+        out = process_frame(None, None, frame)
+        cv2.imwrite(fp, out)
         if update:
             update()
 
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
-    target_frame = cv2.imread(target_path)
-    result = process_frame(None, None, target_frame)
-    cv2.imwrite(output_path, result)
+    frame = cv2.imread(target_path)
+    out = process_frame(None, None, frame)
+    cv2.imwrite(output_path, out)
 
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
-    roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
+    roop.processors.frame.core.process_video(
+        None, temp_frame_paths, process_frames
+    )
