@@ -7,53 +7,51 @@ def enhance_under_eye_wrinkles(frame, face):
     Fokus hanya pada area bawah mata.
     """
 
+    # Ambil umur dari hasil buffalo_l
     age = getattr(face, "age", None)
     if age is None:
-        return frame  # tidak ada prediksi umur → skip
+        return frame
 
-    # aturan kerutan
-   if age >= 40:
-    return frame  # matikan kerutan  # sudah alami, tidak perlu tambahan
-elif age >= 30:
-    strength = 0.30  # tambah sedikit kerutan di sekitar mata/mulut
-elif age >= 20:
-    strength = 0.40  # tambah kerutan moderat + tekstur kulit
-elif age >= 13:
-    strength = 0.50  # efek penuaan cukup kuat (karena gap besar)
-else:
-    strength = 0.0   # anak-anak, hindari efek tidak wajar
+    # ==============================
+    #  ATURAN BARU SESUAI PERMINTAAN
+    # ==============================
+    if age >= 40:
+        strength = 0.0
+    elif age >= 30:
+        strength = 0.25
+    elif age >= 20:
+        strength = 0.35
+    elif age >= 13:
+        strength = 0.55
+    else:
+        strength = 0.0
 
     if strength <= 0:
         return frame
 
-    # landmark 106 (buffalo_l)
+    # Landmark 106 buffalo_l
     lm = getattr(face, "landmark_2d_106", None)
     if lm is None:
         return frame
 
     lm = np.array(lm)
 
-    # titik bawah mata (landmark)
-    # kiri  :  94, 95, 96, 97, 98
-    # kanan :  101,102,103,104,105
-    under_eye_idx = [94,95,96,97,98, 101,102,103,104,105]
+    # titik bawah mata
+    under_eye_idx = [94, 95, 96, 97, 98, 101, 102, 103, 104, 105]
 
     h, w = frame.shape[:2]
     mask = np.zeros((h, w), np.float32)
 
-    # buat area di bawah mata
+    # Buat area mask di bawah mata
     for idx in under_eye_idx:
         x, y = lm[idx]
         x = int(x)
         y = int(y)
-
-        # area kerutan sedikit di bawah mata
         cv2.circle(mask, (x, y + 5), 9, 1.0, -1)
 
-    # haluskan mask
     mask = cv2.GaussianBlur(mask, (31, 31), 0)
 
-    # buat versi tajam (sharpen) untuk meniru kerutan
+    # kernel "sharpen" untuk menambah tekstur seperti kerutan
     sharp_kernel = np.array([
         [0, -1, 0],
         [-1, 5, -1],
@@ -62,8 +60,8 @@ else:
 
     wrinkled = cv2.filter2D(frame, -1, sharp_kernel)
 
-    # blend proporsional sesuai strength
-    mask3 = np.dstack([mask]*3)
+    # Blend hasil sharpening dengan frame asli
+    mask3 = np.dstack([mask] * 3)
     final = frame * (1 - mask3 * strength) + wrinkled * (mask3 * strength)
     final = np.clip(final, 0, 255).astype(np.uint8)
 
