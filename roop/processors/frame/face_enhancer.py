@@ -124,6 +124,10 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
         blend_amount = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.6
         
         result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
+        from roop.processors.frame.wrinkle_enhancer_v2 import enhance_wrinkles_after_gfpgan
+
+result_face = enhance_wrinkles_after_gfpgan(result_face, target_face)
+
         
         temp_frame[start_y:end_y, start_x:end_x] = result_face
         
