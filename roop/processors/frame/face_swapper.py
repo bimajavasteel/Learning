@@ -214,10 +214,6 @@ def process_frame(
                 continue
 
             temp_frame = swap_face(source_face, target_face, temp_frame)
-
-            # 🔥 Apply wrinkle after swap
-            temp_frame = enhance_under_eye_wrinkles(temp_frame, target_face)
-
         return temp_frame
 
     # SINGLE FACE
