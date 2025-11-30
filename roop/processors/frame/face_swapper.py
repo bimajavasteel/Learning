@@ -19,10 +19,6 @@ from roop.face_analyser import (
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
-
-# 🔥 Tambahan: wrinkle enhancer
-from roop.processors.frame.wrinkle_enhancer import enhance_under_eye_wrinkles
-
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
