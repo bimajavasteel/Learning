@@ -10,6 +10,7 @@ from roop.core import update_status
 from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+from roop.processors.frame.perlin_skin_noise import add_subtle_skin_noise
 
 FACE_ENHANCER = None
 THREAD_SEMAPHORE = threading.Semaphore()
