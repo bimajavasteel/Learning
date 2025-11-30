@@ -34,7 +34,7 @@ def generate_perlin_noise(height, width, scale=32):
 #  APPLY NOISE TO FACE REGION
 # ============================================================
 
-def add_subtle_skin_noise(face_img, strength=0.08):
+def add_subtle_skin_noise(face_img, strength=0.20):
     """
     Tambah efek tekstur kulit:
     - Perlin noise halus
