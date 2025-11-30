@@ -12,14 +12,16 @@ def enhance_under_eye_wrinkles(frame, face):
         return frame  # tidak ada prediksi umur → skip
 
     # aturan kerutan
-    if age >= 40:
-        return frame  # matikan kerutan
-    elif age >= 30:
-        strength = 0.07
-    elif age >= 20:
-        strength = 0.15
-    else:
-        strength = 0.0
+   if age >= 40:
+    strength = 0.0  # sudah alami, tidak perlu tambahan
+elif age >= 30:
+    strength = 0.30  # tambah sedikit kerutan di sekitar mata/mulut
+elif age >= 20:
+    strength = 0.40  # tambah kerutan moderat + tekstur kulit
+elif age >= 13:
+    strength = 0.50  # efek penuaan cukup kuat (karena gap besar)
+else:
+    strength = 0.0   # anak-anak, hindari efek tidak wajar
 
     if strength <= 0:
         return frame
