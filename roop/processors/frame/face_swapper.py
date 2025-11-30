@@ -1,4 +1,4 @@
-#face-swpper support new
+#face-swapper support new
 from typing import Any, List, Callable
 import cv2
 import insightface
@@ -19,18 +19,17 @@ from roop.face_analyser import (
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
 
+# =====================================================================
+#  LOAD MODEL
+# =====================================================================
 def get_face_swapper() -> Any:
-    """
-    Inisialisasi model inswapper.
-    Kalau nanti mau upgrade ke inswapper_256 / CSCS_256, cukup ganti path di sini.
-    """
     global FACE_SWAPPER
-
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
             model_path = resolve_relative_path('../models/inswapper_128.onnx')
@@ -46,10 +45,10 @@ def clear_face_swapper() -> None:
     FACE_SWAPPER = None
 
 
+# =====================================================================
+#  PRE-CHECK
+# =====================================================================
 def pre_check() -> bool:
-    """
-    Pastikan model sudah ke-download sebelum mulai.
-    """
     download_directory_path = resolve_relative_path('../models')
     conditional_download(download_directory_path, [
         'https://huggingface.co/ninjawick/webui-faceswap-unlocked/resolve/main/inswapper_128.onnx'
@@ -58,30 +57,23 @@ def pre_check() -> bool:
 
 
 def pre_start() -> bool:
-    """
-    Validasi path source & target sebelum proses.
-    Sekaligus pastikan source punya wajah yang bisa dianalisis.
-    """
     if not is_image(roop.globals.source_path):
         update_status('Select an image for source path.', NAME)
         return False
 
     source_img = cv2.imread(roop.globals.source_path)
     if not get_one_face(source_img):
-        update_status('No face in source path detected.', NAME)
+        update_status('No face in source image.', NAME)
         return False
 
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status('Select an image or video for target path.', NAME)
+        update_status('Select an image/video for target path.', NAME)
         return False
 
     return True
 
 
 def post_process() -> None:
-    """
-    Bersihkan model & reference setelah selesai.
-    """
     clear_face_swapper()
     clear_face_reference()
 
@@ -89,7 +81,6 @@ def post_process() -> None:
 # =====================================================================
 #  POSE-AWARE BBOX ADJUSTMENT
 # =====================================================================
-
 def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     pitch, yaw, roll = get_face_pose(face)
 
@@ -104,17 +95,14 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     pad_y_bottom = 0.0
 
     if abs(yaw) > 25.0:
-        extra = (abs(yaw) - 25.0) * 0.02
-        extra = min(extra, 0.20)
+        extra = min((abs(yaw) - 25.0) * 0.02, 0.20)
         pad_x = w * extra
 
     if pitch < -15.0:
-        extra = (abs(pitch) - 15.0) * 0.02
-        extra = min(extra, 0.25)
+        extra = min((abs(pitch) - 15.0) * 0.02, 0.25)
         pad_y_top = h * extra
     elif pitch > 20.0:
-        extra = (pitch - 20.0) * 0.015
-        extra = min(extra, 0.18)
+        extra = min((pitch - 20.0) * 0.015, 0.18)
         pad_y_bottom = h * extra
 
     nx1 = int(max(0, x1 - pad_x))
@@ -122,33 +110,34 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     ny1 = int(max(0, y1 - pad_y_top))
     ny2 = int(min(h_frame - 1, y2 + pad_y_bottom))
 
-    if nx2 <= nx1 or ny2 <= ny1:
-        return
-
-    face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
+    if nx2 > nx1 and ny2 > ny1:
+        face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
 
 
 # =====================================================================
-#  CORE SWAP
+#  SWAP FUNCTION
 # =====================================================================
-
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    """
-    Fungsi swap dasar (panggil inswapper).
-    """
     if source_face is None or target_face is None:
         return temp_frame
 
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
-    return get_face_swapper().get(
-        temp_frame,
-        target_face,
-        source_face,
-        paste_back=True
-    )
+    try:
+        return get_face_swapper().get(
+            temp_frame,
+            target_face,
+            source_face,
+            paste_back=True
+        )
+    except Exception as e:
+        update_status(f"Swap error: {e}", NAME)
+        return temp_frame
 
 
+# =====================================================================
+#  SELECT BEST TARGET FACE
+# =====================================================================
 def _select_best_target_by_embedding(
     faces: List[Face],
     reference_face: Face
@@ -163,7 +152,6 @@ def _select_best_target_by_embedding(
     ref_emb = reference_face.normed_embedding
     best_face = None
     best_distance = float('inf')
-
     similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
 
     for f in faces:
@@ -183,9 +171,8 @@ def _select_best_target_by_embedding(
 
 
 # =====================================================================
-#  PROCESS FRAME (WRINKLE ADDED HERE)
+#  PROCESS FRAME (NO WRINKLE HERE ANYMORE)
 # =====================================================================
-
 def process_frame(
     source_face: Face,
     reference_face: Face,
@@ -196,23 +183,22 @@ def process_frame(
     if source_face is None:
         return temp_frame
 
-    # MANY FACES
+    # MULTIPLE FACES MODE
     if roop.globals.many_faces:
         faces = smart_face_tracking(temp_frame, frame_number)
         if not faces:
             faces = get_many_faces(temp_frame)
-
         if not faces:
             return temp_frame
 
         for target_face in faces:
             if detect_occlusion(target_face, temp_frame):
                 continue
-
             temp_frame = swap_face(source_face, target_face, temp_frame)
+
         return temp_frame
 
-    # SINGLE FACE
+    # SINGLE FACE MODE
     tracked_faces = smart_face_tracking(temp_frame, frame_number)
     if not tracked_faces:
         tracked_faces = get_many_faces(temp_frame)
@@ -225,7 +211,6 @@ def process_frame(
         return temp_frame
 
     best_target = None
-
     if reference_face is not None:
         best_target = _select_best_target_by_embedding(valid_faces, reference_face)
 
@@ -234,16 +219,12 @@ def process_frame(
 
     temp_frame = swap_face(source_face, best_target, temp_frame)
 
-    # ⭐ Wrinkle AFTER swap
-    temp_frame = enhance_under_eye_wrinkles(temp_frame, best_target)
-
     return temp_frame
 
 
 # =====================================================================
 #  FRAME LOOP
 # =====================================================================
-
 def process_frames(
     source_path: str,
     temp_frame_paths: List[str],
@@ -252,7 +233,6 @@ def process_frames(
 
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
-
     reference_face = None if roop.globals.many_faces else get_face_reference()
 
     for idx, temp_frame_path in enumerate(temp_frame_paths):
@@ -269,6 +249,9 @@ def process_frames(
             update()
 
 
+# =====================================================================
+#  PROCESS IMAGE
+# =====================================================================
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     source_img = cv2.imread(source_path)
     target_frame = cv2.imread(target_path)
@@ -291,6 +274,9 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
     cv2.imwrite(output_path, result)
 
 
+# =====================================================================
+#  PROCESS VIDEO
+# =====================================================================
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
 
     if not roop.globals.many_faces and not get_face_reference():
