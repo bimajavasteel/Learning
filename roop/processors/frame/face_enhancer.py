@@ -10,6 +10,8 @@ from roop.core import update_status
 from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+
+# import wrinkle enhancer v2 di atas file agar tersedia saat runtime
 from roop.processors.frame.wrinkle_enhancer_v2 import enhance_wrinkles_after_gfpgan
 
 FACE_ENHANCER = None
@@ -125,11 +127,15 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
         blend_amount = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.6
         
         result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
-        from roop.processors.frame.wrinkle_enhancer_v2 import enhance_wrinkles_after_gfpgan
 
-result_face = enhance_wrinkles_after_gfpgan(result_face, target_face)
+        # —————— PANGGIL WRINKLE ENHANCER SETELAH GFPGAN ——————
+        try:
+            # target_face dipass agar enhancer punya landmark & age untuk mask & logic
+            result_face = enhance_wrinkles_after_gfpgan(result_face, target_face)
+        except Exception as e:
+            # jangan crash pipeline jika enhancer error
+            update_status(f"Wrinkle enhancer error: {e}", NAME)
 
-        
         temp_frame[start_y:end_y, start_x:end_x] = result_face
         
     return temp_frame
