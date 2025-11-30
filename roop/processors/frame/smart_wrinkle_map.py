@@ -2,18 +2,163 @@ import cv2
 import numpy as np
 
 # ============================================================
-#  Landmark region helper
+# 1. EXPRESSION DETECTOR
 # ============================================================
 
-def _poly(frame_shape, pts, dilation=3):
+def detect_expression(face) -> str:
     """
-    Membuat polygon mask berdasarkan landmark.
-    pts: list koordinat
-    dilation: memperbesar area agar transisi halus
+    Mendeteksi ekspresi wajah menggunakan landmark 106 buffalo_l.
+    Kategori:
+      - smile
+      - frown
+      - open_mouth
+      - neutral
     """
-    mask = np.zeros(frame_shape[:2], np.float32)
-    hull = cv2.convexHull(np.array(pts).astype(np.int32))
 
+    lm = getattr(face, "landmark_2d_106", None)
+    if lm is None:
+        return "neutral"
+
+    lm = np.array(lm)
+
+    mouth_top = lm[52]
+    mouth_bottom = lm[58]
+    mouth_left = lm[48]
+    mouth_right = lm[54]
+
+    brow_left = lm[19]
+    brow_right = lm[24]
+    brow_center = lm[21]
+
+    # ukur jarak mulut vertical & horizontal
+    mouth_open_dist = abs(mouth_bottom[1] - mouth_top[1])
+    mouth_width = abs(mouth_right[0] - mouth_left[0])
+
+    # frown (kerutan dahi)
+    brow_frown_dist = abs(brow_center[1] - brow_left[1])
+
+    if mouth_open_dist > 6:
+        return "open_mouth"
+    if mouth_width > 40:
+        return "smile"
+    if brow_frown_dist > 5:
+        return "frown"
+
+    return "neutral"
+
+
+# ============================================================
+# 2. BASELINE WRINKLE FROM AGE
+# ============================================================
+
+def compute_wrinkle_strength(age: float) -> float:
+    """
+    Wrinkle strength berdasarkan umur:
+    40+ → tidak ditambah lagi
+    30–39 → 0.25
+    20–29 → 0.35
+    13–19 → 0.55
+    """
+    try:
+        age = float(age)
+    except:
+        return 0.0
+
+    if age >= 40:
+        return 0.0
+    elif age >= 30:
+        return 0.25
+    elif age >= 20:
+        return 0.35
+    elif age >= 13:
+        return 0.55
+    return 0.0
+
+
+def full_face_wrinkle(frame, face, strength: float):
+    """
+    Menambah detail kerutan ke seluruh area wajah (high-pass sharpen).
+    Dipakai sebagai baseline sebelum ekspresi / wrinkle map.
+    """
+
+    if strength <= 0:
+        return frame
+
+    x1, y1, x2, y2 = map(int, face.bbox)
+    H, W = frame.shape[:2]
+
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(W, x2); y2 = min(H, y2)
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return frame
+
+    base = crop.astype(np.float32)
+    blur = cv2.GaussianBlur(base, (0, 0), 3)
+    high = base - blur
+
+    enhanced = base + high * (strength * 1.8)
+    result = cv2.addWeighted(base, 1 - strength, enhanced, strength, 0)
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    frame[y1:y2, x1:x2] = result
+    return frame
+
+
+# ============================================================
+# 3. EXPRESSION WRINKLE (WRINKLE BOOSTER)
+# ============================================================
+
+def apply_expression_wrinkle(frame, face, expression: str, base_strength: float):
+    """
+    Booster kerutan berdasarkan ekspresi:
+      smile       → +30%
+      frown       → +40%
+      open_mouth  → +15%
+      neutral     → +0%
+    """
+
+    if base_strength <= 0:
+        return frame
+
+    if expression == "smile":
+        strength = base_strength * 1.30
+    elif expression == "open_mouth":
+        strength = base_strength * 1.15
+    elif expression == "frown":
+        strength = base_strength * 1.40
+    else:
+        strength = base_strength
+
+    x1, y1, x2, y2 = map(int, face.bbox)
+    H, W = frame.shape[:2]
+
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(W, x2); y2 = min(H, y2)
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return frame
+
+    base = crop.astype(np.float32)
+    blur = cv2.GaussianBlur(base, (0, 0), 3)
+    high = base - blur
+
+    wrinkle = base + high * (strength * 2.0)
+    result = cv2.addWeighted(base, 1 - strength, wrinkle, strength, 0)
+
+    frame[y1:y2, x1:x2] = np.clip(result, 0, 255).astype(np.uint8)
+    return frame
+
+
+# ============================================================
+# 4. SMART WRINKLE MAP (region-aware wrinkles)
+# ============================================================
+
+def _poly_mask(shape, pts, dilation=3):
+    mask = np.zeros(shape[:2], np.float32)
+    hull = cv2.convexHull(np.array(pts).astype(np.int32))
     cv2.fillConvexPoly(mask, hull, 1.0)
 
     if dilation > 0:
@@ -23,94 +168,71 @@ def _poly(frame_shape, pts, dilation=3):
     return mask
 
 
-# ============================================================
-#  Main wrinkle-map builder
-# ============================================================
-
-def build_wrinkle_map(face, frame_shape, expression: str):
-    """
-    Membuat peta area kerutan berdasarkan:
-      - ekspresi (smile, frown, open_mouth, neutral)
-      - landmark 106 buffalo_l
-    """
+def build_wrinkle_map(face, shape, expression: str):
 
     lm = getattr(face, "landmark_2d_106", None)
     if lm is None:
-        return np.zeros(frame_shape[:2], np.float32)
+        return np.zeros(shape[:2], np.float32)
 
     lm = np.array(lm)
-    H, W = frame_shape[:2]
+    H, W = shape[:2]
 
-    wrinkle_mask = np.zeros((H, W), np.float32)
+    mask = np.zeros((H, W), np.float32)
 
-    # ========== REGION DEFINITIONS (berbasis landmark 106) ==========
-    # Crow’s feet (ujung mata)
+    # Crow’s feet
     left_crow = lm[[94, 95, 96, 97]]
     right_crow = lm[[101, 102, 103, 104]]
 
-    # Under eye
-    under_left = lm[[94, 95, 96, 97, 98]]
-    under_right = lm[[101, 102, 103, 104, 105]]
+    # Under-eye
+    under_left = lm[[94,95,96,97,98]]
+    under_right = lm[[101,102,103,104,105]]
 
-    # Nasolabial fold (area pipi senyum)
-    naso_left = lm[[46, 47, 58, 67, 68]]
-    naso_right = lm[[53, 54, 56, 65, 66]]
+    # Nasolabial folds
+    naso_left = lm[[46,47,58,67,68]]
+    naso_right = lm[[53,54,56,65,66]]
 
-    # Smile lines (lip corner)
-    smile_left = lm[[48, 49, 59, 60]]
-    smile_right = lm[[53, 54, 64, 65]]
+    # Smile lines
+    smile_left = lm[[48,49,59,60]]
+    smile_right = lm[[53,54,64,65]]
 
-    # Forehead (atas alis)
-    forehead = lm[[17, 18, 19, 20, 21, 22, 23, 24]] + np.array([0, -25])
+    # Forehead lines
+    forehead = lm[[17,18,19,20,21,22,23,24]] + np.array([0, -25])
 
-    # Glabella (antara alis → frown lines)
-    glabella = lm[[21, 22, 27]] + np.array([0, -10])
+    # Glabella (frown lines)
+    glabella = lm[[21,22,27]] + np.array([0, -10])
 
-    # Chin / under-mouth
-    chin = lm[[57, 58, 59, 60]] + np.array([0, 18])
+    # Chin area
+    chin = lm[[57,58,59,60]] + np.array([0, 18])
 
-    # ============================================================
-    #  EXPRESSION → ACTIVE REGIONS
-    # ============================================================
-
+    # Expression mapping
     if expression == "smile":
-        wrinkle_mask += _poly((H, W), left_crow)
-        wrinkle_mask += _poly((H, W), right_crow)
-        wrinkle_mask += _poly((H, W), naso_left)
-        wrinkle_mask += _poly((H, W), naso_right)
-        wrinkle_mask += _poly((H, W), smile_left)
-        wrinkle_mask += _poly((H, W), smile_right)
-
-    elif expression == "open_mouth":
-        wrinkle_mask += _poly((H, W), chin)
-        wrinkle_mask += _poly((H, W), naso_left)
-        wrinkle_mask += _poly((H, W), naso_right)
+        mask += _poly_mask((H, W), left_crow)
+        mask += _poly_mask((H, W), right_crow)
+        mask += _poly_mask((H, W), naso_left)
+        mask += _poly_mask((H, W), naso_right)
+        mask += _poly_mask((H, W), smile_left)
+        mask += _poly_mask((H, W), smile_right)
 
     elif expression == "frown":
-        wrinkle_mask += _poly((H, W), glabella)
-        wrinkle_mask += _poly((H, W), forehead)
+        mask += _poly_mask((H, W), glabella)
+        mask += _poly_mask((H, W), forehead)
+
+    elif expression == "open_mouth":
+        mask += _poly_mask((H, W), chin)
+        mask += _poly_mask((H, W), naso_left)
+        mask += _poly_mask((H, W), naso_right)
 
     else:  # neutral
-        wrinkle_mask += _poly((H, W), under_left, dilation=2)
-        wrinkle_mask += _poly((H, W), under_right, dilation=2)
+        mask += _poly_mask((H, W), under_left, dilation=2)
+        mask += _poly_mask((H, W), under_right, dilation=2)
 
-    # Normalisasi (0–1)
-    wrinkle_mask = np.clip(wrinkle_mask, 0, 1)
+    mask = np.clip(mask, 0, 1)
+    mask = cv2.GaussianBlur(mask, (49, 49), 0)
 
-    # Halus
-    wrinkle_mask = cv2.GaussianBlur(wrinkle_mask, (49, 49), 0)
+    return mask
 
-    return wrinkle_mask
-
-
-# ============================================================
-#  Apply wrinkle enhancement only on wrinkle map
-# ============================================================
 
 def apply_smart_wrinkle_map(frame, face, expression: str, strength: float):
-    """
-    Menguatkan detail kerutan hanya pada area mask yang sesuai ekspresi.
-    """
 
     if strength <= 0:
         return frame
@@ -132,9 +254,8 @@ def apply_smart_wrinkle_map(frame, face, expression: str, strength: float):
     blur = cv2.GaussianBlur(base, (0, 0), 3)
     high = base - blur
 
-    wrinkled = base + high * (strength * 1.8)
-    blended = base * (1 - mask3) + wrinkled * (mask3 * strength * 1.2)
-    blended = np.clip(blended, 0, 255).astype(np.uint8)
+    detail = base + high * (strength * 1.8)
+    blended = base * (1 - mask3) + detail * (mask3 * strength * 1.2)
 
-    frame[y1:y2, x1:x2] = blended
+    frame[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
     return frame
