@@ -46,10 +46,9 @@ def generate_perlin_noise(h, w, scale=35.0, seed=0):
 
 
 # ================================================================
-#  MASK LOWER EYELID (berbasis landmark 106 buffalo_l)
+#  MASK LOWER EYELID
 # ================================================================
 def build_under_eye_mask(lm, h, w):
-    # koordinat landmark bawah mata (left+right)
     under_idx = [94, 95, 96, 97, 98, 101, 102, 103, 104, 105]
 
     mask = np.zeros((h, w), np.float32)
@@ -60,20 +59,18 @@ def build_under_eye_mask(lm, h, w):
         pts.append([int(x), int(y) + 4])
 
     pts = np.array(pts, dtype=np.int32)
-
-    # fill polygon mengikuti kontur eyelid
     cv2.fillPoly(mask, [pts], 1.0)
-
-    # blur besar supaya natural
     mask = cv2.GaussianBlur(mask, (41, 41), 0)
     return mask
 
 
 # ================================================================
-#  DARK EYE CIRCLES
+#  DARK EYE CIRCLES (ditingkatkan)
 # ================================================================
 def add_dark_eye_circle(frame, mask, strength):
-    darkness = (mask * (strength * 45)).astype(np.float32)
+    dark_multiplier = 70  # sebelumnya 45 → lebih gelap & jelas
+    darkness = (mask * (strength * dark_multiplier)).astype(np.float32)
+
     darkened = frame.astype(np.float32)
     darkened[..., 0] -= darkness
     darkened[..., 1] -= darkness * 0.8
@@ -82,25 +79,16 @@ def add_dark_eye_circle(frame, mask, strength):
 
 
 # ================================================================
-#  MAIN WRINKLE + DARK ENHANCER
+#  MAIN WRINKLE + DARK ENHANCER (FINAL BOOSTED VERSION)
 # ================================================================
 def enhance_wrinkles_after_gfpgan(frame, face):
-    """
-    Versi final:
-    - kerutan Perlin
-    - dark circle
-    - mask akurat lower eyelid (2D106)
-    - bekerja SETELAH GFPGAN
-    - tracking friendly (pakai bbox & landmark face)
-    """
-
     age = getattr(face, "age", None)
     if age is None:
         return frame
 
-    # ==========================================================
-    # LOGIKA UMUR (pakai versi kamu)
-    # ==========================================================
+    # -------------------------------------------------------------
+    # LOGIKA UMUR ASLI (TIDAK DIUBAH)
+    # -------------------------------------------------------------
     if age >= 40:
         strength = 0.0
     elif age >= 30:
@@ -122,29 +110,27 @@ def enhance_wrinkles_after_gfpgan(frame, face):
     lm = np.array(lm)
     h, w = frame.shape[:2]
 
-    # ==========================================================
-    # MASK bawah mata (kontur mengikuti landmark)
-    # ==========================================================
+    # MASK
     mask = build_under_eye_mask(lm, h, w)
     mask3 = np.dstack([mask] * 3)
 
     # ==========================================================
-    # PERLIN NOISE untuk kerutan halus
+    # PERLIN WRINKLE (DIPERKUAT)
     # ==========================================================
-    noise = generate_perlin_noise(h, w, scale=23, seed=int(age*13))
+    noise = generate_perlin_noise(h, w, scale=23, seed=int(age * 13))
     noise = cv2.GaussianBlur(noise, (7, 7), 0)
-    noise = (noise * 255).astype(np.uint8)
-    noise = cv2.cvtColor(noise, cv2.COLOR_GRAY2BGR)
+    noise = cv2.cvtColor((noise * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
 
-    wrinkled = frame.astype(np.float32) + (noise.astype(np.float32) - 128) * (strength * 0.45)
+    wrinkle_strength = strength * 0.85  # dulu 0.45 → sekarang lebih kuat
+    wrinkled = frame.astype(np.float32) + (noise.astype(np.float32) - 128) * wrinkle_strength
 
-    # ==========================================================
-    # Tambahkan DARK EYE CIRCLE natural
-    # ==========================================================
+    # DARK CIRCLE
     darkened = add_dark_eye_circle(wrinkled, mask, strength)
 
     # ==========================================================
-    # Blending halus
+    # FINAL BLEND (lebih tebal & jelas)
     # ==========================================================
-    final = frame * (1 - mask3 * strength) + darkened * (mask3 * strength)
+    blend_strength = strength * 1.35
+    final = frame * (1 - mask3 * blend_strength) + darkened * (mask3 * blend_strength)
+
     return np.clip(final, 0, 255).astype(np.uint8)
