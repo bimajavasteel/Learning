@@ -2,12 +2,12 @@ import cv2
 import numpy as np
 
 # ================================================================
-#  PERLIN NOISE GENERATOR (versi very detailed)
+#  PERLIN NOISE GENERATOR — HARD MODE (lebih kasar & kuat)
 # ================================================================
 def generate_perlin_noise(h, w, scale=3.0, seed=0):
     np.random.seed(seed)
-    gx = np.random.rand(h, w) * 2 - 1
-    gy = np.random.rand(h, w) * 2 - 1
+    gx = np.random.randn(h, w)
+    gy = np.random.randn(h, w)
     grad = np.stack([gx, gy], axis=-1)
 
     y, x = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
@@ -19,7 +19,7 @@ def generate_perlin_noise(h, w, scale=3.0, seed=0):
     y0 = y.astype(int)
     y1 = y0 + 1
 
-    def dot_grid(ix, iy):
+    def dot(ix, iy):
         ix = np.clip(ix, 0, w-1)
         iy = np.clip(iy, 0, h-1)
         g = grad[iy, ix]
@@ -27,12 +27,13 @@ def generate_perlin_noise(h, w, scale=3.0, seed=0):
         dy = y - iy
         return g[...,0] * dx + g[...,1] * dy
 
-    n00 = dot_grid(x0, y0)
-    n10 = dot_grid(x1, y0)
-    n01 = dot_grid(x0, y1)
-    n11 = dot_grid(x1, y1)
+    n00 = dot(x0, y0)
+    n10 = dot(x1, y0)
+    n01 = dot(x0, y1)
+    n11 = dot(x1, y1)
 
-    def smooth(t): return t*t*(3 - 2*t)
+    def smooth(t): return t * t * (3 - 2 * t)
+
     sx = smooth(x - x0)
     sy = smooth(y - y0)
 
@@ -40,57 +41,56 @@ def generate_perlin_noise(h, w, scale=3.0, seed=0):
     nx1 = n01 * (1 - sx) + n11 * sx
     nxy = nx0 * (1 - sy) + nx1 * sy
 
+    # normalisasi
     noise = (nxy - nxy.min()) / (nxy.max() - nxy.min())
     return noise.astype(np.float32)
 
 
 # ================================================================
-#  MASK LOWER EYELID (Gaussian kecil 4px)
+#  MASK BAWAH MATA — SUPER PRECISE (blur 3px)
 # ================================================================
 def build_under_eye_mask(lm, h, w):
-    under_idx = [94, 95, 96, 97, 98, 101, 102, 103, 104, 105]
-
+    under_idx = [94,95,96,97,98,101,102,103,104,105]
     mask = np.zeros((h, w), np.float32)
-    pts = []
 
-    for idx in under_idx:
-        x, y = lm[idx]
-        pts.append([int(x), int(y) + 2])  # lebih presisi
+    pts = []
+    for i in under_idx:
+        x, y = lm[i]
+        pts.append([int(x), int(y) + 1])
 
     pts = np.array(pts, dtype=np.int32)
     cv2.fillPoly(mask, [pts], 1.0)
-
-    # Gaussian kecil 4px agar mask tetap tajam & tidak melebar
-    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    mask = cv2.GaussianBlur(mask, (3, 3), 0)  # 3px super tight
     return mask
 
 
 # ================================================================
-#  DARK CIRCLE BOOST
+#  DARK CIRCLE — HARD MODE
 # ================================================================
 def add_dark_eye_circle(frame, mask, strength):
-    factor = 50
-    darkness = (mask * (strength * factor)).astype(np.float32)
+    # dark factor lebih tinggi
+    factor = 90
+    darkness = mask * (strength * factor)
 
     darkened = frame.astype(np.float32)
-    darkened[..., 0] -= darkness
-    darkened[..., 1] -= darkness * 0.75
-    darkened[..., 2] -= darkness * 0.7
+    darkened[...,0] -= darkness       # blue
+    darkened[...,1] -= darkness * 0.85
+    darkened[...,2] -= darkness * 0.82
     return np.clip(darkened, 0, 255).astype(np.uint8)
 
 
 # ================================================================
-#  MICRO-SHARPEN khusus bawah mata
+#  MICRO-CONTRAST EXTREME
 # ================================================================
-def micro_sharpen(image, mask, amount=1.4):
-    blur = cv2.GaussianBlur(image, (3, 3), 0)
-    sharpened = np.clip(image + (image - blur) * amount, 0, 255).astype(np.uint8)
-    mask3 = np.dstack([mask] * 3)
-    return sharpened * mask3 + image * (1 - mask3)
+def micro_contrast(img, mask, amount=2.0):
+    blur = cv2.GaussianBlur(img, (1,1), 0)
+    mc = np.clip(img + (img - blur) * amount, 0, 255).astype(np.uint8)
+    mask3 = np.dstack([mask]*3)
+    return mc * mask3 + img * (1 - mask3)
 
 
 # ================================================================
-#  MAIN WRINKLE ENHANCER (FINAL REAL DETAIL)
+#  MAIN WRINKLE ENHANCER — HARD MODE
 # ================================================================
 def enhance_wrinkles_after_gfpgan(frame, face):
 
@@ -98,15 +98,14 @@ def enhance_wrinkles_after_gfpgan(frame, face):
     if age is None:
         return frame
 
-    # logika umur asli
     if age >= 40:
-        strength = 0.0
+        strength = 0.00
     elif age >= 30:
-        strength = 0.25
-    elif age >= 20:
         strength = 0.35
+    elif age >= 20:
+        strength = 0.48
     elif age >= 13:
-        strength = 0.55
+        strength = 0.65
     else:
         strength = 0.0
 
@@ -120,26 +119,21 @@ def enhance_wrinkles_after_gfpgan(frame, face):
     lm = np.array(lm)
     h, w = frame.shape[:2]
 
-    # MASK presisi
     mask = build_under_eye_mask(lm, h, w)
-    mask3 = np.dstack([mask] * 3)
+    mask3 = np.dstack([mask]*3)
 
-    # PERLIN ultra-detail
-    noise = generate_perlin_noise(h, w, scale=3, seed=int(age * 5))
-    noise = cv2.GaussianBlur(noise, (3, 3), 0)     # blur 1px (3 kernel)
-    noise = cv2.cvtColor((noise * 255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+    # PERLIN HARD MODE
+    noise = generate_perlin_noise(h, w, 3, seed=int(age*7))
+    noise = cv2.GaussianBlur(noise, (1,1), 0)
+    noise = cv2.cvtColor((noise*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
 
-    wrinkle_strength = strength * 0.9
-    wrinkled = frame.astype(np.float32) + (noise.astype(np.float32) - 128) * wrinkle_strength
+    wr = frame.astype(np.float32) + (noise.astype(np.float32) - 128) * (strength * 1.8)
 
-    # DARK CIRCLE
-    darkened = add_dark_eye_circle(wrinkled, mask, strength)
+    dark = add_dark_eye_circle(wr, mask, strength)
 
-    # MICRO SHARP khusus bawah mata
-    sharp = micro_sharpen(darkened.astype(np.uint8), mask, amount=1.4)
+    sharp = micro_contrast(dark, mask, amount=1.8)
 
-    # FINAL — blending frame asli dikurangi (lebih kuat detail)
-    blend_strength = strength * 1.1
-    final = frame * (1 - mask3 * blend_strength) + sharp * (mask3 * blend_strength)
+    # HARD BLEND (frame asli minim)
+    final = frame * (1 - mask3 * (strength * 0.25)) + sharp * (mask3 * (strength * 1.75))
 
     return np.clip(final, 0, 255).astype(np.uint8)
