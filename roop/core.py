@@ -47,6 +47,10 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int)
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
+    #wrknle add
+    parser.add_argument('--wrinkle-preservation', help='Wrinkle preservation strength (0.0 to 2.0)', default=1.0, type=float)
+    parser.add_argument('--dark-circle-intensity', help='Dark circle intensity (0.0 to 2.0)', default=1.0, type=float)
+    parser.add_argument('--preserve-age-texture', help='Preserve age-appropriate textures', action='store_true')
     
     # 📌 TAMBAHAN BARU: Argument untuk mengatur blending ratio/fidelity
     program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.6)
