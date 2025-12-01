@@ -47,13 +47,15 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int)
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
-    #wrknle add
-    parser.add_argument('--wrinkle-preservation', help='Wrinkle preservation strength (0.0 to 2.0)', default=1.0, type=float)
-    parser.add_argument('--dark-circle-intensity', help='Dark circle intensity (0.0 to 2.0)', default=1.0, type=float)
-    parser.add_argument('--preserve-age-texture', help='Preserve age-appropriate textures', action='store_true')
     
     # 📌 TAMBAHAN BARU: Argument untuk mengatur blending ratio/fidelity
     program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.6)
+    
+    # 🆕 TAMBAHAN BARU: Argument untuk wrinkle preservation
+    program.add_argument('--wrinkle-preservation', help='Wrinkle preservation strength (0.0 to 2.0)', dest='wrinkle_preservation', type=float, default=1.0)
+    program.add_argument('--dark-circle-intensity', help='Dark circle intensity (0.0 to 2.0)', dest='dark_circle_intensity', type=float, default=1.0)
+    program.add_argument('--preserve-age-texture', help='Preserve age-appropriate textures', dest='preserve_age_texture', action='store_true')
+    
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
 
     args = program.parse_args()
@@ -80,10 +82,11 @@ def parse_args() -> None:
     
     # 📌 TAMBAHAN BARU: Simpan nilai blend ke roop.globals
     roop.globals.face_enhancer_blend = args.face_enhancer_blend
-    #wrikle
-    wrinkle_preservation = parsed_args.wrinkle_preservation
-    dark_circle_intensity = parsed_args.dark_circle_intensity
-    preserve_age_texture = parsed_args.preserve_age_texture
+    
+    # 🆕 TAMBAHAN BARU: Simpan nilai wrinkle preservation ke roop.globals
+    roop.globals.wrinkle_preservation = args.wrinkle_preservation
+    roop.globals.dark_circle_intensity = args.dark_circle_intensity
+    roop.globals.preserve_age_texture = args.preserve_age_texture
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
@@ -220,11 +223,8 @@ def destroy() -> None:
 
 
 def run() -> None:
-    # 📌 KOREKSI INDENTASI: Panggil parse_args() hanya sekali dan ter-indentasi
-    args = parse_args()
+    parse_args()
     
-    # Nilai face_enhancer_blend sudah diset di akhir parse_args()
-
     if not pre_check():
         return
     for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
