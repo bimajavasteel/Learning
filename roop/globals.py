@@ -20,7 +20,7 @@ max_memory: Optional[int] = None
 execution_providers: List[str] = []
 execution_threads: Optional[int] = None
 # Tambahkan ini di roop/globals.py
-face_enhancer_blend: float = None
+face_enhancer_blend: Optional[float] = None
 log_level: str = 'error'
 # Tambahkan di roop/globals.py (di bagian variabel global yang sudah ada)
 wrinkle_preservation: float = 1.0  # 0.0 (none) to 2.0 (strong)
