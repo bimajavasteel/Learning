@@ -22,3 +22,7 @@ execution_threads: Optional[int] = None
 # Tambahkan ini di roop/globals.py
 face_enhancer_blend: float = None
 log_level: str = 'error'
+# Tambahkan di roop/globals.py (di bagian variabel global yang sudah ada)
+wrinkle_preservation: float = 1.0  # 0.0 (none) to 2.0 (strong)
+dark_circle_intensity: float = 1.0  # 0.0 to 2.0
+preserve_age_texture: bool = True  # Preserve age-appropriate textures
