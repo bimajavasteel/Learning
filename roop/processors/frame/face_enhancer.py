@@ -11,9 +11,6 @@ from roop.face_analyser import get_many_faces
 from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
-# import wrinkle enhancer v2 di atas file agar tersedia saat runtime
-from roop.processors.frame.wrinkle_enhancer_v2 import enhance_wrinkles_after_gfpgan
-
 FACE_ENHANCER = None
 THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
@@ -103,8 +100,70 @@ def apply_blend_and_color_match(enhanced_crop: np.ndarray, original_crop: np.nda
         return original_crop
 
 
+def enhance_wrinkles_for_face(face_crop: np.ndarray, face: Face) -> np.ndarray:
+    """
+    Fungsi wrinkle enhancement untuk digunakan di enhancer stage
+    (Opsional - untuk yang ingin lebih banyak kontrol)
+    """
+    try:
+        age = getattr(face, "age", None)
+        if age is None or age < 25:
+            return face_crop
+        
+        # Hitung strength berdasarkan usia
+        if age >= 50:
+            strength = 0.6
+        elif age >= 40:
+            strength = 0.5
+        elif age >= 30:
+            strength = 0.4
+        elif age >= 25:
+            strength = 0.3
+        else:
+            return face_crop
+        
+        h, w = face_crop.shape[:2]
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        
+        # Extract details
+        blurred = cv2.GaussianBlur(gray, (0, 0), 2.0)
+        details = cv2.subtract(gray, blurred)
+        
+        # Create under-eye mask
+        mask = np.zeros((h, w), dtype=np.float32)
+        eye_y = h // 3
+        eye_width = w // 4
+        
+        # Left eye area
+        cv2.ellipse(mask, (w//4, eye_y), (eye_width//2, h//8), 
+                   0, 180, 360, 1.0, -1)
+        # Right eye area
+        cv2.ellipse(mask, (3*w//4, eye_y), (eye_width//2, h//8), 
+                   0, 180, 360, 1.0, -1)
+        
+        # Blur mask
+        mask = cv2.GaussianBlur(mask, (15, 15), 5)
+        
+        # Apply dark circles
+        darken_factor = strength * 0.4
+        for c in range(3):
+            face_crop[:,:,c] = face_crop[:,:,c].astype(float) * (1.0 - mask * darken_factor)
+        
+        # Apply wrinkle details
+        mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        details_3ch = cv2.cvtColor(details, cv2.COLOR_GRAY2BGR)
+        
+        enhanced = face_crop.astype(float) + details_3ch * mask_3ch * strength * 0.5
+        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+        
+        return enhanced
+        
+    except Exception:
+        return face_crop
+
+
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    start_x, start_y, end_x, end_y = map(int, target_face['bbox'])
+    start_x, start_y, end_x, end_y = map(int, target_face.bbox)
     padding_x = int((end_x - start_x) * 0.2)
     padding_y = int((end_y - start_y) * 0.2)
     
@@ -128,10 +187,14 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
         
         result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
 
-        # —————— PANGGIL WRINKLE ENHANCER SETELAH GFPGAN ——————
+        # —————— OPTIONAL WRINKLE ENHANCEMENT ——————
+        # Hanya jika wrinkle_enhancer_v2 tersedia
         try:
-            # target_face dipass agar enhancer punya landmark & age untuk mask & logic
+            from roop.processors.frame.wrinkle_enhancer_v2 import enhance_wrinkles_after_gfpgan
             result_face = enhance_wrinkles_after_gfpgan(result_face, target_face)
+        except ImportError:
+            # Jika tidak ada, gunakan fungsi internal
+            result_face = enhance_wrinkles_for_face(result_face, target_face)
         except Exception as e:
             # jangan crash pipeline jika enhancer error
             update_status(f"Wrinkle enhancer error: {e}", NAME)
