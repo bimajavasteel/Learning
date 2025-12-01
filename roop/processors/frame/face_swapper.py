@@ -89,6 +89,225 @@ def post_process() -> None:
 
 
 # =====================================================================
+#  WRINKLE & AGE PRESERVATION FUNCTIONS
+# =====================================================================
+
+def extract_age_from_source(source_face: Face) -> float:
+    """
+    Ekstrak usia dari source face untuk menentukan intensitas wrinkle preservation
+    """
+    age = getattr(source_face, "age", None)
+    
+    if age is None:
+        # Jika age tidak ada, coba prediksi dari gender/features
+        gender = getattr(source_face, "gender", None)
+        if gender is not None:
+            # Estimasi kasar berdasarkan gender (jika ada)
+            return 35.0 if gender == 1 else 30.0  # 1=Male, 0=Female di InsightFace
+        return 30.0  # Default middle age
+    
+    return float(age)
+
+
+def calculate_wrinkle_strength_from_age(age: float) -> float:
+    """
+    Hitung strength berdasarkan usia sumber dengan kurva non-linear
+    """
+    if age >= 60:
+        return 1.2  # Sangat kuat untuk usia lanjut
+    elif age >= 50:
+        return 1.0
+    elif age >= 40:
+        return 0.8
+    elif age >= 30:
+        return 0.6
+    elif age >= 25:
+        return 0.4
+    elif age >= 20:
+        return 0.3
+    elif age >= 15:
+        return 0.15
+    else:
+        return 0.05  # Hampir tidak ada untuk anak-anak
+
+
+def create_age_appropriate_mask(age: float, width: int, height: int) -> np.ndarray:
+    """
+    Buat mask kerutan yang sesuai dengan usia
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    
+    # Area tengah wajah (selalu dapat tekstur)
+    center_x, center_y = width // 2, height // 2
+    face_radius = min(width, height) // 3
+    
+    # Base face ellipse
+    cv2.ellipse(mask, (center_x, center_y), 
+                (face_radius, face_radius), 0, 0, 360, 100, -1)
+    
+    # Tambahan area berdasarkan usia
+    if age >= 40:
+        # Dahi (top third)
+        cv2.ellipse(mask, (center_x, center_y - face_radius//2),
+                   (face_radius//2, face_radius//4), 0, 0, 360, 150, -1)
+        # Garis senyum (bottom sides)
+        left_smile = (center_x - face_radius//2, center_y + face_radius//3)
+        right_smile = (center_x + face_radius//2, center_y + face_radius//3)
+        cv2.circle(mask, left_smile, face_radius//4, 120, -1)
+        cv2.circle(mask, right_smile, face_radius//4, 120, -1)
+    
+    if age >= 30:
+        # Area bawah mata
+        left_eye = (center_x - face_radius//3, center_y - face_radius//6)
+        right_eye = (center_x + face_radius//3, center_y - face_radius//6)
+        cv2.ellipse(mask, left_eye, (face_radius//5, face_radius//8), 
+                   0, 0, 360, 180, -1)
+        cv2.ellipse(mask, right_eye, (face_radius//5, face_radius//8), 
+                   0, 0, 360, 180, -1)
+    
+    # Blur mask untuk transisi smooth
+    blur_size = max(3, min(width, height) // 20)
+    if blur_size % 2 == 0:
+        blur_size += 1
+    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), blur_size//3)
+    
+    return mask
+
+
+def create_under_eye_mask(width: int, height: int, age: float) -> np.ndarray:
+    """
+    Buat mask untuk dark circle berdasarkan usia
+    """
+    mask = np.zeros((height, width), dtype=np.float32)
+    
+    center_x, center_y = width // 2, height // 2
+    eye_spacing = min(width, height) // 4
+    
+    # Posisi mata
+    left_eye_center = (center_x - eye_spacing//2, center_y - height//10)
+    right_eye_center = (center_x + eye_spacing//2, center_y - height//10)
+    
+    # Size based on age (semakin tua, semakin besar area)
+    if age >= 50:
+        eye_width, eye_height = width//6, height//8
+    elif age >= 40:
+        eye_width, eye_height = width//7, height//9
+    elif age >= 30:
+        eye_width, eye_height = width//8, height//10
+    else:
+        eye_width, eye_height = width//10, height//12
+    
+    # Buat elliptical mask untuk bawah mata
+    for eye_center in [left_eye_center, right_eye_center]:
+        # Under-eye area (lower half of ellipse)
+        cv2.ellipse(mask, eye_center, (eye_width, eye_height), 
+                   0, 180, 360, 1.0, -1)
+        
+        # Tambahkan gradien untuk natural look
+        y_start = eye_center[1]
+        for y in range(y_start, min(height, y_start + eye_height)):
+            # Fade out ke bawah
+            fade = 1.0 - (y - y_start) / eye_height
+            if fade > 0:
+                x_start = max(0, eye_center[0] - eye_width)
+                x_end = min(width, eye_center[0] + eye_width)
+                if x_end > x_start:
+                    row = mask[y, x_start:x_end]
+                    mask[y, x_start:x_end] = np.maximum(row, fade * 0.7)
+    
+    # Blur mask
+    blur_size = max(3, min(width, height) // 25)
+    if blur_size % 2 == 0:
+        blur_size += 1
+    mask = cv2.GaussianBlur(mask, (blur_size, blur_size), blur_size//4)
+    
+    return mask
+
+
+def preserve_wrinkle_texture(source_face: Face, target_bbox, frame: Frame, 
+                            strength: float, source_age: float) -> Frame:
+    """
+    Preservasi tekstur kerutan dari sumber ke hasil swap
+    """
+    try:
+        x1, y1, x2, y2 = map(int, target_bbox)
+        h_frame, w_frame = frame.shape[:2]
+        
+        # Validasi bbox
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_frame-1, x2), min(h_frame-1, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return frame
+        
+        # Crop area wajah hasil swap
+        swapped_crop = frame[y1:y2, x1:x2]
+        if swapped_crop.size == 0:
+            return frame
+        
+        h_crop, w_crop = swapped_crop.shape[:2]
+        
+        # 1. Extract high-frequency details (texture/wrinkles)
+        gray = cv2.cvtColor(swapped_crop, cv2.COLOR_BGR2GRAY)
+        
+        # Multi-scale detail extraction
+        blurred_small = cv2.GaussianBlur(gray, (0, 0), 1.0)  # Fine details
+        blurred_medium = cv2.GaussianBlur(gray, (0, 0), 2.5)  # Medium details
+        blurred_large = cv2.GaussianBlur(gray, (0, 0), 4.0)  # Coarse details
+        
+        # Combine details dengan bobot berdasarkan usia
+        if source_age >= 50:
+            # Usia lanjut: lebih banyak coarse details (kerutan dalam)
+            details = (gray - blurred_large) * 0.7 + (gray - blurred_medium) * 0.3
+        elif source_age >= 30:
+            # Dewasa: mix medium dan fine details
+            details = (gray - blurred_medium) * 0.6 + (gray - blurred_small) * 0.4
+        else:
+            # Muda: hanya fine details
+            details = (gray - blurred_small) * 0.8
+        
+        # Amplify details berdasarkan strength
+        details_amplified = details * (1.0 + strength * 3.0)
+        
+        # 2. Create wrinkle mask berdasarkan area wajah
+        wrinkle_mask = create_age_appropriate_mask(source_age, w_crop, h_crop)
+        
+        # 3. Apply dark circles jika usia > 25
+        if source_age > 25:
+            under_eye_mask = create_under_eye_mask(w_crop, h_crop, source_age)
+            # Darken under-eye area
+            darken_factor = min(strength * 0.4, 0.3)
+            for c in range(3):
+                swapped_crop[:,:,c] = swapped_crop[:,:,c].astype(float) * \
+                                     (1.0 - under_eye_mask * darken_factor)
+        
+        # 4. Apply wrinkle details dengan mask
+        details_3ch = cv2.cvtColor(details_amplified, cv2.COLOR_GRAY2BGR)
+        mask_3ch = cv2.cvtColor(wrinkle_mask, cv2.COLOR_GRAY2BGR) / 255.0
+        
+        # Enhanced result
+        enhanced = swapped_crop.astype(float) + details_3ch * mask_3ch * strength
+        
+        # 5. Local contrast enhancement untuk area kerutan
+        if source_age > 30:
+            # CLAHE untuk meningkatkan kontras lokal
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+            enhanced_yuv = cv2.cvtColor(np.clip(enhanced, 0, 255).astype(np.uint8), 
+                                       cv2.COLOR_BGR2YUV)
+            enhanced_yuv[:,:,0] = clahe.apply(enhanced_yuv[:,:,0])
+            enhanced = cv2.cvtColor(enhanced_yuv, cv2.COLOR_YUV2BGR).astype(float)
+        
+        # 6. Apply back to frame
+        frame[y1:y2, x1:x2] = np.clip(enhanced, 0, 255).astype(np.uint8)
+        
+    except Exception as e:
+        # Jika error, return frame asli tanpa modifikasi
+        print(f"Wrinkle preservation error: {e}")
+    
+    return frame
+
+
+# =====================================================================
 #  POSE-AWARE BBOX ADJUSTMENT (ANTI MASKER / ANTI KECIL)
 # =====================================================================
 
@@ -146,26 +365,48 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
 
 
 # =====================================================================
-#  CORE SWAP
+#  CORE SWAP WITH WRINKLE PRESERVATION
 # =====================================================================
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
-    Fungsi swap dasar (panggil inswapper).
-    Dipisah supaya mudah di-mod / patch kalau mau upgrade model.
+    Fungsi swap dasar dengan preservasi tekstur usia sumber
     """
     if source_face is None or target_face is None:
         return temp_frame
 
-    # pose-aware bbox adjust (anti masker / anti wajah kecil)
+    # 1. Dapatkan usia SUMBER
+    source_age = extract_age_from_source(source_face)
+    
+    # 2. Hitung strength berdasarkan usia sumber
+    wrinkle_strength = calculate_wrinkle_strength_from_age(source_age)
+    
+    # 3. Pose-aware bbox adjust
     adapt_bbox_for_pose(target_face, temp_frame.shape)
-
-    return get_face_swapper().get(
+    
+    # 4. Lakukan swap normal
+    swapped_frame = get_face_swapper().get(
         temp_frame,
         target_face,
         source_face,
         paste_back=True
     )
+    
+    # 5. Apply wrinkle preservation/transfer jika usia > 20
+    if source_age > 20 and wrinkle_strength > 0.1:
+        # Apply global wrinkle preservation strength multiplier
+        global_multiplier = getattr(roop.globals, 'wrinkle_preservation', 1.0)
+        final_strength = wrinkle_strength * global_multiplier
+        
+        swapped_frame = preserve_wrinkle_texture(
+            source_face=source_face,
+            target_bbox=target_face.bbox,
+            frame=swapped_frame,
+            strength=final_strength,
+            source_age=source_age
+        )
+    
+    return swapped_frame
 
 
 def _select_best_target_by_embedding(
