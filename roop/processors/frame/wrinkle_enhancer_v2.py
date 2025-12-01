@@ -90,14 +90,23 @@ def micro_contrast(img, mask, amount=2.0):
 
 
 # ================================================================
-#  MAIN WRINKLE ENHANCER — HARD MODE
+#  MAIN WRINKLE ENHANCER — HARD MODE (MODIFIED)
 # ================================================================
-def enhance_wrinkles_after_gfpgan(frame, face):
-
-    age = getattr(face, "age", None)
+def enhance_wrinkles_after_gfpgan(frame, face, source_age=None):
+    """
+    Gunakan source_age jika diberikan (prioritas tinggi)
+    Jika tidak, gunakan age dari face
+    """
+    # Prioritize source_age if provided
+    if source_age is not None:
+        age = source_age
+    else:
+        age = getattr(face, "age", None)
+    
     if age is None:
         return frame
 
+    # Calculate strength based on SOURCE age (not target)
     if age >= 40:
         strength = 0.00
     elif age >= 30:
@@ -122,7 +131,7 @@ def enhance_wrinkles_after_gfpgan(frame, face):
     mask = build_under_eye_mask(lm, h, w)
     mask3 = np.dstack([mask]*3)
 
-    # PERLIN HARD MODE
+    # PERLIN HARD MODE - seed based on source age
     noise = generate_perlin_noise(h, w, 3, seed=int(age*7))
     noise = cv2.GaussianBlur(noise, (1,1), 0)
     noise = cv2.cvtColor((noise*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
