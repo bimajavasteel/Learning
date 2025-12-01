@@ -54,7 +54,6 @@ def parse_args() -> None:
     
     # 📌 TAMBAHAN BARU: Argument untuk mengatur blending ratio/fidelity
     program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.6)
-    
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
 
     args = program.parse_args()
@@ -81,6 +80,10 @@ def parse_args() -> None:
     
     # 📌 TAMBAHAN BARU: Simpan nilai blend ke roop.globals
     roop.globals.face_enhancer_blend = args.face_enhancer_blend
+    #wrikle
+    wrinkle_preservation = parsed_args.wrinkle_preservation
+    dark_circle_intensity = parsed_args.dark_circle_intensity
+    preserve_age_texture = parsed_args.preserve_age_texture
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
