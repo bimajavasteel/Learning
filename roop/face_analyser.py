@@ -434,12 +434,3 @@ def find_similar_face(frame: Frame,
             best_face = face
 
     return best_face
-
-
-def get_face_landmarks(face: Face) -> List[tuple]:
-    
-    if hasattr(face, 'landmark_2d_106'):
-        return face.landmark_2d_106.tolist() if hasattr(face.landmark_2d_106, 'tolist') else face.landmark_2d_106
-    elif hasattr(face, 'kps'):
-        return face.kps.tolist() if hasattr(face.kps, 'tolist') else face.kps
-    return None
