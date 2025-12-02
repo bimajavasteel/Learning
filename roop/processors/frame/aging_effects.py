@@ -338,3 +338,35 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
         # Terapkan ke semua wajah
         many_faces = get_many_faces(temp_frame)
         if many_faces:
+            for target_face in many_faces:
+                temp_frame = apply_aging_effects(target_face, temp_frame)
+    
+    return temp_frame
+
+
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    """
+    Proses semua frame.
+    """
+    for temp_frame_path in temp_frame_paths:
+        temp_frame = cv2.imread(temp_frame_path)
+        result = process_frame(None, None, temp_frame)
+        cv2.imwrite(temp_frame_path, result)
+        if update:
+            update()
+
+
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
+    """
+    Proses mode gambar ke gambar.
+    """
+    target_frame = cv2.imread(target_path)
+    result = process_frame(None, None, target_frame)
+    cv2.imwrite(output_path, result)
+
+
+def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
+    """
+    Proses video.
+    """
+    roop.processors.frame.core.process_video(None, temp_frame_paths, process_frames)
