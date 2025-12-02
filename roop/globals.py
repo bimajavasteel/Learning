@@ -20,3 +20,7 @@ max_memory: Optional[int] = None
 execution_providers: List[str] = []
 execution_threads: Optional[int] = None
 log_level: str = 'error'
+# === Face Enhancer Globals ===
+face_enhancer_blend: float = 0.6
+face_enhancer_strength: float = 1.0
+face_enhancer_sharpen: float = 0.0
