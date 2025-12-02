@@ -19,10 +19,4 @@ output_video_quality: Optional[int] = None
 max_memory: Optional[int] = None
 execution_providers: List[str] = []
 execution_threads: Optional[int] = None
-face_enhancer_blend: float = None
 log_level: str = 'error'
-
-# Age preservation features
-wrinkle_preservation: float = 1.0
-dark_circle_intensity: float = 1.0
-preserve_age_texture: bool = True
