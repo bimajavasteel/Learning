@@ -61,7 +61,6 @@ def get_face_analyser() -> Any:
             )
             FACE_ANALYSER.prepare(ctx_id=0)
             print("✅ [face_analyser] Using buffalo_l (pose + 2d106 + 3d68)")
-            print("✅ [genderage] genderage.onnx loaded (age & gender head from buffalo_l)")
     return FACE_ANALYSER
 
 
@@ -433,12 +432,14 @@ def find_similar_face(frame: Frame,
         if distance < similar_threshold and distance < best_distance:
             best_distance = distance
             best_face = face
-        #mendapatkan tracking untuk aging
+
     return best_face
-    def get_face_landmarks(face: Face) -> List[tuple]:
-    #Dapatkan landmarks wajah dari objek Face.
+
+
+def get_face_landmarks(face: Face) -> List[tuple]:
+    
     if hasattr(face, 'landmark_2d_106'):
         return face.landmark_2d_106.tolist() if hasattr(face.landmark_2d_106, 'tolist') else face.landmark_2d_106
     elif hasattr(face, 'kps'):
         return face.kps.tolist() if hasattr(face.kps, 'tolist') else face.kps
-    return None                      
+    return None
