@@ -3,7 +3,6 @@ import cv2
 import threading
 import numpy as np
 from gfpgan.utils import GFPGANer
-import scipy.ndimage
 
 import roop.globals
 import roop.processors.frame.core
@@ -83,9 +82,8 @@ def apply_wrinkle_effect(target_face: np.ndarray, wrinkle_map: np.ndarray, stren
     wrinkle_mask = wrinkle_normalized * strength
     
     # Aplikasikan efek depth untuk kerutan
-    # Area gelap (kerutan) dibuat lebih gelap, area terang tetap
     for c in range(3):
-        result[:, :, c] = result[:, :, c] * (1 - wrinkle_mask * 0.3)  # Menggelapkan area kerutan
+        result[:, :, c] = result[:, :, c] * (1 - wrinkle_mask * 0.3)
     
     # Tambahkan tekstur halus
     texture_strength = 0.1 * strength
@@ -117,8 +115,8 @@ def apply_dark_circles(target_face: np.ndarray, dark_circle_mask: np.ndarray, in
     # Normalisasi mask
     mask_normalized = dark_circle_mask.astype(np.float32) / 255.0 * intensity
     
-    # Warna untuk dark circles (warna kecoklatan/keunguan)
-    dark_color = np.array([30, 20, 40], dtype=np.float32)  # BGR: sedikit keunguan
+    # Warna untuk dark circles
+    dark_color = np.array([30, 20, 40], dtype=np.float32)
     
     # Terapkan warna gelap berdasarkan mask
     for c in range(3):
@@ -194,12 +192,7 @@ def extract_dark_circle_mask(face_image: np.ndarray) -> np.ndarray:
     # Buat mask untuk area bawah mata
     mask = np.zeros((h, w), dtype=np.uint8)
     
-    # Area bawah mata (sekitar 20-40% dari tinggi wajah)
-    eye_y_start = int(h * 0.25)
-    eye_y_end = int(h * 0.45)
-    eye_x_mid = w // 2
-    
-    # Buat elips untuk area dark circles
+    # Area bawah mata
     left_center = (int(w * 0.35), int(h * 0.35))
     right_center = (int(w * 0.65), int(h * 0.35))
     
@@ -258,11 +251,10 @@ def apply_age_texture_transfer(source_face: np.ndarray, target_face: np.ndarray,
     
     # Terapkan dark circles
     if dark_circle_intensity > 0:
-        # Ambil dark circle mask dari source dan terapkan ke target
         result = apply_dark_circles(result, source_dark_circle_mask, dark_circle_intensity)
     
     # Final blending dengan original untuk kontrol
-    blend_ratio = 0.7  # 70% efek, 30% original
+    blend_ratio = 0.7
     result = cv2.addWeighted(result, blend_ratio, target_face, 1 - blend_ratio, 0)
     
     return result
@@ -331,11 +323,13 @@ def enhance_face(target_face: Face, temp_frame: Frame, source_face_crop: np.ndar
                 paste_back=True
             )
         
-        # 📌 AMBIL NILAI BLEND DARI GLOBAL (0.6 default jika CLI tidak diisi)
+        # Ambil nilai blend dari global
         blend_amount = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.6
         
-        # 📌 TERAPKAN TEKSTUR USIA JIKA ADA SOURCE FACE
-        if source_face_crop is not None and roop.globals.preserve_age_texture:
+        # Terapkan tekstur usia jika ada source face
+        preserve_age = getattr(roop.globals, 'preserve_age_texture', True)
+        
+        if source_face_crop is not None and preserve_age:
             wrinkle_strength = getattr(roop.globals, 'wrinkle_preservation', 1.0)
             dark_circle_strength = getattr(roop.globals, 'dark_circle_intensity', 1.0)
             
@@ -344,7 +338,7 @@ def enhance_face(target_face: Face, temp_frame: Frame, source_face_crop: np.ndar
                 target_face=enhanced_face,
                 wrinkle_preservation=wrinkle_strength,
                 dark_circle_intensity=dark_circle_strength,
-                preserve_age_texture=roop.globals.preserve_age_texture
+                preserve_age_texture=preserve_age
             )
         
         result_face = apply_blend_and_color_match(enhanced_face, temp_face, fidelity=blend_amount)
@@ -358,7 +352,6 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
     many_faces = get_many_faces(temp_frame)
     if many_faces:
         for target_face in many_faces:
-            # Dapatkan crop wajah source jika tersedia
             source_face_crop = None
             if source_face is not None and hasattr(source_face, 'bbox'):
                 s_x1, s_y1, s_x2, s_y2 = map(int, source_face.bbox)
@@ -371,14 +364,12 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
 
 
 def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-    # Baca source image untuk ekstraksi tekstur
     source_img = cv2.imread(source_path) if source_path else None
     source_face_crop = None
     
     if source_img is not None:
         source_faces = get_many_faces(source_img)
         if source_faces:
-            # Ambil wajah pertama dari source
             s_face = source_faces[0]
             s_x1, s_y1, s_x2, s_y2 = map(int, s_face.bbox)
             source_face_crop = source_img[s_y1:s_y2, s_x1:s_x2]
