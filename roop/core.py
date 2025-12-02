@@ -32,7 +32,7 @@ def parse_args() -> None:
     program.add_argument('-s', '--source', help='select an source image', dest='source_path')
     program.add_argument('-t', '--target', help='select an target image or video', dest='target_path')
     program.add_argument('-o', '--output', help='select output file or directory', dest='output_path')
-    program.add_argument('--frame-processor', help='frame processors (choices: face_swapper, face_enhancer, aging_effects)', dest='frame_processor', default=['face_swapper'], nargs='+')
+    program.add_argument('--frame-processor', help='frame processors (choices: face_swapper, face_enhancer, face_aging)', dest='frame_processor', default=['face_swapper'], nargs='+')
     program.add_argument('--keep-fps', help='keep target fps', dest='keep_fps', action='store_true')
     program.add_argument('--keep-frames', help='keep temporary frames', dest='keep_frames', action='store_true')
     program.add_argument('--skip-audio', help='skip target audio', dest='skip_audio', action='store_true')
@@ -48,18 +48,19 @@ def parse_args() -> None:
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
     
-    # Aging Effects Arguments
-    program.add_argument('--wrinkle-intensity', help='wrinkle intensity (0.0 to 1.0)', dest='wrinkle_intensity', type=float, default=0.3)
-    program.add_argument('--dark-circle-intensity', help='dark circle intensity (0.0 to 1.0)', dest='dark_circle_intensity', type=float, default=0.4)
-    program.add_argument('--apply-aging-to-all-faces', help='apply aging effects to all faces', dest='apply_aging_to_all_faces', action='store_true', default=True)
-    program.add_argument('--no-apply-aging-to-all-faces', dest='apply_aging_to_all_faces', action='store_false')
+    # Aging effects arguments - PERBAIKAN NAMA VARIABEL
+    program.add_argument('--wrinkles-intensity', help='Wrinkles intensity (0.0 to 1.0)', dest='wrinkles_intensity', type=float, default=0.0)
+    program.add_argument('--dark-circles-intensity', help='Dark circles intensity (0.0 to 1.0)', dest='dark_circles_intensity', type=float, default=0.0)
+    program.add_argument('--age-pattern', help='Aging pattern (light/moderate/heavy)', dest='age_pattern', 
+                        choices=['light', 'moderate', 'heavy'], default='moderate')
     
-    # Face Enhancer Blend
+    # Face enhancer blend argument
     program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.6)
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
 
     args = program.parse_args()
 
+    # Set values to globals
     roop.globals.source_path = args.source_path
     roop.globals.target_path = args.target_path
     roop.globals.output_path = normalize_output_path(roop.globals.source_path, roop.globals.target_path, args.output_path)
@@ -79,13 +80,14 @@ def parse_args() -> None:
     roop.globals.max_memory = args.max_memory
     roop.globals.execution_providers = decode_execution_providers(args.execution_provider)
     roop.globals.execution_threads = args.execution_threads
-    roop.globals.face_enhancer_blend = args.face_enhancer_blend
     
-    # Aging Effects Parameters
-    roop.globals.wrinkle_intensity = args.wrinkle_intensity
-    roop.globals.dark_circle_intensity = args.dark_circle_intensity
-    roop.globals.apply_aging_to_all_faces = args.apply_aging_to_all_faces
-    roop.globals.aging_enabled = 'aging_effects' in roop.globals.frame_processors
+    # Set aging effects parameters - PERBAIKAN NAMA VARIABEL
+    roop.globals.wrinkles_intensity = args.wrinkles_intensity
+    roop.globals.dark_circles_intensity = args.dark_circles_intensity
+    roop.globals.age_pattern = args.age_pattern
+    
+    # Set face enhancer blend
+    roop.globals.face_enhancer_blend = args.face_enhancer_blend
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
@@ -222,7 +224,7 @@ def destroy() -> None:
 
 
 def run() -> None:
-    parse_args()
+    parse_args()  # Panggil parse_args tanpa return value
     
     if not pre_check():
         return
