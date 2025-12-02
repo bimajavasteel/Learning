@@ -83,9 +83,11 @@ def parse_args() -> None:
     # 📌 TAMBAHAN BARU: Simpan nilai blend ke roop.globals
     roop.globals.face_enhancer_blend = args.face_enhancer_blend
     #wrikle
-    wrinkle_preservation = parsed_args.wrinkle_preservation
-    dark_circle_intensity = parsed_args.dark_circle_intensity
-    preserve_age_texture = parsed_args.preserve_age_texture
+    # wrinkle settings → simpan ke globals
+    roop.globals.wrinkle_preservation = args.wrinkle_preservation
+    roop.globals.dark_circle_intensity = args.dark_circle_intensity
+    roop.globals.preserve_age_texture = args.preserve_age_texture
+
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
