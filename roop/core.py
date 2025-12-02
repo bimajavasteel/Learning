@@ -2,8 +2,10 @@
 
 import os
 import sys
+# single thread doubles cuda performance - needs to be set before torch import
 if any(arg.startswith('--execution-provider') for arg in sys.argv):
     os.environ['OMP_NUM_THREADS'] = '1'
+# reduce tensorflow log level
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import warnings
 from typing import List
@@ -45,14 +47,6 @@ def parse_args() -> None:
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int)
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
-    
-    # wrinkle and dark circle arguments
-    program.add_argument('--wrinkle-preservation', help='Wrinkle preservation strength (0.0 to 2.0)', dest='wrinkle_preservation', default=1.0, type=float)
-    program.add_argument('--dark-circle-intensity', help='Dark circle intensity (0.0 to 2.0)', dest='dark_circle_intensity', default=1.0, type=float)
-    program.add_argument('--preserve-age-texture', help='Preserve age-appropriate textures', dest='preserve_age_texture', action='store_true')
-    
-    # face enhancer blend argument
-    program.add_argument('--face-enhancer-blend', help='blend ratio for face enhancer (0.0 to 1.0)', dest='face_enhancer_blend', type=float, default=0.6)
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
 
     args = program.parse_args()
@@ -76,12 +70,6 @@ def parse_args() -> None:
     roop.globals.max_memory = args.max_memory
     roop.globals.execution_providers = decode_execution_providers(args.execution_provider)
     roop.globals.execution_threads = args.execution_threads
-    
-    roop.globals.face_enhancer_blend = args.face_enhancer_blend
-    
-    roop.globals.wrinkle_preservation = args.wrinkle_preservation
-    roop.globals.dark_circle_intensity = args.dark_circle_intensity
-    roop.globals.preserve_age_texture = args.preserve_age_texture
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
@@ -90,7 +78,7 @@ def encode_execution_providers(execution_providers: List[str]) -> List[str]:
 
 def decode_execution_providers(execution_providers: List[str]) -> List[str]:
     return [provider for provider, encoded_execution_provider in zip(onnxruntime.get_available_providers(), encode_execution_providers(onnxruntime.get_available_providers()))
-             if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
+            if any(execution_provider in encoded_execution_provider for execution_provider in execution_providers)]
 
 
 def suggest_execution_providers() -> List[str]:
@@ -104,18 +92,20 @@ def suggest_execution_threads() -> int:
 
 
 def limit_resources() -> None:
+    # prevent tensorflow memory leak
     gpus = tensorflow.config.experimental.list_physical_devices('GPU')
     for gpu in gpus:
         tensorflow.config.experimental.set_virtual_device_configuration(gpu, [
-             tensorflow.config.experimental.VirtualDeviceConfiguration(memory_limit=1024)
+            tensorflow.config.experimental.VirtualDeviceConfiguration(memory_limit=1024)
         ])
+    # limit memory usage
     if roop.globals.max_memory:
         memory = roop.globals.max_memory * 1024 ** 3
         if platform.system().lower() == 'darwin':
             memory = roop.globals.max_memory * 1024 ** 6
         if platform.system().lower() == 'windows':
             import ctypes
-            kernel32 = ctypes.windll.kernel32
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
             kernel32.SetProcessWorkingSetSize(-1, ctypes.c_size_t(memory), ctypes.c_size_t(memory))
         else:
             import resource
@@ -142,23 +132,28 @@ def start() -> None:
     for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
         if not frame_processor.pre_start():
             return
+    # process image to image
     if has_image_extension(roop.globals.target_path):
         if predict_image(roop.globals.target_path):
             destroy()
         shutil.copy2(roop.globals.target_path, roop.globals.output_path)
+        # process frame
         for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
             update_status('Progressing...', frame_processor.NAME)
             frame_processor.process_image(roop.globals.source_path, roop.globals.output_path, roop.globals.output_path)
             frame_processor.post_process()
+        # validate image
         if is_image(roop.globals.target_path):
             update_status('Processing to image succeed!')
         else:
             update_status('Processing to image failed!')
         return
+    # process image to videos
     if predict_video(roop.globals.target_path):
         destroy()
     update_status('Creating temporary resources...')
     create_temp(roop.globals.target_path)
+    # extract frames
     if roop.globals.keep_fps:
         fps = detect_fps(roop.globals.target_path)
         update_status(f'Extracting frames with {fps} FPS...')
@@ -166,6 +161,7 @@ def start() -> None:
     else:
         update_status('Extracting frames with 30 FPS...')
         extract_frames(roop.globals.target_path)
+    # process frame
     temp_frame_paths = get_temp_frame_paths(roop.globals.target_path)
     if temp_frame_paths:
         for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
@@ -175,6 +171,7 @@ def start() -> None:
     else:
         update_status('Frames not found...')
         return
+    # create video
     if roop.globals.keep_fps:
         fps = detect_fps(roop.globals.target_path)
         update_status(f'Creating video with {fps} FPS...')
@@ -182,6 +179,7 @@ def start() -> None:
     else:
         update_status('Creating video with 30 FPS...')
         create_video(roop.globals.target_path)
+    # handle audio
     if roop.globals.skip_audio:
         move_temp(roop.globals.target_path, roop.globals.output_path)
         update_status('Skipping audio...')
@@ -191,8 +189,10 @@ def start() -> None:
         else:
             update_status('Restoring audio might cause issues as fps are not kept...')
         restore_audio(roop.globals.target_path, roop.globals.output_path)
+    # clean temp
     update_status('Cleaning temporary resources...')
     clean_temp(roop.globals.target_path)
+    # validate video
     if is_video(roop.globals.target_path):
         update_status('Processing to video succeed!')
     else:
@@ -207,7 +207,6 @@ def destroy() -> None:
 
 def run() -> None:
     parse_args()
-    
     if not pre_check():
         return
     for frame_processor in get_frame_processors_modules(roop.globals.frame_processors):
