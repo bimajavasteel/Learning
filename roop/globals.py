@@ -1,5 +1,6 @@
 from typing import List, Optional
 
+# Core parameters
 source_path: Optional[str] = None
 target_path: Optional[str] = None
 output_path: Optional[str] = None
@@ -19,11 +20,14 @@ output_video_quality: Optional[int] = None
 max_memory: Optional[int] = None
 execution_providers: List[str] = []
 execution_threads: Optional[int] = None
-face_enhancer_blend: float = None
-log_level: str = 'error'
 
-# Aging Effects Parameters
-wrinkle_intensity: float = 0.3  # 0.0 (none) to 1.0 (strong)
-dark_circle_intensity: float = 0.4  # 0.0 (none) to 1.0 (strong)
-apply_aging_to_all_faces: bool = True
-aging_enabled: bool = False
+# Face enhancer parameters
+face_enhancer_blend: Optional[float] = None
+
+# Aging effects parameters - PERBAIKAN NAMA VARIABEL
+wrinkles_intensity: float = 0.0  # 0.0 to 1.0
+dark_circles_intensity: float = 0.0  # 0.0 to 1.0
+age_pattern: str = 'moderate'  # 'light', 'moderate', 'heavy'
+
+# Log level
+log_level: str = 'error'
