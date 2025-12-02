@@ -433,5 +433,14 @@ def find_similar_face(frame: Frame,
         if distance < similar_threshold and distance < best_distance:
             best_distance = distance
             best_face = face
-
+        #mendapatkan tracking untuk aging
     return best_face
+    def get_face_landmarks(face: Face) -> List[tuple]:
+    """
+    Dapatkan landmarks wajah dari objek Face.
+    """
+    if hasattr(face, 'landmark_2d_106'):
+        return face.landmark_2d_106.tolist() if hasattr(face.landmark_2d_106, 'tolist') else face.landmark_2d_106
+    elif hasattr(face, 'kps'):
+        return face.kps.tolist() if hasattr(face.kps, 'tolist') else face.kps
+    return None                      
