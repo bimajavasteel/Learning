@@ -99,12 +99,11 @@ def extract_age_features(source_face_img: np.ndarray, target_face_img: np.ndarra
 
 
 def apply_age_preserved_swap(source_face: Face, target_face: Face, temp_frame: Frame, 
-                            source_face_img: np.ndarray = None) -> Frame:
+                            source_img: np.ndarray = None) -> Frame:
     if source_face is None or target_face is None:
         return temp_frame
     
     x1, y1, x2, y2 = map(int, target_face.bbox)
-    target_crop_before = temp_frame[y1:y2, x1:x2].copy()
     
     swapped_frame = get_face_swapper().get(
         temp_frame,
@@ -117,27 +116,35 @@ def apply_age_preserved_swap(source_face: Face, target_face: Face, temp_frame: F
     
     preserve_age = getattr(roop.globals, 'preserve_age_texture', True)
     
-    if (preserve_age and 
-        source_face_img is not None and 
-        target_crop_before.size > 0):
-        
+    if preserve_age and source_img is not None:
         try:
-            from roop.processors.frame.face_enhancer import apply_age_texture_transfer
+            # Ekstrak wajah source dari source image
+            s_x1, s_y1, s_x2, s_y2 = map(int, source_face.bbox)
+            source_face_crop = source_img[s_y1:s_y2, s_x1:s_x2]
             
-            wrinkle_strength = getattr(roop.globals, 'wrinkle_preservation', 1.0)
-            dark_circle_strength = getattr(roop.globals, 'dark_circle_intensity', 1.0)
-            
-            age_adjusted_crop = apply_age_texture_transfer(
-                source_face=source_face_img,
-                target_face=swapped_crop,
-                wrinkle_preservation=wrinkle_strength,
-                dark_circle_intensity=dark_circle_strength,
-                preserve_age_texture=preserve_age
-            )
-            
-            swapped_frame[y1:y2, x1:x2] = age_adjusted_crop
+            if source_face_crop.size > 0 and swapped_crop.size > 0:
+                from roop.processors.frame.face_enhancer import apply_age_texture_transfer
+                
+                wrinkle_strength = getattr(roop.globals, 'wrinkle_preservation', 1.0)
+                dark_circle_strength = getattr(roop.globals, 'dark_circle_intensity', 1.0)
+                
+                # Resize source crop ke ukuran target crop
+                h_target, w_target = swapped_crop.shape[:2]
+                source_face_resized = cv2.resize(source_face_crop, (w_target, h_target))
+                
+                age_adjusted_crop = apply_age_texture_transfer(
+                    source_face=source_face_resized,
+                    target_face=swapped_crop,
+                    wrinkle_preservation=wrinkle_strength,
+                    dark_circle_intensity=dark_circle_strength,
+                    preserve_age_texture=preserve_age
+                )
+                
+                swapped_frame[y1:y2, x1:x2] = age_adjusted_crop
         except ImportError:
             update_status("Warning: Age texture transfer not available", NAME)
+        except Exception as e:
+            update_status(f"Warning: Age preservation error: {str(e)}", NAME)
     
     return swapped_frame
 
@@ -230,16 +237,11 @@ def process_frame(
     source_face: Face,
     reference_face: Face,
     temp_frame: Frame,
-    frame_number: int = 0
+    frame_number: int = 0,
+    source_img: np.ndarray = None
 ) -> Frame:
     if source_face is None:
         return temp_frame
-
-    source_face_crop = None
-    if hasattr(source_face, '_frame'):
-        s_x1, s_y1, s_x2, s_y2 = map(int, source_face.bbox)
-        source_frame = source_face._frame
-        source_face_crop = source_frame[s_y1:s_y2, s_x1:s_x2]
 
     if roop.globals.many_faces:
         faces = smart_face_tracking(temp_frame, frame_number)
@@ -254,12 +256,12 @@ def process_frame(
                 continue
 
             preserve_age = getattr(roop.globals, 'preserve_age_texture', True)
-            if preserve_age and source_face_crop is not None:
+            if preserve_age and source_img is not None:
                 temp_frame = apply_age_preserved_swap(
                     source_face, 
                     target_face, 
                     temp_frame,
-                    source_face_crop
+                    source_img
                 )
             else:
                 temp_frame = swap_face(source_face, target_face, temp_frame)
@@ -286,12 +288,12 @@ def process_frame(
         best_target = valid_faces[0]
 
     preserve_age = getattr(roop.globals, 'preserve_age_texture', True)
-    if preserve_age and source_face_crop is not None:
+    if preserve_age and source_img is not None:
         temp_frame = apply_age_preserved_swap(
             source_face, 
             best_target, 
             temp_frame,
-            source_face_crop
+            source_img
         )
     else:
         temp_frame = swap_face(source_face, best_target, temp_frame)
@@ -307,27 +309,21 @@ def process_frames(
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
     
-    source_face_crop = None
-    if source_face is not None:
-        s_x1, s_y1, s_x2, s_y2 = map(int, source_face.bbox)
-        source_face_crop = source_img[s_y1:s_y2, s_x1:s_x2]
+    if source_face is None:
+        update_status("No face found in source image", NAME)
+        return
 
     reference_face = None if roop.globals.many_faces else get_face_reference()
 
     for idx, temp_frame_path in enumerate(temp_frame_paths):
         temp_frame = cv2.imread(temp_frame_path)
         
-        if getattr(roop.globals, 'preserve_age_texture', True) and source_face_crop is not None:
-            if not hasattr(source_face, '_frame'):
-                source_face._frame = source_img
-            if not hasattr(source_face, '_crop'):
-                source_face._crop = source_face_crop
-        
         result = process_frame(
             source_face=source_face,
             reference_face=reference_face,
             temp_frame=temp_frame,
-            frame_number=idx
+            frame_number=idx,
+            source_img=source_img
         )
         cv2.imwrite(temp_frame_path, result)
 
@@ -352,7 +348,8 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
         source_face=source_face,
         reference_face=reference_face,
         temp_frame=target_frame,
-        frame_number=0
+        frame_number=0,
+        source_img=source_img
     )
     cv2.imwrite(output_path, result)
 
