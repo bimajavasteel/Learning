@@ -19,10 +19,11 @@ output_video_quality: Optional[int] = None
 max_memory: Optional[int] = None
 execution_providers: List[str] = []
 execution_threads: Optional[int] = None
-# Tambahkan ini di roop/globals.py
-face_enhancer_blend: Optional[float] = None
+face_enhancer_blend: float = None
 log_level: str = 'error'
-# Tambahkan di roop/globals.py (di bagian variabel global yang sudah ada)
-wrinkle_preservation: float = 1.0  # 0.0 (none) to 2.0 (strong)
-dark_circle_intensity: float = 1.0  # 0.0 to 2.0
-preserve_age_texture: bool = True  # Preserve age-appropriate textures
+
+# Aging Effects Parameters
+wrinkle_intensity: float = 0.3  # 0.0 (none) to 1.0 (strong)
+dark_circle_intensity: float = 0.4  # 0.0 (none) to 1.0 (strong)
+apply_aging_to_all_faces: bool = True
+aging_enabled: bool = False
