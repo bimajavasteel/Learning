@@ -17,7 +17,7 @@ TEMP_VIDEO_FILE = 'temp.mp4'
 
 
 # ===================================================================
-#  MAC SSL FIX
+#  SSL Fix for MacOS
 # ===================================================================
 if platform.system().lower() == 'darwin':
     ssl._create_default_https_context = ssl._create_unverified_context
@@ -44,69 +44,63 @@ def run_ffmpeg(args: List[str]) -> bool:
 
 
 # ===================================================================
-#  FPS DETECTOR (dipakai core.py)
+#  FPS DETECTOR — required by core.py
 # ===================================================================
 def detect_fps(target_path: str) -> float:
-    command = [
+    cmd = [
         'ffprobe', '-v', 'error',
         '-select_streams', 'v:0',
         '-show_entries', 'stream=r_frame_rate',
         '-of', 'default=nokey=1:noprint_wrappers=1',
         target_path
     ]
-
     try:
-        output = subprocess.check_output(command).decode().strip()
-
-        if output.isdigit():
-            return float(output)
-
-        if "/" in output:
-            num, den = output.split('/')
-            return float(num) / float(den)
-
-        return float(output)
-
+        out = subprocess.check_output(cmd).decode().strip()
+        if out.isdigit():
+            return float(out)
+        if "/" in out:
+            n, d = out.split("/")
+            return float(n) / float(d)
+        return float(out)
     except Exception:
         return 30.0
 
 
 # ===================================================================
-#  PROBE CODEC + GPU DECODER AVAILABILITY
+#  CODEC PROBE + CUVID CHECK
 # ===================================================================
-def probe_codec(target_path: str) -> Optional[str]:
+def probe_codec(path: str) -> Optional[str]:
     cmd = [
-        'ffprobe', '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_name',
-        '-of', 'default=nokey=1:noprint_wrappers=1',
-        target_path
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        path
     ]
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
-        return out if out else None
-    except Exception:
+        return subprocess.check_output(cmd).decode().strip()
+    except:
         return None
 
 
-def is_decoder_available(decoder: str) -> bool:
+def is_decoder_available(name: str) -> bool:
     try:
-        dec = subprocess.check_output(['ffmpeg', '-hide_banner', '-decoders'],
-                                      stderr=subprocess.STDOUT).decode().lower()
-        return decoder.lower() in dec
-    except Exception:
+        dec = subprocess.check_output(["ffmpeg", "-hide_banner", "-decoders"]).decode().lower()
+        return name.lower() in dec
+    except:
         return False
 
 
-def choose_gpu_decoder_for_codec(codec: str) -> Optional[str]:
+def choose_gpu_decoder(codec: str) -> Optional[str]:
     if not codec:
         return None
     codec = codec.lower()
 
-    if codec in ('h264', 'avc1', 'mpeg4'):
-        return 'h264_cuvid'
-    if codec in ('hevc', 'h265'):
-        return 'hevc_cuvid'
+    if codec in ("h264", "avc1", "mpeg4"):
+        return "h264_cuvid"
+
+    if codec in ("hevc", "h265"):
+        return "hevc_cuvid"
 
     return None
 
@@ -124,10 +118,10 @@ def get_temp_output_path(target_path: str) -> str:
 
 
 # ===================================================================
-#  MAIN: GPU FRAME EXTRACTOR + CPU FALLBACK
+#  EXTRACT FRAMES (GPU + HWDOWNLOAD FIX)
 # ===================================================================
 def extract_frames(target_path: str, fps: float = 30.0) -> bool:
-    return extract_frames_gpu(target_path, fps=fps, force_gpu=False)
+    return extract_frames_gpu(target_path, fps, force_gpu=False)
 
 
 def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = False) -> bool:
@@ -135,28 +129,28 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
     Path(temp_dir).mkdir(parents=True, exist_ok=True)
 
     fmt = roop.globals.temp_frame_format
-    q = roop.globals.temp_frame_quality * 31 // 100
+    qv = roop.globals.temp_frame_quality * 31 // 100
 
     codec = probe_codec(target_path)
-    gpu_decoder = choose_gpu_decoder_for_codec(codec)
+    gpu_decoder = choose_gpu_decoder(codec)
 
-    # ===========================================================
-    #  ATTEMPT GPU DECODE (CUVID)
-    # ===========================================================
+    # ---------------------------------------------------------------
+    #  TRY GPU DECODE (CUVID)
+    # ---------------------------------------------------------------
     if gpu_decoder and is_decoder_available(gpu_decoder):
         print(f"[extract_frames_gpu] GPU decode → {gpu_decoder} (codec={codec})")
 
         args = [
-            '-hwaccel', 'cuda',
-            '-hwaccel_output_format', 'cuda',
-            '-c:v', gpu_decoder,
-            '-i', target_path,
-            '-q:v', str(q),
+            "-hwaccel", "cuda",
+            "-hwaccel_output_format", "cuda",
+            "-c:v", gpu_decoder,
+            "-i", target_path,
 
-            # FIX UTAMA → CUDA scale → fps
-            '-vf', f'scale_cuda=format=rgb0,fps={fps}',
+            # HWDOWNLOAD FIX — the ONLY working chain in Kaggle
+            "-vf", f"hwdownload,format=yuv420p,fps={fps}",
 
-            '-pix_fmt', 'rgb24',
+            "-pix_fmt", "rgb24",
+            "-q:v", str(qv),
             os.path.join(temp_dir, f"%04d.{fmt}")
         ]
 
@@ -168,146 +162,138 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
         print("[extract_frames_gpu] GPU decode gagal.")
         if force_gpu:
             raise RuntimeError("FFmpeg gagal memakai GPU decoder.")
-        print("[extract_frames_gpu] fallback ke CPU decode...")
+        print("[extract_frames_gpu] fallback CPU decode...")
 
     else:
-        if force_gpu:
-            raise RuntimeError(f"GPU decoder tak tersedia untuk codec={codec}")
-        print(f"[extract_frames_gpu] GPU decoder tidak tersedia, fallback CPU. (codec={codec})")
+        print(f"[extract_frames_gpu] GPU decoder tidak tersedia (codec={codec}), CPU fallback.")
 
-    # ===========================================================
+    # ---------------------------------------------------------------
     #  CPU FALLBACK
-    # ===========================================================
+    # ---------------------------------------------------------------
     cpu_args = [
-        '-hwaccel', 'auto',
-        '-i', target_path,
-        '-q:v', str(q),
-        '-pix_fmt', 'rgb24',
-        '-vf', f'fps={fps}',
+        "-hwaccel", "auto",
+        "-i", target_path,
+        "-q:v", str(qv),
+        "-pix_fmt", "rgb24",
+        "-vf", f"fps={fps}",
         os.path.join(temp_dir, f"%04d.{fmt}")
     ]
 
     ok = run_ffmpeg(cpu_args)
     if ok:
         print("[extract_frames_gpu] CPU decode sukses.")
-    else:
-        print("[extract_frames_gpu] CPU decode gagal.")
-
     return ok
 
 
 # ===================================================================
-#  CREATE VIDEO
+#  VIDEO CREATION
 # ===================================================================
 def create_video(target_path: str, fps: float = 30.0) -> bool:
     temp_dir = get_temp_directory_path(target_path)
-    temp_out = get_temp_output_path(target_path)
-
+    out = get_temp_output_path(target_path)
     fmt = roop.globals.temp_frame_format
     enc = roop.globals.output_video_encoder
-    q = (roop.globals.output_video_quality + 1) * 51 // 100
+    qv = (roop.globals.output_video_quality + 1) * 51 // 100
 
     args = [
-        '-hwaccel', 'auto',
-        '-r', str(fps),
-        '-i', os.path.join(temp_dir, f"%04d.{fmt}"),
-        '-c:v', enc,
-        '-pix_fmt', 'yuv420p',
-        '-vf', 'colorspace=bt709:iall=bt601-6-625:fast=1'
+        "-hwaccel", "auto",
+        "-r", str(fps),
+        "-i", os.path.join(temp_dir, f"%04d.{fmt}"),
+        "-c:v", enc,
+        "-pix_fmt", "yuv420p",
+        "-vf", "colorspace=bt709:iall=bt601-6-625:fast=1"
     ]
 
-    if enc in ['libx264', 'libx265', 'libvpx']:
-        args.extend(['-crf', str(q)])
-    elif enc in ['h264_nvenc', 'hevc_nvenc']:
-        args.extend(['-cq', str(q)])
+    if enc in ("libx264", "libx265", "libvpx"):
+        args.extend(["-crf", str(qv)])
+    elif enc in ("h264_nvenc", "hevc_nvenc"):
+        args.extend(["-cq", str(qv)])
 
-    args.extend(['-y', temp_out])
+    args.extend(["-y", out])
     return run_ffmpeg(args)
 
 
 # ===================================================================
 #  AUDIO RESTORE
 # ===================================================================
-def restore_audio(target_path: str, output_path: str) -> None:
+def restore_audio(target_path: str, out: str) -> None:
     temp_out = get_temp_output_path(target_path)
 
     ok = run_ffmpeg([
-        '-i', temp_out,
-        '-i', target_path,
-        '-c:v', 'copy',
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-y', output_path
+        "-i", temp_out,
+        "-i", target_path,
+        "-c:v", "copy",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-y", out
     ])
 
     if not ok:
-        move_temp(target_path, output_path)
+        move_temp(target_path, out)
 
 
 # ===================================================================
 #  FRAME PATHS
 # ===================================================================
 def get_temp_frame_paths(target_path: str) -> List[str]:
-    temp_dir = get_temp_directory_path(target_path)
+    temp = get_temp_directory_path(target_path)
     fmt = roop.globals.temp_frame_format
-    return glob.glob(os.path.join(glob.escape(temp_dir), f"*.{fmt}"))
+    return glob.glob(os.path.join(glob.escape(temp), f"*.{fmt}"))
 
 
 # ===================================================================
-#  OUTPUT NORMALIZE
+#  OUTPUT PATH NORMALIZATION
 # ===================================================================
-def normalize_output_path(source_path: str, target_path: str, output_path: str) -> Optional[str]:
-    if source_path and target_path and output_path:
-        src = Path(source_path).stem
-        tgt = Path(target_path).stem
-        ext = Path(target_path).suffix
-
-        if Path(output_path).is_dir():
-            return str(Path(output_path) / f"{src}-{tgt}{ext}")
-
-    return output_path
+def normalize_output_path(src, tgt, out):
+    if src and tgt and out:
+        src_name = Path(src).stem
+        tgt_name = Path(tgt).stem
+        ext = Path(tgt).suffix
+        if Path(out).is_dir():
+            return str(Path(out) / f"{src_name}-{tgt_name}{ext}")
+    return out
 
 
 # ===================================================================
-#  TEMP OPS
+#  TEMP FILE OPS
 # ===================================================================
-def create_temp(target_path: str) -> None:
-    Path(get_temp_directory_path(target_path)).mkdir(parents=True, exist_ok=True)
+def create_temp(path: str) -> None:
+    Path(get_temp_directory_path(path)).mkdir(parents=True, exist_ok=True)
 
 
-def move_temp(target_path: str, output_path: str) -> None:
-    temp_out = Path(get_temp_output_path(target_path))
-    output_path = Path(output_path)
+def move_temp(path: str, out: str) -> None:
+    src = Path(get_temp_output_path(path))
+    out = Path(out)
 
-    if temp_out.exists():
-        if output_path.exists():
-            output_path.unlink()
-        shutil.move(str(temp_out), str(output_path))
+    if src.exists():
+        if out.exists():
+            out.unlink()
+        shutil.move(str(src), str(out))
 
 
-def clean_temp(target_path: str) -> None:
-    temp_dir = Path(get_temp_directory_path(target_path))
-    parent = temp_dir.parent
+def clean_temp(path: str) -> None:
+    temp = Path(get_temp_directory_path(path))
+    parent = temp.parent
 
     try:
-        if not roop.globals.keep_frames and temp_dir.exists():
-            shutil.rmtree(temp_dir)
-    except Exception:
+        if not roop.globals.keep_frames and temp.exists():
+            shutil.rmtree(temp)
+    except:
         pass
 
     try:
         if parent.exists() and not any(parent.iterdir()):
             parent.rmdir()
-    except Exception:
+    except:
         pass
 
 
 # ===================================================================
-#  FILE TYPE CHECK
+#  IMAGE / VIDEO CHECKERS
 # ===================================================================
 def has_image_extension(path: str) -> bool:
     ext = Path(path).suffix.lower()
-    return ext in ('.png', '.jpg', '.jpeg', '.webp')
+    return ext in (".png", ".jpg", ".jpeg", ".webp")
 
 
 def is_image(path: str) -> bool:
@@ -337,9 +323,9 @@ def conditional_download(directory: str, urls: List[str]) -> None:
         if not out_file.exists():
             try:
                 req = urllib.request.urlopen(url)
-                total = int(req.headers.get('Content-Length', 0))
+                total = int(req.headers.get("Content-Length", 0))
 
-                with tqdm(total=total, unit='B', unit_scale=True,
+                with tqdm(total=total, unit="B", unit_scale=True,
                           desc=f"Downloading {out_file.name}") as pb:
                     urllib.request.urlretrieve(
                         url, out_file,
@@ -350,7 +336,7 @@ def conditional_download(directory: str, urls: List[str]) -> None:
 
 
 # ===================================================================
-#  PATH RESOLVER
+#  RESOLVE RELATIVE PATH
 # ===================================================================
 def resolve_relative_path(path: str) -> str:
     return str(Path(__file__).parent.joinpath(path).resolve())
