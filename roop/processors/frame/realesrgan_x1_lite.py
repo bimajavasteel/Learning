@@ -33,17 +33,20 @@ def load_realesrgan_x1():
 
     try:
         # RRDBNet untuk model x1 (tanpa upscale)
-        model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            nf=32,
-            nb=4,
-            gc=16
-        )
+        MODEL = RealESRGANer(
+    scale=1,   # paksa x1
+    model_path=model_path,
+    model=model,
+    tile=0,
+    tile_pad=10,
+    pre_pad=0,
+    half=True
+)
+
 
         MODEL = RealESRGANer(
             scale=1,                                   # x1 model
-            model_path="/kaggle/working/Learning/models/RealESRGAN_x1_lite.pth",
+            model_path="/kaggle/working/Learning/models/realesr-general-x4v3.pth",
             dni_weight=None,
             model=model,
             tile=0,
