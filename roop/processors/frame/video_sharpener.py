@@ -1,64 +1,131 @@
 # ================================================================
-#  video_sharpener.py
-#  - Melakukan Unsharp Mask + High Frequency Boost
-#  - Dipanggil setelah face_swapper, sebelum face_enhancer
+#  video_sharpener.py (UPGRADED + ROOP NOTIFICATION)
 # ================================================================
 
 import cv2
 import numpy as np
+from roop.core import update_status
 
 # ------------------------------------------------
-# 1. Unsharp Mask (stabil, aman untuk wajah)
+# Utility: Variance Laplacian
 # ------------------------------------------------
-def apply_unsharp_mask(frame, strength=1.1, blur_size=3):
+def _lap_var(gray):
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+# ------------------------------------------------
+# Adaptive Unsharp
+# ------------------------------------------------
+def adaptive_unsharp(frame, base_strength=1.0):
     try:
-        blur = cv2.GaussianBlur(frame, (blur_size, blur_size), 0)
-        sharpened = cv2.addWeighted(frame, 1 + strength, blur, -strength, 0)
-        return sharpened
+        blur = cv2.GaussianBlur(frame, (3, 3), 0)
+        detail = cv2.subtract(frame, blur)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        var = cv2.Laplacian(gray, cv2.CV_32F).var()
+
+        adaptive_gain = np.clip(var / 150.0, 0.2, 1.5)
+        strength = base_strength * adaptive_gain
+
+        sharpen = cv2.addWeighted(frame, 1 + strength, blur, -strength, 0)
+        return sharpen
     except Exception as e:
-        print(f"[video_sharpener] Unsharp Mask error: {e}")
+        print(f"[adaptive_unsharp] Error: {e}")
         return frame
 
 
 # ------------------------------------------------
-# 2. High Frequency Boost (detail kecil + pori)
+# Edge-aware Sharpen
 # ------------------------------------------------
-def apply_high_freq_boost(frame, boost=0.35):
+def edge_aware_sharpen(frame, intensity=0.25):
     try:
-        # bilateral menjaga struktur wajah
-        low = cv2.bilateralFilter(frame, 9, 75, 75)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        sobelx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        edge = cv2.magnitude(sobelx, sobely)
+
+        edge_norm = cv2.normalize(edge, None, 0.0, 1.0, cv2.NORM_MINMAX)
+        edge_norm = edge_norm[..., None]
+
+        blur = cv2.GaussianBlur(frame, (3, 3), 0)
+        high = cv2.subtract(frame, blur)
+
+        enhanced = frame + high * (intensity * edge_norm)
+        return np.clip(enhanced, 0, 255).astype(np.uint8)
+    except Exception as e:
+        print(f"[edge_aware_sharpen] Error: {e}")
+        return frame
+
+
+# ------------------------------------------------
+# Noise detection → dynamic scaling
+# ------------------------------------------------
+def smart_noise_gate(frame):
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        v = _lap_var(gray)
+
+        if v > 180:
+            return 0.5
+        if v > 260:
+            return 0.2
+        return 1.0
+    except:
+        return 1.0
+
+
+# ------------------------------------------------
+# High Frequency Boost
+# ------------------------------------------------
+def controlled_hf_boost(frame, boost=0.25):
+    try:
+        low = cv2.bilateralFilter(frame, 9, 50, 50)
         high = cv2.subtract(frame, low)
-        merged = cv2.add(frame, high * boost)
-        return np.clip(merged, 0, 255).astype(np.uint8)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        lap = cv2.Laplacian(gray, cv2.CV_32F)
+        mask = cv2.normalize(np.abs(lap), None, 0.0, 1.0, cv2.NORM_MINMAX)
+        mask = mask[..., None]
+
+        return np.clip(frame + high * boost * mask, 0, 255).astype(np.uint8)
     except Exception as e:
-        print(f"[video_sharpener] HighFreq error: {e}")
+        print(f"[HF_Boost] Error: {e}")
         return frame
 
 
 # ------------------------------------------------
-# 3. Proses utama untuk setiap frame
+# Main pipeline
 # ------------------------------------------------
 def sharpen_frame_pipeline(frame):
-    try:
-        # Step 1: Unsharp Mask
-        frame = apply_unsharp_mask(frame, strength=1.1, blur_size=3)
+    noise_scale = smart_noise_gate(frame)
 
-        # Step 2: High Frequency Boost
-        frame = apply_high_freq_boost(frame, boost=0.35)
+    frame = adaptive_unsharp(frame, base_strength=0.8 * noise_scale)
+    frame = edge_aware_sharpen(frame, intensity=0.25 * noise_scale)
+    frame = controlled_hf_boost(frame, boost=0.25 * noise_scale)
 
-        return frame
-
-    except Exception as e:
-        print(f"[video_sharpener] Pipeline error: {e}")
-        return frame
+    return frame
 
 
 # ------------------------------------------------
-# 4. Hook untuk ROOP (wajib agar bisa dipanggil processor)
+# ROOP Hook + Notification
 # ------------------------------------------------
+frame_count = 0
+total_frames = None
+
 def process_frame(frame, faces=None, **kwargs):
-    """
-    Dipanggil setelah face_swapper dan sebelum face_enhancer.
-    Tidak memakai data wajah karena sharpening berlaku global.
-    """
+    global frame_count, total_frames
+
+    # Set total frames only once
+    if total_frames is None:
+        total_frames = kwargs.get("total_frames", None)
+
+    # Progress notification
+    if total_frames:
+        pct = (frame_count / total_frames) * 100
+        update_status(f"[ROOP.VIDEO-SHARPENER] Processing... {pct:.1f}%")
+
+    frame_count += 1
+
+    # Main process
     return sharpen_frame_pipeline(frame)
