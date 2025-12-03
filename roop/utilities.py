@@ -15,8 +15,9 @@ import roop.globals
 TEMP_DIRECTORY = 'temp'
 TEMP_VIDEO_FILE = 'temp.mp4'
 
+
 # ===================================================================
-#  SSL bypass for MacOS
+#  MAC SSL FIX
 # ===================================================================
 if platform.system().lower() == 'darwin':
     ssl._create_default_https_context = ssl._create_unverified_context
@@ -57,10 +58,10 @@ def detect_fps(target_path: str) -> float:
     try:
         output = subprocess.check_output(command).decode().strip()
 
-        if output.isdigit():   # contoh: "30"
+        if output.isdigit():
             return float(output)
 
-        if "/" in output:      # contoh "30000/1001"
+        if "/" in output:
             num, den = output.split('/')
             return float(num) / float(den)
 
@@ -71,7 +72,7 @@ def detect_fps(target_path: str) -> float:
 
 
 # ===================================================================
-#  CODEC PROBING + GPU DECODER CHECK
+#  PROBE CODEC + GPU DECODER AVAILABILITY
 # ===================================================================
 def probe_codec(target_path: str) -> Optional[str]:
     cmd = [
@@ -123,7 +124,7 @@ def get_temp_output_path(target_path: str) -> str:
 
 
 # ===================================================================
-#  GPU-ACCELERATED FRAME EXTRACTION
+#  MAIN: GPU FRAME EXTRACTOR + CPU FALLBACK
 # ===================================================================
 def extract_frames(target_path: str, fps: float = 30.0) -> bool:
     return extract_frames_gpu(target_path, fps=fps, force_gpu=False)
@@ -139,7 +140,9 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
     codec = probe_codec(target_path)
     gpu_decoder = choose_gpu_decoder_for_codec(codec)
 
-    # ---- GPU DECODER TRY ----
+    # ===========================================================
+    #  ATTEMPT GPU DECODE (CUVID)
+    # ===========================================================
     if gpu_decoder and is_decoder_available(gpu_decoder):
         print(f"[extract_frames_gpu] GPU decode → {gpu_decoder} (codec={codec})")
 
@@ -149,8 +152,11 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
             '-c:v', gpu_decoder,
             '-i', target_path,
             '-q:v', str(q),
+
+            # FIX UTAMA → CUDA scale → fps
+            '-vf', f'scale_cuda=format=rgb0,fps={fps}',
+
             '-pix_fmt', 'rgb24',
-            '-vf', f'fps={fps}',
             os.path.join(temp_dir, f"%04d.{fmt}")
         ]
 
@@ -158,18 +164,20 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
         if ok:
             print("[extract_frames_gpu] sukses GPU decode.")
             return True
-        else:
-            print("[extract_frames_gpu] GPU decode gagal.")
-            if force_gpu:
-                raise RuntimeError("Gagal memakai decoder GPU.")
-            print("[extract_frames_gpu] fallback ke CPU decode...")
+
+        print("[extract_frames_gpu] GPU decode gagal.")
+        if force_gpu:
+            raise RuntimeError("FFmpeg gagal memakai GPU decoder.")
+        print("[extract_frames_gpu] fallback ke CPU decode...")
 
     else:
         if force_gpu:
-            raise RuntimeError(f"GPU decoder tidak tersedia: codec={codec}, candidate={gpu_decoder}")
-        print(f"[extract_frames_gpu] GPU decoder tidak ditemukan, CPU fallback. (codec={codec})")
+            raise RuntimeError(f"GPU decoder tak tersedia untuk codec={codec}")
+        print(f"[extract_frames_gpu] GPU decoder tidak tersedia, fallback CPU. (codec={codec})")
 
-    # ---- CPU DECODER FALLBACK ----
+    # ===========================================================
+    #  CPU FALLBACK
+    # ===========================================================
     cpu_args = [
         '-hwaccel', 'auto',
         '-i', target_path,
@@ -180,7 +188,6 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
     ]
 
     ok = run_ffmpeg(cpu_args)
-
     if ok:
         print("[extract_frames_gpu] CPU decode sukses.")
     else:
@@ -190,7 +197,7 @@ def extract_frames_gpu(target_path: str, fps: float = 30.0, force_gpu: bool = Fa
 
 
 # ===================================================================
-#  VIDEO CREATION
+#  CREATE VIDEO
 # ===================================================================
 def create_video(target_path: str, fps: float = 30.0) -> bool:
     temp_dir = get_temp_directory_path(target_path)
@@ -247,7 +254,7 @@ def get_temp_frame_paths(target_path: str) -> List[str]:
 
 
 # ===================================================================
-#  OUTPUT NORMALIZER
+#  OUTPUT NORMALIZE
 # ===================================================================
 def normalize_output_path(source_path: str, target_path: str, output_path: str) -> Optional[str]:
     if source_path and target_path and output_path:
@@ -296,7 +303,7 @@ def clean_temp(target_path: str) -> None:
 
 
 # ===================================================================
-#  FILE TYPE CHECKERS
+#  FILE TYPE CHECK
 # ===================================================================
 def has_image_extension(path: str) -> bool:
     ext = Path(path).suffix.lower()
