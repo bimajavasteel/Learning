@@ -7,7 +7,9 @@ from queue import Queue
 from types import ModuleType
 from typing import Any, List, Callable
 from tqdm import tqdm
-from roop.processors.frame.video_sharpener import process_frame as sharpen_frame
+#from roop.processors.frame.video_sharpener import process_frame as sharpen_frame
+from roop.processors.frame.video_sharpener import process_frame as sharpener_process
+
 
 import roop
 
