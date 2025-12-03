@@ -1,91 +1,111 @@
 # ================================================================
-#   esrgan_x2_processor.py
-#   RealESRGAN_x2plus video enhancer (2X Super Resolution)
-#   Optimized for Kaggle GPU (CUDA Execution Provider)
+#  esrgan_x2_sharpener.py  (RealESRGAN_x2plus VERSION)
+#
+#  Pipeline: face_swapper → ESRGAN_x2 → face_enhancer
+#
+#  Fitur:
+#  - Auto-download model RealESRGAN_x2plus.pth
+#  - Auto-load sekali saja (global)
+#  - ESRGAN scale X2 → lalu downscale kembali (sharp natural)
+#  - Error handling lengkap
 # ================================================================
 
-import cv2
-import numpy as np
 import os
-import onnxruntime as ort
+import cv2
+import torch
+import numpy as np
 
-from roop.core import update_status
+from roop.utilities import conditional_download, resolve_relative_path
+
 
 # ================================================================
-#   LOAD ESRGAN X2 MODEL (ONNX)
+# 1. Auto Download Model
 # ================================================================
-MODEL_NAME = "RealESRGAN_x2plus.onnx"
-MODEL_URL  = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.3.0/RealESRGAN_x2plus.onnx"
-
+MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+MODEL_NAME = "RealESRGAN_x2plus.pth"
 MODEL_PATH = f"/kaggle/working/{MODEL_NAME}"
 
-# Auto-download model if missing
-if not os.path.exists(MODEL_PATH):
-    import urllib.request
-    print(f"[ESRGAN] Downloading {MODEL_NAME} ...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-    print("[ESRGAN] Download completed.")
-
-# Create ONNX runtime session
-providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-session = ort.InferenceSession(MODEL_PATH, providers=providers)
-
-input_name  = session.get_inputs()[0].name
-output_name = session.get_outputs()[0].name
+def download_model_if_needed():
+    if not os.path.exists(MODEL_PATH):
+        print(f"[ESRGAN_X2] Downloading model... {MODEL_NAME}")
+        conditional_download(MODEL_URL, MODEL_PATH)
+    else:
+        print(f"[ESRGAN_X2] Model already exists.")
 
 
 # ================================================================
-#   ESRGAN INFERRING
+# 2. Load Real-ESRGAN Model
 # ================================================================
-def esrgan_x2(frame):
-    """
-    RealESRGAN_x2plus inference
-    2X upscaling → downscale back to original size
-    """
+RELOADED = False
+upsampler = None
+
+def load_esrgan_x2():
+    global RELOADED, upsampler
+
+    if RELOADED:
+        return upsampler
+
+    from realesrgan import RealESRGANer
+
+    download_model_if_needed()
+
+    # Device detection
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     try:
-        h, w = frame.shape[:2]
-
-        # ----- preprocess -----
-        img = frame.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))              # CHW
-        img = np.expand_dims(img, 0)                   # NCHW
-
-        # ONNX Inference
-        output = session.run([output_name], {input_name: img})[0]
-
-        # ----- postprocess -----
-        out = output[0]
-        out = np.clip(out, 0, 1)
-        out = (out * 255.0).astype(np.uint8)
-        out = np.transpose(out, (1, 2, 0))             # HWC
-
-        # Downscale back to original resolution
-        out = cv2.resize(out, (w, h), interpolation=cv2.INTER_CUBIC)
-
-        return out
+        upsampler = RealESRGANer(
+            scale=2,
+            model_path=MODEL_PATH,
+            dni_weight=None,
+            device=device,
+            tile=0,
+            tile_pad=10,
+            pre_pad=0,
+            half=True if torch.cuda.is_available() else False
+        )
+        RELOADED = True
+        print("[ESRGAN_X2] Model loaded successfully.")
+        return upsampler
 
     except Exception as e:
-        print(f"[ESRGAN_X2] Error: {e}")
+        print(f"[ESRGAN_X2] Failed loading ESRGAN: {e}")
+        return None
+
+
+# ================================================================
+# 3. ESRGAN X2 Processing per-frame
+# ================================================================
+def esrgan_process_frame(frame):
+    global upsampler
+
+    if upsampler is None:
+        upsampler = load_esrgan_x2()
+        if upsampler is None:
+            print("[ESRGAN_X2] ERROR: ESRGAN not loaded, skipping sharpener.")
+            return frame
+
+    try:
+        # Convert BGR→RGB
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # Super-resolution inference (scale=2)
+        output_rgb, _ = upsampler.enhance(img_rgb, outscale=2)
+
+        # Downscale back to original size (sharpening effect)
+        h, w = frame.shape[:2]
+        output_rgb = cv2.resize(output_rgb, (w, h), interpolation=cv2.INTER_AREA)
+
+        # Convert back to BGR
+        output_bgr = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+        return output_bgr
+
+    except Exception as e:
+        print(f"[ESRGAN_X2] Enhance error: {e}")
         return frame
 
 
 # ================================================================
-#   ROOP PIPELINE HOOK
+# 4. ROOP Hook
 # ================================================================
-frame_count = 0
-total_frames = None
-
 def process_frame(frame, faces=None, **kwargs):
-    global frame_count, total_frames
-
-    if total_frames is None:
-        total_frames = kwargs.get("total_frames", None)
-
-    if total_frames:
-        pct = (frame_count / total_frames) * 100
-        update_status(f"[ROOP.ESRGAN-X2] Enhancing... {pct:.1f}%")
-
-    frame_count += 1
-
-    # Run ESRGAN X2
-    return esrgan_x2(frame)
+    return esrgan_process_frame(frame)
