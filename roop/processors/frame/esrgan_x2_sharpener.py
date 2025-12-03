@@ -1,13 +1,14 @@
 # ================================================================
-#  esrgan_x2_sharpener.py  (RealESRGAN_x2plus VERSION)
+#  esrgan_x2_sharpener.py  (RealESRGAN_x2plus — NO DOWNSCALE)
 #
-#  Pipeline: face_swapper → ESRGAN_x2 → face_enhancer
+#  Pipeline:
+#     face_swapper → ESRGAN_x2 (native upscale 2×) → face_enhancer
 #
 #  Fitur:
-#  - Auto-download model RealESRGAN_x2plus.pth
-#  - Auto-load sekali saja (global)
-#  - ESRGAN scale X2 → lalu downscale kembali (sharp natural)
-#  - Error handling lengkap
+#  - Auto-download model
+#  - Auto-load model sekali saja
+#  - Output final 2× dari resolusi asli
+#  - Tidak ada downscale → detail paling tinggi
 # ================================================================
 
 import os
@@ -15,11 +16,11 @@ import cv2
 import torch
 import numpy as np
 
-from roop.utilities import conditional_download, resolve_relative_path
+from roop.utilities import conditional_download
 
 
 # ================================================================
-# 1. Auto Download Model
+# 1. Auto-download model
 # ================================================================
 MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
 MODEL_NAME = "RealESRGAN_x2plus.pth"
@@ -30,17 +31,17 @@ def download_model_if_needed():
         print(f"[ESRGAN_X2] Downloading model... {MODEL_NAME}")
         conditional_download(MODEL_URL, MODEL_PATH)
     else:
-        print(f"[ESRGAN_X2] Model already exists.")
+        print("[ESRGAN_X2] Model already exists.")
 
 
 # ================================================================
-# 2. Load Real-ESRGAN Model
+# 2. Load ESRGAN model
 # ================================================================
-RELOADED = False
 upsampler = None
+RELOADED = False
 
 def load_esrgan_x2():
-    global RELOADED, upsampler
+    global upsampler, RELOADED
 
     if RELOADED:
         return upsampler
@@ -49,7 +50,6 @@ def load_esrgan_x2():
 
     download_model_if_needed()
 
-    # Device detection
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     try:
@@ -68,12 +68,12 @@ def load_esrgan_x2():
         return upsampler
 
     except Exception as e:
-        print(f"[ESRGAN_X2] Failed loading ESRGAN: {e}")
+        print(f"[ESRGAN_X2] Failed to load ESRGAN model: {e}")
         return None
 
 
 # ================================================================
-# 3. ESRGAN X2 Processing per-frame
+# 3. Enhance frame (no downscale)
 # ================================================================
 def esrgan_process_frame(frame):
     global upsampler
@@ -81,22 +81,19 @@ def esrgan_process_frame(frame):
     if upsampler is None:
         upsampler = load_esrgan_x2()
         if upsampler is None:
-            print("[ESRGAN_X2] ERROR: ESRGAN not loaded, skipping sharpener.")
+            print("[ESRGAN_X2] ERROR: Cannot load ESRGAN. Skipping.")
             return frame
 
     try:
-        # Convert BGR→RGB
+        # Convert BGR → RGB
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Super-resolution inference (scale=2)
+        # Native 2× super-resolution (no downscale)
         output_rgb, _ = upsampler.enhance(img_rgb, outscale=2)
-
-        # Downscale back to original size (sharpening effect)
-        h, w = frame.shape[:2]
-        output_rgb = cv2.resize(output_rgb, (w, h), interpolation=cv2.INTER_AREA)
 
         # Convert back to BGR
         output_bgr = cv2.cvtColor(output_rgb, cv2.COLOR_RGB2BGR)
+
         return output_bgr
 
     except Exception as e:
@@ -105,7 +102,7 @@ def esrgan_process_frame(frame):
 
 
 # ================================================================
-# 4. ROOP Hook
+# 4. ROOP hook
 # ================================================================
 def process_frame(frame, faces=None, **kwargs):
     return esrgan_process_frame(frame)
