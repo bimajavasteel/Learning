@@ -1,6 +1,5 @@
 # ================================================================
-#   frame/core.py  —  FINAL VERSION
-#   Dengan integrasi video_sharpener & progress notification penuh
+#   frame/core.py — FINAL (Anti Circular Import)
 # ================================================================
 
 import cv2
@@ -9,7 +8,6 @@ import traceback
 from typing import List, Callable
 
 import roop.globals
-from roop.core import update_status
 from roop.typing import Frame, Face
 from roop.face_analyser import get_many_faces
 from roop.utilities import is_image
@@ -24,7 +22,7 @@ from roop.processors.frame.face_enhancer import process_frame as face_enhancer_p
 
 
 # ================================================================
-#   Processor Order (JANGAN UBAH)
+#   Processor Order
 # ================================================================
 PROCESSORS: List[Callable] = [
     face_swapper_process,
@@ -40,55 +38,45 @@ PROCESSOR_NAMES = [
 
 
 # ================================================================
-#   Helper: Safe processor call
+#   Lazy import update_status (anti circular import)
+# ================================================================
+def _update_status(message: str):
+    from roop.core import update_status   # ← SAFE
+    update_status(message)
+
+
+# ================================================================
+#   Safe processor call
 # ================================================================
 def apply_processor(frame: Frame, faces: List[Face], processor: Callable, processor_name: str,
                     frame_index: int, total_frames: int) -> Frame:
-    """
-    Menjalankan processor dengan error-handling aman.
-    Menyediakan informasi progress untuk video_sharpener.
-    """
     try:
-        # Update status
         percent = (frame_index / total_frames) * 100
-        update_status(f"[{processor_name}] Progressing... {percent:.1f}%")
+        _update_status(f"[{processor_name}] Progressing... {percent:.1f}%")
 
-        # Jalankan processor (semua processor menerima argumen yg sama)
         return processor(frame, faces=faces, total_frames=total_frames)
 
     except Exception as e:
         print(f"[{processor_name}] ERROR pada frame {frame_index}: {e}")
         traceback.print_exc()
-        return frame  # gagal → tetap lanjut tanpa crash
+        return frame
 
 
 # ================================================================
-#   Process a single frame
+#   Process per frame
 # ================================================================
 def process_frame(frame: Frame, frame_index: int, total_frames: int) -> Frame:
-    """
-    Pipeline final:
-      1) Face-analyse → detect faces
-      2) Face-swapper
-      3) Video-sharpener (enhanced)
-      4) Face-enhancer
-    """
-
     if frame is None:
         return frame
 
-    # ------------------------------------------------------------
-    # Analisa wajah
-    # ------------------------------------------------------------
+    # Face Detection
     try:
         faces = get_many_faces(frame)
     except Exception as e:
         print(f"[FACE-ANALYSER] Error pada frame {frame_index}: {e}")
         faces = []
 
-    # ------------------------------------------------------------
-    # Jalankan semua processor berurutan
-    # ------------------------------------------------------------
+    # Processor pipeline
     for processor, name in zip(PROCESSORS, PROCESSOR_NAMES):
         frame = apply_processor(frame, faces, processor, name, frame_index, total_frames)
 
@@ -96,23 +84,18 @@ def process_frame(frame: Frame, frame_index: int, total_frames: int) -> Frame:
 
 
 # ================================================================
-#   Batch / Video Processing Entry
+#   Batch processing (dipanggil dari core.run)
 # ================================================================
 def run_frame_processors(frames: List[Frame]) -> List[Frame]:
-    """
-    Menjalankan pipeline per frame.
-    Dipanggil oleh core.run()
-    """
-
     total = len(frames)
     processed_frames = []
 
-    update_status("⏳ [ROOP.FRAME-PIPELINE] Starting...")
+    _update_status("⏳ [ROOP.FRAME-PIPELINE] Starting...")
 
     for idx, frame in enumerate(frames):
-        processed = process_frame(frame, idx, total)
-        processed_frames.append(processed)
+        out = process_frame(frame, idx, total)
+        processed_frames.append(out)
 
-    update_status("✅ [ROOP.FRAME-PIPELINE] Completed.")
+    _update_status("✅ [ROOP.FRAME-PIPELINE] Completed.")
 
     return processed_frames
