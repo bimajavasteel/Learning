@@ -9,6 +9,7 @@ from typing import Any, List, Callable, Optional
 import cv2
 import numpy as np
 import threading
+NAME = 'ROOP.FACE-SWAPPER'
 
 import roop.globals
 import roop.processors.frame.core
