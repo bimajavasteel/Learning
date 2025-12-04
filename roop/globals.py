@@ -24,3 +24,6 @@ log_level: str = 'error'
 face_enhancer_blend: float = 0.6
 face_enhancer_strength: float = 1.0
 face_enhancer_sharpen: float = 0.0
+# === RealESRGAN Globals ===
+realesrgan_temporal_alpha: float = 0.6   # smoothing default (EMA)
+
