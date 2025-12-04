@@ -18,7 +18,7 @@ from pathlib import Path
 
 import roop.globals
 from roop.utilities import conditional_download, resolve_relative_path
-from roop.core import update_status
+import roop.core as core
 
 NAME = "ROOP.REALESRGAN-X2PLUS"
 THREAD_LOCK = threading.Lock()
