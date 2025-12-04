@@ -10,15 +10,6 @@ from tqdm import tqdm
 
 import roop
 
-# ============================================================
-#  IMPORT REAL-ESRGAN MODULE (NEW)
-# ============================================================
-from roop.processors.frame.realesrgan_upscaler import (
-    pre_check as realesrgan_pre_check,
-    pre_start as realesrgan_pre_start,
-    process_frames as realesrgan_process_frames
-)
-
 FRAME_PROCESSORS_MODULES: List[ModuleType] = []
 FRAME_PROCESSORS_INTERFACE = [
     'pre_check',
@@ -54,9 +45,6 @@ def get_frame_processors_modules(frame_processors: List[str]) -> List[ModuleType
     return FRAME_PROCESSORS_MODULES
 
 
-# ==================================================================
-#  MULTI THREADING (DEFAULT ROOP) — TETAP SAYA PERTAHANKAN
-# ==================================================================
 def multi_process_frame(source_path: str, temp_frame_paths: List[str], process_frames: Callable[[str, List[str], Any], None], update: Callable[[], None]) -> None:
     with ThreadPoolExecutor(max_workers=roop.globals.execution_threads) as executor:
         futures = []
@@ -84,26 +72,11 @@ def pick_queue(queue: Queue[str], queue_per_future: int) -> List[str]:
     return queues
 
 
-# ====================================================================
-#  PROCESS VIDEO (DIPANGGIL OLEH PIPELINE)
-# ====================================================================
 def process_video(source_path: str, frame_paths: list[str], process_frames: Callable[[str, List[str], Any], None]) -> None:
-
-    # =====================================================
-    # NEW: RealESRGAN AUTO PRE-CHECK / DOWNLOAD
-    # =====================================================
-    realesrgan_pre_check()
-
     progress_bar_format = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]'
     total = len(frame_paths)
     with tqdm(total=total, desc='Processing', unit='frame', dynamic_ncols=True, bar_format=progress_bar_format) as progress:
         multi_process_frame(source_path, frame_paths, process_frames, lambda: update_progress(progress))
-
-    # =====================================================
-    # NEW: AFTER ALL FRAME PROCESSORS, RUN RealESRGAN
-    # =====================================================
-    realesrgan_pre_start()
-    realesrgan_process_frames(source_path, frame_paths, lambda: None)
 
 
 def update_progress(progress: Any = None) -> None:
