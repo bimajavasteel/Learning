@@ -50,7 +50,13 @@ def parse_args() -> None:
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
     #enhancer-blend
     program.add_argument('--face-enhancer-blend', help='blending amount for face enhancer', dest='face_enhancer_blend', type=float, default=0.6)
-
+    program.add_argument(
+    '--realesrgan-temporal-alpha',
+    help='temporal smoothing alpha for RealESRGAN (0.0 - 1.0)',
+    dest='realesrgan_temporal_alpha',
+    type=float,
+    default=0.6
+)
 
     args = program.parse_args()
 
@@ -75,6 +81,9 @@ def parse_args() -> None:
     roop.globals.execution_threads = args.execution_threads
     #enhancer-blend
     roop.globals.face_enhancer_blend = args.face_enhancer_blend
+    # RealESRGAN temporal stabilizer
+    roop.globals.realesrgan_temporal_alpha = args.realesrgan_temporal_alpha
+
 
 
 
