@@ -3,6 +3,7 @@ from typing import Any, Optional, List
 import threading
 from collections import deque
 from scipy.spatial.distance import cosine
+from roop.hand_occlusion import get_hand_mask
 
 import insightface
 import numpy as np
