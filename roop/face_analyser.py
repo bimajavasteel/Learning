@@ -1,6 +1,9 @@
 # ================================================================
-#   FACE ANALYSER — FULL REPLACEMENT
-#   (Face Parsing ResNet34 + FaceFusion-style Occlusion)
+#   FACE ANALYSER — FINAL FULL VERSION (FIXED)
+#   - Face Parsing ResNet34 (CelebAMaskHQ)
+#   - No occluder.onnx
+#   - FaceFusion-style occlusion
+#   - Compatible with your face_swapper
 # ================================================================
 
 from typing import Any, Optional, List
@@ -34,53 +37,63 @@ MAX_TRACK_GAP = 10
 MAX_TRACK_AGE = 15
 MIN_EMBED_SIMILARITY = 0.70
 
-# ================================================================
-#   FACE PARSING MODEL (ResNet34)
-# ================================================================
+# ===========================
+#   FACE PARSING GLOBALS
+# ===========================
 
 PARSING_SESSION = None
 PARSING_INPUT = None
 
 
+# ================================================================
+#   LOAD FACE PARSING MODEL (FIXED)
+# ================================================================
+
 def get_face_parsing_session():
     """
-    Auto-download + load ResNet34 Face Parsing model.
+    Load ResNet34 Face Parsing model.
+    Auto-download if missing.
+    FIXED version (no rename_map).
     """
     global PARSING_SESSION, PARSING_INPUT
     if PARSING_SESSION is not None:
         return PARSING_SESSION
 
-    # -----------------------------
-    # Auto-download model
-    # -----------------------------
     model_dir = resolve_relative_path("../models")
-    model_path = os.path.join(model_dir, "face_parsing_resnet34.onnx")
+    downloaded_path = os.path.join(model_dir, "resnet34.onnx")
+    final_path = os.path.join(model_dir, "face_parsing_resnet34.onnx")
 
+    # Step 1 — Download original name
     conditional_download(
         model_dir,
         [
             "https://github.com/yakhyo/face-parsing/releases/download/v0.0.1/resnet34.onnx"
-        ],
-        rename_map={"resnet34.onnx": "face_parsing_resnet34.onnx"}
+        ]
     )
 
-    # -----------------------------
-    # Load ONNX
-    # -----------------------------
+    # Step 2 — Rename manually
+    if os.path.exists(downloaded_path) and not os.path.exists(final_path):
+        os.rename(downloaded_path, final_path)
+
+    # Step 3 — Load ONNX
     PARSING_SESSION = ort.InferenceSession(
-        model_path,
+        final_path,
         providers=roop.globals.execution_providers
     )
     PARSING_INPUT = PARSING_SESSION.get_inputs()[0].name
-    print("✅ [face_parsing] Loaded ResNet34 parsing model")
 
+    print("✅ [face_parsing] Loaded ResNet34 parsing model")
     return PARSING_SESSION
 
 
+# ================================================================
+#   RUN FACE PARSING
+# ================================================================
+
 def run_face_parsing(crop: np.ndarray) -> np.ndarray:
     """
-    Jalankan parsing wajah pada crop.
-    Output = mask HxW (19 kelas CelebAMask-HQ).
+    Run face parsing on crop.
+    Output is mask HxW (19 classes).
     """
     session = get_face_parsing_session()
 
@@ -89,15 +102,15 @@ def run_face_parsing(crop: np.ndarray) -> np.ndarray:
     inp = inp.astype(np.float32).transpose(2, 0, 1)[None]
 
     out = session.run(None, {PARSING_INPUT: inp})[0]  # (1,19,512,512)
-    mask = np.argmax(out[0], axis=0)
+    mask = np.argmax(out[0], axis=0).astype(np.uint8)
 
-    # Resize kembali
-    mask = cv2.resize(mask.astype(np.uint8), (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+    # resize back to original crop size
+    mask = cv2.resize(mask, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask
 
 
 # ================================================================
-#   FACE ANALYSER
+#   FACE ANALYSER INIT
 # ================================================================
 
 def get_face_analyser() -> Any:
@@ -109,7 +122,7 @@ def get_face_analyser() -> Any:
                 providers=roop.globals.execution_providers
             )
             FACE_ANALYSER.prepare(ctx_id=0)
-            print("✅ [face_analyser] Using buffalo_l (pose + 2d106 + 3d68)")
+            print("✅ [face_analyser] Using buffalo_l (pose + 106 landmarks)")
     return FACE_ANALYSER
 
 
@@ -124,7 +137,7 @@ def clear_face_analyser() -> None:
 
 
 # ================================================================
-#   BASIC FACE ACCESS
+#   FACE ACCESS
 # ================================================================
 
 def get_many_faces(frame: Frame) -> Optional[List[Face]]:
@@ -153,7 +166,7 @@ def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
 def get_face_pose(face: Face):
     pose = getattr(face, "pose", None)
     if pose is None:
-        return 0.0, 0.0, 0.0
+        return (0.0, 0.0, 0.0)
     return float(pose[0]), float(pose[1]), float(pose[2])
 
 
@@ -176,7 +189,7 @@ def calculate_motion_vector(prev_face, current_face):
 
 def _compute_embedding_similarity(a, b):
     try:
-        return 1.0 - float(cosine(a, b))  # convert distance → similarity
+        return 1.0 - float(cosine(a, b))
     except Exception:
         return 0.0
 
@@ -204,8 +217,8 @@ def smart_face_tracking(frame: Frame, frame_number: int):
                 if frame_number - data["last_seen"] > MAX_TRACK_GAP:
                     continue
 
-                prev_f = data["last_face"]
-                prev_emb = getattr(prev_f, "normed_embedding", None)
+                last_f = data["last_face"]
+                prev_emb = getattr(last_f, "normed_embedding", None)
                 if prev_emb is None:
                     continue
 
@@ -214,6 +227,7 @@ def smart_face_tracking(frame: Frame, frame_number: int):
                     max_sim = sim
                     best_id = tid
 
+            # update / new track
             if best_id is not None:
                 prev_f = FACE_TRACKING[best_id]["last_face"]
                 motion = calculate_motion_vector(prev_f, face)
@@ -240,7 +254,7 @@ def smart_face_tracking(frame: Frame, frame_number: int):
             TRACKING_HISTORY.append({"bbox": np.array(face.bbox, dtype=np.float32)})
             tracked.append(face)
 
-        # cleanup old
+        # cleanup
         FACE_TRACKING = {
             k: v for k, v in FACE_TRACKING.items()
             if frame_number - v["last_seen"] <= MAX_TRACK_AGE
@@ -250,14 +264,14 @@ def smart_face_tracking(frame: Frame, frame_number: int):
 
 
 # ================================================================
-#   FACE PARSING OCCLUSION (LIKE FACEFUSION)
+#   OCCLUSION — FACE PARSING VISIBILITY
 # ================================================================
 
 def detect_occlusion(face: Face, frame: Frame) -> bool:
     """
-    Occlusion detection berdasarkan parsing:
-    - hitung visibility (skin + eyes + nose + mouth)
-    - visibility < threshold ⇒ occluded
+    FaceFusion-style occlusion detection using parsing:
+    - compute visibility ratio (skin + eyes + nose + mouth)
+    - low visibility → occluded
     """
     if face is None or frame is None:
         return True
@@ -278,14 +292,14 @@ def detect_occlusion(face: Face, frame: Frame) -> bool:
 
     mask = run_face_parsing(crop)
 
-    # Kelas fundamental wajah
-    FACE_CLASSES = {1, 2, 3, 4, 5, 6, 7, 8}
+    # core facial classes
+    FACE_CLASSES = {1,2,3,4,5,6,7,8}
 
     total = crop.size // 3
     visible = np.count_nonzero(np.isin(mask, list(FACE_CLASSES)))
     visibility = visible / total
 
-    VIS_THRESHOLD = 0.45  # recommended FaceFusion level
+    VIS_THRESHOLD = 0.45  # recommended value
 
     return visibility < VIS_THRESHOLD
 
@@ -308,7 +322,6 @@ def find_similar_face(frame: Frame, reference_face: Face, use_tracking=True):
     ref_emb = reference_face.normed_embedding
     best_face = None
     best_dist = float("inf")
-
     threshold = getattr(roop.globals, "similar_face_distance", 1.0)
 
     for f in faces:
@@ -317,7 +330,7 @@ def find_similar_face(frame: Frame, reference_face: Face, use_tracking=True):
 
         try:
             dist = np.sum(np.square(f.normed_embedding - ref_emb))
-        except Exception:
+        except:
             continue
 
         if dist < threshold and dist < best_dist:
