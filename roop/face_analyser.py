@@ -97,7 +97,7 @@ def run_face_parsing(crop: np.ndarray) -> np.ndarray:
     """
     session = get_face_parsing_session()
 
-    inp = cv2.resize(crop, (512, 512))
+    inp = cv2.resize(crop, (256, 256))
     inp = inp[:, :, ::-1] / 255.0
     inp = inp.astype(np.float32).transpose(2, 0, 1)[None]
 
