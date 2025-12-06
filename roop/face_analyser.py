@@ -52,30 +52,41 @@ PARSING_INPUT = None
 def get_face_parsing_session():
     """
     Load ResNet34 Face Parsing model.
-    Auto-download if missing.
-    FIXED version (no rename_map).
+    Menghindari progress bar spam (tqdm) dari conditional_download().
+    Menggunakan downloader silent 1-line.
     """
     global PARSING_SESSION, PARSING_INPUT
     if PARSING_SESSION is not None:
         return PARSING_SESSION
 
+    import requests
+
     model_dir = resolve_relative_path("../models")
-    downloaded_path = os.path.join(model_dir, "resnet34.onnx")
+    os.makedirs(model_dir, exist_ok=True)
+
     final_path = os.path.join(model_dir, "face_parsing_resnet34.onnx")
 
-    # Step 1 — Download original name
-    conditional_download(
-        model_dir,
-        [
-            "https://github.com/yakhyo/face-parsing/releases/download/v0.0.1/resnet34.onnx"
-        ]
-    )
+    # If already exists → skip
+    if not os.path.exists(final_path):
+        url = "https://github.com/yakhyo/face-parsing/releases/download/v0.0.1/resnet34.onnx"
 
-    # Step 2 — Rename manually
-    if os.path.exists(downloaded_path) and not os.path.exists(final_path):
-        os.rename(downloaded_path, final_path)
+        print("Downloading face_parsing_resnet34.onnx ...", flush=True)
+        response = requests.get(url, stream=True)
 
-    # Step 3 — Load ONNX
+        total = int(response.headers.get('content-length', 0))
+        downloaded = 0
+
+        with open(final_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    percent = (downloaded / total) * 100
+                    print(f"Progress: {percent:.1f}%", end="\r", flush=True)
+
+        print("\nDownload complete.")
+
+    # Load ONNX model (CPU or CUDA)
     PARSING_SESSION = ort.InferenceSession(
         final_path,
         providers=roop.globals.execution_providers
@@ -84,7 +95,6 @@ def get_face_parsing_session():
 
     print("✅ [face_parsing] Loaded ResNet34 parsing model")
     return PARSING_SESSION
-
 
 # ================================================================
 #   RUN FACE PARSING
