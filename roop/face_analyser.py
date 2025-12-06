@@ -52,8 +52,8 @@ PARSING_INPUT = None
 def get_face_parsing_session():
     """
     Load ResNet34 Face Parsing model.
-    Menghindari progress bar spam (tqdm) dari conditional_download().
-    Menggunakan downloader silent 1-line.
+    Force CPUExecutionProvider to avoid CUDA OOM and stream capture issues.
+    Silent, single-line downloader.
     """
     global PARSING_SESSION, PARSING_INPUT
     if PARSING_SESSION is not None:
@@ -66,36 +66,32 @@ def get_face_parsing_session():
 
     final_path = os.path.join(model_dir, "face_parsing_resnet34.onnx")
 
-    # If already exists → skip
+    # Skip if exists
     if not os.path.exists(final_path):
         url = "https://github.com/yakhyo/face-parsing/releases/download/v0.0.1/resnet34.onnx"
+        temp_path = os.path.join(model_dir, "resnet34.onnx")
 
         print("Downloading face_parsing_resnet34.onnx ...", flush=True)
-        response = requests.get(url, stream=True)
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(temp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
 
-        total = int(response.headers.get('content-length', 0))
-        downloaded = 0
+        # Rename to final filename
+        os.rename(temp_path, final_path)
+        print("Download complete.", flush=True)
 
-        with open(final_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    percent = (downloaded / total) * 100
-                    print(f"Progress: {percent:.1f}%", end="\r", flush=True)
-
-        print("\nDownload complete.")
-
-    # Load ONNX model (CPU or CUDA)
+    # FORCE MODEL TO CPU (agar tidak pernah pakai CUDA)
     PARSING_SESSION = ort.InferenceSession(
         final_path,
-        providers=roop.globals.execution_providers
+        providers=["CPUExecutionProvider"]
     )
     PARSING_INPUT = PARSING_SESSION.get_inputs()[0].name
 
-    print("✅ [face_parsing] Loaded ResNet34 parsing model")
+    print("✅ [face_parsing] Loaded ResNet34 parsing model (CPU)")
     return PARSING_SESSION
-
 # ================================================================
 #   RUN FACE PARSING
 # ================================================================
@@ -103,18 +99,19 @@ def get_face_parsing_session():
 def run_face_parsing(crop: np.ndarray) -> np.ndarray:
     """
     Run face parsing on crop.
-    Output is mask HxW (19 classes).
+    Model requires fixed 512x512 input.
+    Running on CPU (safe, no CUDA OOM).
     """
     session = get_face_parsing_session()
 
-    inp = cv2.resize(crop, (256, 256))
+    inp = cv2.resize(crop, (512, 512))
     inp = inp[:, :, ::-1] / 255.0
     inp = inp.astype(np.float32).transpose(2, 0, 1)[None]
 
-    out = session.run(None, {PARSING_INPUT: inp})[0]  # (1,19,512,512)
+    out = session.run(None, {PARSING_INPUT: inp})[0]
     mask = np.argmax(out[0], axis=0).astype(np.uint8)
 
-    # resize back to original crop size
+    # Resize back to the original crop shape
     mask = cv2.resize(mask, (crop.shape[1], crop.shape[0]), interpolation=cv2.INTER_NEAREST)
     return mask
 
