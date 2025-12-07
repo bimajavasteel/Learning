@@ -39,7 +39,8 @@ def parse_args() -> None:
     program.add_argument('--many-faces', help='process every face', dest='many_faces', action='store_true')
     program.add_argument('--reference-face-position', help='position of the reference face', dest='reference_face_position', type=int, default=0)
     program.add_argument('--reference-frame-number', help='number of the reference frame', dest='reference_frame_number', type=int, default=0)
-    program.add_argument('--similar-face-distance', help='face distance used for recognition', dest='similar_face_distance', type=float, default=0.85)
+    # 🔧 OPTIMASI B: turunkan default supaya matching lebih ketat ke referensi
+    program.add_argument('--similar-face-distance', help='face distance used for recognition', dest='similar_face_distance', type=float, default=0.65)
     program.add_argument('--temp-frame-format', help='image format used for frame extraction', dest='temp_frame_format', default='png', choices=['jpg', 'png'])
     program.add_argument('--temp-frame-quality', help='image quality used for frame extraction', dest='temp_frame_quality', type=int, default=0, choices=range(101), metavar='[0-100]')
     program.add_argument('--output-video-encoder', help='encoder used for the output video', dest='output_video_encoder', default='libx264', choices=['libx264', 'libx265', 'libvpx-vp9', 'h264_nvenc', 'hevc_nvenc'])
@@ -48,15 +49,39 @@ def parse_args() -> None:
     program.add_argument('--execution-provider', help='available execution provider (choices: cpu, ...)', dest='execution_provider', default=['cpu'], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
     program.add_argument('-v', '--version', action='version', version=f'{roop.metadata.name} {roop.metadata.version}')
-    #enhancer-blend
+    # enhancer-blend
     program.add_argument('--face-enhancer-blend', help='blending amount for face enhancer', dest='face_enhancer_blend', type=float, default=0.6)
     program.add_argument(
-    '--realesrgan-temporal-alpha',
-    help='temporal smoothing alpha for RealESRGAN (0.0 - 1.0)',
-    dest='realesrgan_temporal_alpha',
-    type=float,
-    default=0.6
-)
+        '--realesrgan-temporal-alpha',
+        help='temporal smoothing alpha for RealESRGAN (0.0 - 1.0)',
+        dest='realesrgan_temporal_alpha',
+        type=float,
+        default=0.6
+    )
+    # 🔧 OPTIMASI D: temporal blending factor untuk face_swapper
+    program.add_argument(
+        '--temporal-blend-alpha',
+        help='temporal blending alpha for face swapper (0.0 - 1.0)',
+        dest='temporal_blend_alpha',
+        type=float,
+        default=0.90
+    )
+    # 🔧 OPTIMASI C: threshold occluder
+    program.add_argument(
+        '--occluder-threshold',
+        help='occluder threshold for occlusion detection (0.0 - 1.0)',
+        dest='occluder_threshold',
+        type=float,
+        default=0.20
+    )
+    # 🔧 OPTIMASI G: max sharpness enhancer
+    program.add_argument(
+        '--face-enhancer-max-sharpness',
+        help='maximum Laplacian variance before softening enhanced face',
+        dest='face_enhancer_max_sharpness',
+        type=float,
+        default=1500.0
+    )
 
     args = program.parse_args()
 
@@ -79,12 +104,14 @@ def parse_args() -> None:
     roop.globals.max_memory = args.max_memory
     roop.globals.execution_providers = decode_execution_providers(args.execution_provider)
     roop.globals.execution_threads = args.execution_threads
-    #enhancer-blend
+    # enhancer-blend
     roop.globals.face_enhancer_blend = args.face_enhancer_blend
     # RealESRGAN temporal stabilizer
     roop.globals.realesrgan_temporal_alpha = args.realesrgan_temporal_alpha
-
-
+    # 🔧 OPTIMASI D / C / G
+    roop.globals.temporal_blend_alpha = args.temporal_blend_alpha
+    roop.globals.occluder_threshold = args.occluder_threshold
+    roop.globals.face_enhancer_max_sharpness = args.face_enhancer_max_sharpness
 
 
 def encode_execution_providers(execution_providers: List[str]) -> List[str]:
