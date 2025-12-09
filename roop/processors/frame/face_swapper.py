@@ -1,5 +1,5 @@
 #face-swpper support new
-from typing import Any, List, Callable, Optional
+from typing import Any, List, Callable
 import cv2
 import insightface
 import threading
@@ -24,10 +24,6 @@ FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-SWAPPER'
 
-
-# =====================================================================
-#  MODEL HANDLING
-# =====================================================================
 
 def get_face_swapper() -> Any:
     """
@@ -93,114 +89,6 @@ def post_process() -> None:
 
 
 # =====================================================================
-#  UTILS
-# =====================================================================
-
-def _clip_bbox_to_frame(bbox: np.ndarray, frame_shape) -> np.ndarray:
-    h, w = frame_shape[:2]
-    x1, y1, x2, y2 = bbox.astype(np.int32)
-    x1 = max(0, min(x1, w - 1))
-    x2 = max(0, min(x2, w))
-    y1 = max(0, min(y1, h - 1))
-    y2 = max(0, min(y2, h))
-    if x2 <= x1 or y2 <= y1:
-        return np.array([0, 0, 0, 0], dtype=np.int32)
-    return np.array([x1, y1, x2, y2], dtype=np.int32)
-
-
-def _create_elliptical_mask(h: int, w: int) -> np.ndarray:
-    """
-    Mask elips halus untuk blending wajah (anti garis box).
-    Dipakai oleh Laplacian / Gaussian blending.
-    """
-    mask = np.zeros((h, w), dtype=np.float32)
-    center = (w // 2, h // 2)
-    axes = (int(w * 0.45), int(h * 0.45))
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
-
-    blur_radius = int(min(w, h) * 0.12)
-    if blur_radius % 2 == 0:
-        blur_radius += 1
-    mask = cv2.GaussianBlur(mask, (blur_radius, blur_radius), 0)
-    return mask
-
-
-def _laplacian_pyramid_blend(src: np.ndarray,
-                             dst: np.ndarray,
-                             mask: np.ndarray,
-                             levels: int = 3) -> np.ndarray:
-    """
-    🔧 OPTIMASI E: Laplacian pyramid blending di area wajah.
-    src = ROI frame asli, dst = ROI frame hasil swap, mask = 0..1
-    """
-    if levels < 1:
-        return dst
-
-    src = src.astype(np.float32) / 255.0
-    dst = dst.astype(np.float32) / 255.0
-    mask = mask.astype(np.float32)
-
-    # bangun Gaussian pyramid mask
-    gp_mask = [mask]
-    for _ in range(levels - 1):
-        gp_mask.append(cv2.pyrDown(gp_mask[-1]))
-
-    # Gaussian pyramid src & dst
-    gp_src = [src]
-    gp_dst = [dst]
-    for _ in range(levels - 1):
-        gp_src.append(cv2.pyrDown(gp_src[-1]))
-        gp_dst.append(cv2.pyrDown(gp_dst[-1]))
-
-    # Laplacian pyramid
-    lp_src = [gp_src[-1]]
-    lp_dst = [gp_dst[-1]]
-    for i in range(levels - 2, -1, -1):
-        size = (gp_src[i].shape[1], gp_src[i].shape[0])
-        src_expanded = cv2.pyrUp(gp_src[i + 1], dstsize=size)
-        dst_expanded = cv2.pyrUp(gp_dst[i + 1], dstsize=size)
-        lp_src.append(gp_src[i] - src_expanded)
-        lp_dst.append(gp_dst[i] - dst_expanded)
-
-    # blend tiap level
-    blended_pyr = []
-    for l_src, l_dst, g_m in zip(lp_src, lp_dst, gp_mask[::-1]):
-        g_m_3 = np.dstack([g_m] * 3)
-        blended = l_dst * g_m_3 + l_src * (1.0 - g_m_3)
-        blended_pyr.append(blended)
-
-    # rekonstruksi
-    img = blended_pyr[0]
-    for i in range(1, len(blended_pyr)):
-        size = (blended_pyr[i].shape[1], blended_pyr[i].shape[0])
-        img = cv2.pyrUp(img, dstsize=size)
-        img = img + blended_pyr[i]
-
-    img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-    return img
-
-
-def is_face_blurry(target_face: Face, frame: Frame, threshold: float = 80.0) -> bool:
-    """
-    🔧 OPTIMASI F: Skip wajah yang terlalu blur supaya tidak muncul artefak aneh.
-    threshold Laplacian bisa kamu tuning.
-    """
-    bbox = _clip_bbox_to_frame(np.array(target_face.bbox, dtype=np.float32), frame.shape)
-    x1, y1, x2, y2 = bbox
-    if x2 <= x1 or y2 <= y1:
-        return False
-
-    crop = frame[y1:y2, x1:x2]
-    if crop.size == 0:
-        return False
-
-    lap = cv2.Laplacian(crop, cv2.CV_64F)
-    score = float(lap.var())
-    min_var = getattr(roop.globals, "swap_blur_threshold", threshold)
-    return score < min_var
-
-
-# =====================================================================
 #  POSE-AWARE BBOX ADJUSTMENT (ANTI MASKER / ANTI KECIL)
 # =====================================================================
 
@@ -258,49 +146,13 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
 
 
 # =====================================================================
-#  CORE SWAP + LAPLACIAN BLEND
+#  CORE SWAP
 # =====================================================================
-
-def _blend_face_region(original_frame: Frame,
-                       swapped_frame: Frame,
-                       target_face: Face) -> Frame:
-    """
-    🔧 OPTIMASI E:
-    - Ambil ROI wajah di original & swapped
-    - Blending pakai Laplacian pyramid + elips mask → hilang garis tempelan keras.
-    """
-    if original_frame.shape != swapped_frame.shape:
-        return swapped_frame
-
-    h_frame, w_frame = swapped_frame.shape[:2]
-    bbox = _clip_bbox_to_frame(np.array(target_face.bbox, dtype=np.float32), swapped_frame.shape)
-    x1, y1, x2, y2 = bbox
-    if x2 <= x1 or y2 <= y1:
-        return swapped_frame
-
-    roi_orig = original_frame[y1:y2, x1:x2]
-    roi_swap = swapped_frame[y1:y2, x1:x2]
-    h, w = roi_orig.shape[:2]
-
-    # safety
-    if h < 8 or w < 8:
-        return swapped_frame
-
-    mask = _create_elliptical_mask(h, w)
-    blended_roi = _laplacian_pyramid_blend(roi_orig, roi_swap, mask, levels=3)
-
-    result = swapped_frame.copy()
-    result[y1:y2, x1:x2] = blended_roi
-    return result
-
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
     Fungsi swap dasar (panggil inswapper).
     Dipisah supaya mudah di-mod / patch kalau mau upgrade model.
-    Ditambah:
-    - pose-aware bbox adjust
-    - Laplacian blending di ROI wajah
     """
     if source_face is None or target_face is None:
         return temp_frame
@@ -308,17 +160,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # pose-aware bbox adjust (anti masker / anti wajah kecil)
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
-    original_frame = temp_frame.copy()
-
-    swapped_full = get_face_swapper().get(
+    return get_face_swapper().get(
         temp_frame,
         target_face,
         source_face,
         paste_back=True
     )
-
-    blended = _blend_face_region(original_frame, swapped_full, target_face)
-    return blended
 
 
 def _select_best_target_by_embedding(
@@ -362,80 +209,61 @@ def process_frame(
     source_face: Face,
     reference_face: Face,
     temp_frame: Frame,
-    frame_number: int = 0,
-    prev_frame: Optional[Frame] = None
+    frame_number: int = 0
 ) -> Frame:
     """
     Proses 1 frame dengan strategi:
-    - many_faces = True  → swap ke semua wajah yang lolos filter & tidak occluded & tidak blur
+    - many_faces = True  → swap ke semua wajah yang lolos filter & tidak occluded
     - many_faces = False → cari wajah paling mirip + stabil (tracking + embedding) + pose-aware
-    - 🔧 OPTIMASI D: temporal blending dengan frame sebelumnya (anti flicker)
     """
     if source_face is None:
         # Safety guard: sudah dicek di pre_start, tapi buat jaga-jaga.
         return temp_frame
 
-    working_frame = temp_frame
-
     # MODE: banyak wajah → swap semua yang valid
     if roop.globals.many_faces:
         # pakai smart_face_tracking agar ID wajah konsisten antar frame
-        faces = smart_face_tracking(working_frame, frame_number)
+        faces = smart_face_tracking(temp_frame, frame_number)
         if not faces:
-            faces = get_many_faces(working_frame)
+            faces = get_many_faces(temp_frame)
 
         if not faces:
-            return working_frame
+            return temp_frame
 
         for target_face in faces:
             # skip wajah yang ter-occlusion berat (tangan, rambut, dsb)
-            if detect_occlusion(target_face, working_frame):
+            if detect_occlusion(target_face, temp_frame):
                 continue
 
-            # skip wajah yang terlalu blur (optimasi F)
-            if is_face_blurry(target_face, working_frame):
-                continue
+            temp_frame = swap_face(source_face, target_face, temp_frame)
 
-            working_frame = swap_face(source_face, target_face, working_frame)
+        return temp_frame
 
-    else:
-        # MODE: single / fokus 1 wajah → pakai reference + embedding matching
-        tracked_faces = smart_face_tracking(working_frame, frame_number)
-        if not tracked_faces:
-            tracked_faces = get_many_faces(working_frame)
+    # MODE: single / fokus 1 wajah → pakai reference + embedding matching
+    tracked_faces = smart_face_tracking(temp_frame, frame_number)
+    if not tracked_faces:
+        tracked_faces = get_many_faces(temp_frame)
 
-        if not tracked_faces:
-            return working_frame
+    if not tracked_faces:
+        return temp_frame
 
-        # Filter occlusion dulu
-        valid_faces = [f for f in tracked_faces if not detect_occlusion(f, working_frame)]
-        if not valid_faces:
-            return working_frame
+    # Filter occlusion dulu
+    valid_faces = [f for f in tracked_faces if not detect_occlusion(f, temp_frame)]
+    if not valid_faces:
+        return temp_frame
 
-        # Filter blur
-        valid_faces = [f for f in valid_faces if not is_face_blurry(f, working_frame)]
-        if not valid_faces:
-            return working_frame
+    best_target = None
 
-        best_target = None
+    # Kalau ada reference_face (dari reference frame) → pakai embedding-based selection
+    if reference_face is not None:
+        best_target = _select_best_target_by_embedding(valid_faces, reference_face)
 
-        # Kalau ada reference_face (dari reference frame) → pakai embedding-based selection
-        if reference_face is not None:
-            best_target = _select_best_target_by_embedding(valid_faces, reference_face)
+    # Kalau belum ketemu, fallback ke wajah pertama yang valid
+    if best_target is None:
+        best_target = valid_faces[0]
 
-        # Kalau belum ketemu, fallback ke wajah pertama yang valid
-        if best_target is None:
-            best_target = valid_faces[0]
-
-        working_frame = swap_face(source_face, best_target, working_frame)
-
-    # 🔧 OPTIMASI D: temporal anti-flicker (blending dengan frame sebelumnya jika ada)
-    if prev_frame is not None and prev_frame.shape == working_frame.shape:
-        alpha = getattr(roop.globals, "temporal_blend_alpha", 0.90)
-        alpha = max(0.0, min(1.0, float(alpha)))
-        working_frame = cv2.addWeighted(working_frame, alpha, prev_frame, 1.0 - alpha, 0)
-
-    return working_frame
+    temp_frame = swap_face(source_face, best_target, temp_frame)
+    return temp_frame
 
 
 def process_frames(
@@ -449,7 +277,6 @@ def process_frames(
     - source_face: konstan
     - reference_face: diambil dari face_reference (single-mode)
     - frame_number: index frame → dipakai di smart_face_tracking
-    - prev_frame: dipakai untuk temporal blending anti flicker
     """
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
@@ -457,18 +284,14 @@ def process_frames(
     # Single-face mode → pakai reference_face global yang sudah diset di process_video
     reference_face = None if roop.globals.many_faces else get_face_reference()
 
-    prev_frame: Optional[Frame] = None
-
     for idx, temp_frame_path in enumerate(temp_frame_paths):
         temp_frame = cv2.imread(temp_frame_path)
         result = process_frame(
             source_face=source_face,
             reference_face=reference_face,
             temp_frame=temp_frame,
-            frame_number=idx,
-            prev_frame=prev_frame
+            frame_number=idx
         )
-        prev_frame = result.copy()
         cv2.imwrite(temp_frame_path, result)
 
         if update:
@@ -497,8 +320,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
         source_face=source_face,
         reference_face=reference_face,
         temp_frame=target_frame,
-        frame_number=0,
-        prev_frame=None
+        frame_number=0
     )
     cv2.imwrite(output_path, result)
 
