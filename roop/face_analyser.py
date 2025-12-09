@@ -44,6 +44,120 @@ MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0�
 OCCLUDER_SESSION: Optional[ort.InferenceSession] = None
 OCCLUDER_INPUT_NAME: Optional[str] = None
 
+# =====================================================================
+#  DUAL TV-L1 OPTICAL FLOW (untuk stabilitas temporal level lanjut)
+# =====================================================================
+
+# NOTE: butuh opencv-contrib-python, bukan opencv-python biasa.
+TVL1_FLOW = None
+TVL1_PREV_GRAY: Optional[np.ndarray] = None
+TVL1_LAST_FLOW: Optional[np.ndarray] = None
+TVL1_LAST_FRAME: int = -1
+
+# alpha blending antara bbox hasil optical-flow vs bbox hasil smoothing biasa
+FLOW_SMOOTH_ALPHA: float = 0.7  # 0.0 = matikan efek flow, 1.0 = full flow
+
+
+def _init_tvl1_if_needed() -> None:
+    """
+    Lazy init Dual TV-L1 Optical Flow.
+    Kalau opencv tidak punya cv2.optflow (tidak pake contrib) → TVL1_FLOW tetap None.
+    """
+    global TVL1_FLOW
+    if TVL1_FLOW is not None:
+        return
+
+    # beberapa build OpenCV tidak punya modul optflow
+    if not hasattr(cv2, "optflow"):
+        print("[face_analyser][TVL1] cv2.optflow tidak ditemukan, optical flow dimatikan.")
+        TVL1_FLOW = None
+        return
+
+    try:
+        TVL1_FLOW = cv2.optflow.DualTVL1OpticalFlow_create()
+        print("✅ [face_analyser] Dual TV-L1 Optical Flow aktif.")
+    except Exception as e:
+        print(f"[face_analyser][TVL1] gagal init DualTVL1: {e}")
+        TVL1_FLOW = None
+
+
+def _get_tvl1_flow(frame: Frame, frame_number: int) -> Optional[np.ndarray]:
+    """
+    Hitung optical flow antar frame (prev_gray → sekarang) sekali per frame_number.
+    Hasilnya dipakai bersama untuk semua wajah di frame itu.
+    """
+    global TVL1_PREV_GRAY, TVL1_LAST_FLOW, TVL1_LAST_FRAME, TVL1_FLOW
+
+    _init_tvl1_if_needed()
+    if TVL1_FLOW is None:
+        return None
+    if frame is None:
+        return None
+
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return None
+
+    # pertama kali / resolusi berubah: set prev dan jangan hitung flow dulu
+    if TVL1_PREV_GRAY is None or TVL1_PREV_GRAY.shape != gray.shape:
+        TVL1_PREV_GRAY = gray
+        TVL1_LAST_FLOW = None
+        TVL1_LAST_FRAME = frame_number
+        return None
+
+    # kalau untuk frame_number ini sudah dihitung, reuse saja
+    if TVL1_LAST_FRAME == frame_number and TVL1_LAST_FLOW is not None:
+        return TVL1_LAST_FLOW
+
+    try:
+        flow = TVL1_FLOW.calc(TVL1_PREV_GRAY, gray, None)
+    except Exception:
+        # kalau perhitungan gagal, jangan matikan pipeline
+        TVL1_PREV_GRAY = gray
+        TVL1_LAST_FLOW = None
+        TVL1_LAST_FRAME = frame_number
+        return None
+
+    TVL1_PREV_GRAY = gray
+    TVL1_LAST_FLOW = flow
+    TVL1_LAST_FRAME = frame_number
+    return flow
+
+
+def tvl1_stabilize_bbox(face: Face, flow: np.ndarray) -> None:
+    """
+    Stabilkan bbox 1 wajah dengan Dual TV-L1 optical flow.
+    - Ambil vektor gerakan di center bbox
+    - Geser bbox mengikuti flow
+    - Lalu blend dengan bbox hasil smoothing biasa (FLOW_SMOOTH_ALPHA)
+    """
+    if flow is None is None:
+        return
+
+    try:
+        x1, y1, x2, y2 = map(float, face.bbox)
+    except Exception:
+        return
+
+    h, w = flow.shape[:2]
+    cx = int(max(0, min((x1 + x2) / 2.0, w - 1)))
+    cy = int(max(0, min((y1 + y2) / 2.0, h - 1)))
+
+    try:
+        dx, dy = flow[cy, cx]
+    except Exception:
+        return
+
+    flow_bbox = np.array([x1 + dx, y1 + dy, x2 + dx, y2 + dy], dtype=np.float32)
+    current_bbox = np.array(face.bbox, dtype=np.float32)
+
+    alpha = float(FLOW_SMOOTH_ALPHA)
+    alpha = max(0.0, min(1.0, alpha))
+
+    blended = alpha * flow_bbox + (1.0 - alpha) * current_bbox
+    face.bbox = blended.astype(np.float32)
+
 
 # =====================================================================
 #  MODEL HANDLING
@@ -73,11 +187,17 @@ def clear_face_analyser() -> None:
     Dipanggil saat post_process / cleanup.
     """
     global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
+    global TVL1_PREV_GRAY, TVL1_LAST_FLOW, TVL1_LAST_FRAME
 
     with TRACK_LOCK:
         FACE_TRACKING.clear()
         TRACKING_HISTORY.clear()
         TEMPORAL_BUFFER.clear()
+
+    # reset optical flow state
+    TVL1_PREV_GRAY = None
+    TVL1_LAST_FLOW = None
+    TVL1_LAST_FRAME = -1
 
     with THREAD_LOCK:
         FACE_ANALYSER = None
@@ -331,7 +451,7 @@ def smooth_bbox_for_face(face: Face) -> None:
 
 
 # =====================================================================
-#  SMART TRACKING (EMBEDDING + TEMPORAL SMOOTHING)
+#  SMART TRACKING (EMBEDDING + TEMPORAL + TV-L1)
 # =====================================================================
 
 def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]:
@@ -340,6 +460,7 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
     - gunakan embedding similarity + sedikit motion
     - jaga agar ID wajah konsisten antar frame
     - smoothing bbox pakai TEMPORAL_BUFFER (stabilitas temporal)
+    - stabilisasi tambahan pakai Dual TV-L1 optical flow
     - thread-safe: di-protect oleh TRACK_LOCK
     """
     global FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
@@ -418,9 +539,18 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
 
         # 🔥 Setelah tracking selesai → update temporal buffer & smooth bbox
         if tracked_faces:
+            # simpan snapshot ke buffer
             push_temporal_frame(tracked_faces, frame_number)
+
+            # smoothing berbasis buffer
             for f in tracked_faces:
                 smooth_bbox_for_face(f)
+
+            # 🔥 stabilisasi tambahan dengan Dual TV-L1 optical flow
+            flow = _get_tvl1_flow(frame, frame_number)
+            if flow is not None:
+                for f in tracked_faces:
+                    tvl1_stabilize_bbox(f, flow)
 
     return tracked_faces
 
