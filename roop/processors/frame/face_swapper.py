@@ -19,6 +19,7 @@ from roop.face_analyser import (
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
+from roop.face_analyser import smooth_bbox_for_face
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -143,6 +144,13 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
         return
 
     face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
+    
+    #smoothing khusus swapper
+    def smooth_bbox_for_swapper(target_face):
+    try:
+        smooth_bbox_for_face(target_face)
+    except Exception:
+        pass
 
 
 # =====================================================================
@@ -152,13 +160,18 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """
     Fungsi swap dasar (panggil inswapper).
-    Dipisah supaya mudah di-mod / patch kalau mau upgrade model.
+    Sudah ditambah:
+    - pose-aware bbox adjust
+    - temporal smoothing tambahan
     """
     if source_face is None or target_face is None:
         return temp_frame
 
     # pose-aware bbox adjust (anti masker / anti wajah kecil)
     adapt_bbox_for_pose(target_face, temp_frame.shape)
+
+    # 🔥 smoothing tahap 2 (setelah pose adjust)
+    smooth_bbox_for_swapper(target_face)
 
     return get_face_swapper().get(
         temp_frame,
