@@ -27,20 +27,18 @@ TRACK_LOCK = threading.Lock()         # lock khusus tracking (penting untuk mult
 FACE_TRACKING: dict[int, dict[str, Any]] = {}
 TRACKING_HISTORY: deque = deque(maxlen=30)
 
+# 🔥 Temporal Frame Buffer: simpan beberapa frame terakhir
+TEMPORAL_BUFFER: deque = deque(maxlen=5)  # bisa ubah jadi 3–7 sesuai kebutuhan
+
 # Threshold / hyper-parameter default (boleh kamu tuning)
 MIN_DET_SCORE = 0.30        # min score agar wajah dianggap valid (untuk get_many_faces)
 
 # fallback occlusion kalau occluder.onnx tidak ada
 OCCLUSION_THRESHOLD = 0.40  # det_score < ini dianggap occluded
 
-MAX_TRACK_GAP = 10          # frame: kalau lebih lama dari ini → track di-skip saat matching normal
+MAX_TRACK_GAP = 10          # frame: kalau lebih lama dari ini → track di-skip saat matching
 MAX_TRACK_AGE = 15          # frame: track dihapus bila tidak terlihat selama ini
-
-# 🔧 OPTIMASI B: threshold embedding dinaikkan ke zona aman ArcFace
-MIN_EMBED_SIMILARITY = 0.82  # cosine similarity minimal untuk dianggap match (0–1)
-
-# 🔧 OPTIMASI A: EMA smoothing per-track
-EMA_ALPHA = 0.60  # 0.6 cukup halus tanpa terlalu delay
+MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0–1)
 
 # Occluder ONNX (opsional)
 OCCLUDER_SESSION: Optional[ort.InferenceSession] = None
@@ -74,11 +72,12 @@ def clear_face_analyser() -> None:
     Reset analyser & tracking state.
     Dipanggil saat post_process / cleanup.
     """
-    global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY
+    global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
 
     with TRACK_LOCK:
         FACE_TRACKING.clear()
         TRACKING_HISTORY.clear()
+        TEMPORAL_BUFFER.clear()
 
     with THREAD_LOCK:
         FACE_ANALYSER = None
@@ -257,16 +256,93 @@ def _compute_embedding_similarity(current_embedding: np.ndarray,
         return 0.0
 
 
+# =====================================================================
+#  TEMPORAL FRAME BUFFER (STABILITAS TEMPORAL)
+# =====================================================================
+
+def push_temporal_frame(faces: List[Face], frame_number: int) -> None:
+    """
+    Simpan data wajah dari frame saat ini ke buffer temporal.
+    Disimpan:
+    - bbox
+    - embedding
+    - pose
+    """
+    if not faces:
+        return
+
+    snapshot = []
+    for f in faces:
+        emb = getattr(f, "normed_embedding", None)
+        pose = getattr(f, "pose", None)
+
+        snapshot.append({
+            "bbox": np.array(f.bbox, dtype=np.float32).copy(),
+            "embedding": emb.copy() if isinstance(emb, np.ndarray) else emb,
+            "pose": np.array(pose, dtype=np.float32).copy() if pose is not None else None
+        })
+
+    TEMPORAL_BUFFER.append({
+        "frame": frame_number,
+        "faces": snapshot
+    })
+
+
+def smooth_bbox_for_face(face: Face) -> None:
+    """
+    Haluskan bbox 1 wajah berdasarkan data di TEMPORAL_BUFFER.
+    Untuk menghindari wajah bercampur saat multi-face:
+    - kita ambil beberapa bbox dengan center paling dekat.
+    """
+    if not TEMPORAL_BUFFER:
+        return
+
+    try:
+        cx = float((face.bbox[0] + face.bbox[2]) / 2.0)
+        cy = float((face.bbox[1] + face.bbox[3]) / 2.0)
+    except Exception:
+        return
+
+    centers: List[float] = []
+    bboxes: List[np.ndarray] = []
+
+    for entry in TEMPORAL_BUFFER:
+        for f in entry["faces"]:
+            bbox = f.get("bbox", None)
+            if bbox is None or len(bbox) != 4:
+                continue
+            fx1, fy1, fx2, fy2 = bbox
+            fcx = (fx1 + fx2) / 2.0
+            fcy = (fy1 + fy2) / 2.0
+            dist = float(np.hypot(fcx - cx, fcy - cy))
+            centers.append(dist)
+            bboxes.append(bbox)
+
+    if not bboxes:
+        return
+
+    # Pilih maksimum 3 bbox dengan center terdekat
+    idx_order = np.argsort(np.array(centers))
+    k = min(3, len(idx_order))
+    selected = [bboxes[i] for i in idx_order[:k]]
+
+    avg_bbox = np.mean(selected, axis=0)
+    face.bbox = avg_bbox.astype(np.float32)
+
+
+# =====================================================================
+#  SMART TRACKING (EMBEDDING + TEMPORAL SMOOTHING)
+# =====================================================================
+
 def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]:
     """
     Smart tracking:
     - gunakan embedding similarity + sedikit motion
     - jaga agar ID wajah konsisten antar frame
-    - smoothing bbox pakai EMA per-track + TRACKING_HISTORY (backward compat)
-    - 🔧 OPTIMASI C: fast re-id dengan penalti jarak waktu
+    - smoothing bbox pakai TEMPORAL_BUFFER (stabilitas temporal)
     - thread-safe: di-protect oleh TRACK_LOCK
     """
-    global FACE_TRACKING, TRACKING_HISTORY
+    global FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
 
     current_faces = get_many_faces(frame)
     if not current_faces:
@@ -277,80 +353,57 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
     with TRACK_LOCK:
         for face in current_faces:
             face_id = None
+            max_similarity = MIN_EMBED_SIMILARITY
             best_match_id = None
-            best_score = 0.0
 
             # embedding wajah sekarang
             current_embedding = getattr(face, "normed_embedding", None)
             if current_embedding is None or len(current_embedding) == 0:
-                current_embedding = None
+                current_embedding = np.array([])
 
             # cari track yang paling cocok (snapshot list() → aman dari perubahan size)
             for track_id, track_data in list(FACE_TRACKING.items()):
-                last_seen = track_data.get('last_seen', -9999)
-                age_gap = frame_number - last_seen
-
-                # buang track yang sudah terlalu tua (benar-benar hilang)
-                if age_gap > MAX_TRACK_AGE:
+                # lupakan track yang terlalu lama tidak terlihat
+                if frame_number - track_data.get('last_seen', -9999) > MAX_TRACK_GAP:
                     continue
 
                 last_face = track_data.get('last_face', None)
-                if last_face is None or current_embedding is None:
+                if last_face is None:
                     continue
 
                 track_embedding = getattr(last_face, "normed_embedding", None)
                 if track_embedding is None:
                     continue
 
-                # similarity dasar
-                similarity = _compute_embedding_similarity(current_embedding, track_embedding)
+                embedding_similarity = _compute_embedding_similarity(
+                    current_embedding, track_embedding
+                )
 
-                # 🔧 OPTIMASI C: penalti kalau sudah lama tidak muncul (fast re-id)
-                if age_gap > MAX_TRACK_GAP:
-                    decay = 0.90 ** (age_gap - MAX_TRACK_GAP)
-                    similarity *= decay
-
-                if similarity >= MIN_EMBED_SIMILARITY and similarity > best_score:
-                    best_score = similarity
+                if embedding_similarity > max_similarity:
+                    max_similarity = embedding_similarity
                     best_match_id = track_id
 
             if best_match_id is not None:
                 # update track yang ada
                 face_id = best_match_id
-                prev_face = FACE_TRACKING[face_id].get('last_face', None)
-                motion = calculate_motion_vector(prev_face, face) if prev_face is not None else 0.0
-
-                # 🔧 OPTIMASI A: EMA smoothing bbox
-                prev_bbox = FACE_TRACKING[face_id].get('bbox', None)
-                current_bbox = np.array(face.bbox, dtype=np.float32)
-
-                if prev_bbox is not None:
-                    smoothed_bbox = EMA_ALPHA * prev_bbox + (1.0 - EMA_ALPHA) * current_bbox
-                else:
-                    smoothed_bbox = current_bbox
+                prev_face = FACE_TRACKING[face_id]['last_face']
+                motion = calculate_motion_vector(prev_face, face)
 
                 FACE_TRACKING[face_id].update({
                     'last_face': face,
                     'last_seen': frame_number,
-                    'motion': motion,
-                    'bbox': smoothed_bbox
+                    'motion': motion
                 })
-
-                # apply bbox yang sudah di-smooth
-                face.bbox = smoothed_bbox
             else:
                 # buat track baru
-                face_id = (max(FACE_TRACKING.keys()) + 1) if FACE_TRACKING else 1
-                bbox_arr = np.array(face.bbox, dtype=np.float32)
+                face_id = len(FACE_TRACKING) + 1
                 FACE_TRACKING[face_id] = {
                     'last_face': face,
                     'last_seen': frame_number,
-                    'motion': 0.0,
-                    'bbox': bbox_arr
+                    'motion': 0.0
                 }
-                face.bbox = bbox_arr
 
-            # simpan ke history (backward compat + opsi smoothing tambahan)
+            # history lama (optional, masih disimpan jika ingin dipakai hal lain)
             face_data = {
                 'bbox': np.array(face.bbox, dtype=np.float32).copy()
             }
@@ -362,6 +415,12 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
             k: v for k, v in list(FACE_TRACKING.items())
             if frame_number - v.get('last_seen', -9999) <= MAX_TRACK_AGE
         }
+
+        # 🔥 Setelah tracking selesai → update temporal buffer & smooth bbox
+        if tracked_faces:
+            push_temporal_frame(tracked_faces, frame_number)
+            for f in tracked_faces:
+                smooth_bbox_for_face(f)
 
     return tracked_faces
 
