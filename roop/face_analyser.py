@@ -8,177 +8,208 @@ import numpy as np
 import cv2
 import os
 
-import torch
-from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
-
 import roop.globals
 from roop.typing import Frame, Face
 from roop.utilities import resolve_relative_path
 
-import onnxruntime as ort  # optional occluder
+# optional: kalau kamu punya occluder.onnx
+import onnxruntime as ort
 
 # =====================================================================
-# GLOBALS
+#  GLOBALS
 # =====================================================================
 
 FACE_ANALYSER: Any = None
-THREAD_LOCK = threading.Lock()
-TRACK_LOCK = threading.Lock()
+THREAD_LOCK = threading.Lock()        # lock untuk init model
+TRACK_LOCK = threading.Lock()         # lock khusus tracking (penting untuk multi-thread)
 
-# Tracking
+# Tracking variables
 FACE_TRACKING: dict[int, dict[str, Any]] = {}
 TRACKING_HISTORY: deque = deque(maxlen=30)
 
-# Temporal buffer (untuk smoothing multi-frame)
-TEMPORAL_BUFFER: deque = deque(maxlen=5)
+# 🔥 Temporal Frame Buffer: simpan beberapa frame terakhir
+TEMPORAL_BUFFER: deque = deque(maxlen=5)  # bisa ubah jadi 3–7 sesuai kebutuhan
 
-# Threshold
-MIN_DET_SCORE = 0.30
-OCCLUSION_THRESHOLD = 0.40
-MAX_TRACK_GAP = 10
-MAX_TRACK_AGE = 15
-MIN_EMBED_SIMILARITY = 0.70
+# Threshold / hyper-parameter default (boleh kamu tuning)
+MIN_DET_SCORE = 0.30        # min score agar wajah dianggap valid (untuk get_many_faces)
 
-# Occluder
+# fallback occlusion kalau occluder.onnx tidak ada
+OCCLUSION_THRESHOLD = 0.40  # det_score < ini dianggap occluded
+
+MAX_TRACK_GAP = 10          # frame: kalau lebih lama dari ini → track di-skip saat matching
+MAX_TRACK_AGE = 15          # frame: track dihapus bila tidak terlihat selama ini
+MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0–1)
+
+# Occluder ONNX (opsional)
 OCCLUDER_SESSION: Optional[ort.InferenceSession] = None
 OCCLUDER_INPUT_NAME: Optional[str] = None
 
 # =====================================================================
-# RAFT LARGE (C_T_SKHT_K_V2) – OPTICAL FLOW CUDA
+#  RAFT LARGE (Recurrent All-Pairs Field Transforms) - OPTICAL FLOW CUDA
 # =====================================================================
 
-RAFT_MODEL: Optional[torch.nn.Module] = None
-RAFT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
-RAFT_LOCK = threading.Lock()
-
-# kita simpan frame sebelumnya dalam bentuk raw BGR (numpy)
-RAFT_PREV_FRAME: Optional[np.ndarray] = None
+RAFT_MODEL = None
+RAFT_DEVICE = "cpu"
+RAFT_PREV_FRAME: Optional[np.ndarray] = None   # disimpan dalam RGB float32 [0..1]
 RAFT_LAST_FLOW: Optional[np.ndarray] = None
 RAFT_LAST_FRAME_IDX: int = -1
 
-# blending RAFT vs bbox asli
-RAFT_ALPHA: float = 0.7
+# seberapa kuat efek optical flow di-blend ke bbox
+RAFT_FLOW_ALPHA: float = 0.7  # 0.0 = mati, 1.0 = full RAFT
 
-# transforms dari weights (normalisasi ke [-1, 1], resize, dll)
-RAFT_TRANSFORMS = None
+RAFT_INIT_LOCK = threading.Lock()
 
-
-def _get_raft_model() -> Optional[torch.nn.Module]:
+def _get_raft_weights_path() -> str:
     """
-    Lazy init RAFT Large C_T_SKHT_K_V2 dari torchvision.
+    Lokasi file weight RAFT.
+    Default: ../models/raft_large_C_T_SKHT_K_V2-b5c70766.pth
+    Bisa dioverride dengan roop.globals.raft_model_path
     """
-    global RAFT_MODEL, RAFT_TRANSFORMS
+    rel = getattr(
+        roop.globals,
+        "raft_model_path",
+        "../models/raft_large_C_T_SKHT_K_V2-b5c70766.pth"
+    )
+    return resolve_relative_path(rel)
 
-    with RAFT_LOCK:
+
+def _init_raft_if_needed() -> None:
+    """
+    Lazy init RAFT Large (torchvision) di device CUDA kalau tersedia.
+    """
+    global RAFT_MODEL, RAFT_DEVICE
+
+    if RAFT_MODEL is not None:
+        return
+
+    with RAFT_INIT_LOCK:
         if RAFT_MODEL is not None:
-            return RAFT_MODEL
+            return
 
         try:
-            weights = Raft_Large_Weights.C_T_SKHT_K_V2
-            RAFT_TRANSFORMS = weights.transforms()
-            model = raft_large(weights=weights, progress=False)
-            model = model.to(RAFT_DEVICE)
-            model.eval()
-            RAFT_MODEL = model
-            print(f"✅ [face_analyser][RAFT] RAFT Large (C_T_SKHT_K_V2) loaded on {RAFT_DEVICE}")
+            import torch
+            from torchvision.models.optical_flow import raft_large
+
+            RAFT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+            weights_path = _get_raft_weights_path()
+            if not os.path.exists(weights_path):
+                print(f"[face_analyser][RAFT] weight tidak ditemukan: {weights_path}")
+                RAFT_MODEL = None
+                return
+
+            print(f"[face_analyser][RAFT] Loading RAFT Large from: {weights_path}")
+            RAFT_MODEL = raft_large(weights=None)
+            state = torch.load(weights_path, map_location=RAFT_DEVICE)
+            RAFT_MODEL.load_state_dict(state)
+            RAFT_MODEL.to(RAFT_DEVICE)
+            RAFT_MODEL.eval()
+            for p in RAFT_MODEL.parameters():
+                p.requires_grad_(False)
+
+            print(f"✅ [face_analyser] RAFT Large siap di device: {RAFT_DEVICE}")
         except Exception as e:
-            print(f"❌ [face_analyser][RAFT] gagal init RAFT Large: {e}")
+            print(f"[face_analyser][RAFT] gagal init RAFT: {e}")
             RAFT_MODEL = None
-            RAFT_TRANSFORMS = None
-
-        return RAFT_MODEL
 
 
-def _preprocess_for_raft(prev_bgr: np.ndarray, cur_bgr: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+def _frames_to_raft_tensors(prev_rgb: np.ndarray, curr_rgb: np.ndarray, device: str):
     """
-    BGR uint8 → batch [1,3,H,W] float untuk RAFT, gunakan transforms bawaan weights.
+    Konversi dua frame RGB [H,W,3] float32(0..1) jadi tensor untuk RAFT.
+    Dipad ke kelipatan 8, lalu nanti hasil flow di-crop kembali.
     """
-    # BGR → RGB
-    prev_rgb = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2RGB)
-    cur_rgb = cv2.cvtColor(cur_bgr, cv2.COLOR_BGR2RGB)
+    import torch
+    import torch.nn.functional as F
 
-    # [H,W,3] → [3,H,W]
-    prev_t = torch.from_numpy(prev_rgb).permute(2, 0, 1).float() / 255.0
-    cur_t = torch.from_numpy(cur_rgb).permute(2, 0, 1).float() / 255.0
+    h, w, _ = curr_rgb.shape
 
-    # buat batch
-    prev_t = prev_t.unsqueeze(0)  # [1,3,H,W]
-    cur_t = cur_t.unsqueeze(0)
+    def to_tensor(img):
+        t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
+        return t
 
-    if RAFT_TRANSFORMS is not None:
-        try:
-            prev_t, cur_t = RAFT_TRANSFORMS(prev_t, cur_t)
-        except Exception as e:
-            # kalau transforms error, minimal tetap jalan tanpa transforms
-            print(f"[face_analyser][RAFT] warning transforms error: {e}")
-    return prev_t.to(RAFT_DEVICE), cur_t.to(RAFT_DEVICE)
+    t1 = to_tensor(prev_rgb)
+    t2 = to_tensor(curr_rgb)
+
+    # pad ke kelipatan 8 (kanan & bawah)
+    pad_h = (8 - h % 8) % 8
+    pad_w = (8 - w % 8) % 8
+    if pad_h or pad_w:
+        pad = (0, pad_w, 0, pad_h)  # (left,right,top,bottom)
+        t1 = F.pad(t1, pad)
+        t2 = F.pad(t2, pad)
+
+    t1 = t1.to(device)
+    t2 = t2.to(device)
+
+    return t1, t2, h, w
 
 
-@torch.no_grad()
-def _get_raft_flow(frame: Frame, frame_idx: int) -> Optional[np.ndarray]:
+def _get_raft_flow(frame: Frame, frame_number: int) -> Optional[np.ndarray]:
     """
-    Hitung optical flow dense pakai RAFT Large.
-    Output: numpy (H,W,2) dalam koordinat piksel (dx,dy).
+    Hitung dense optical flow pakai RAFT (prev_frame → frame).
+    Flow: ndarray [H,W,2] (dx, dy) dalam koordinat pixel.
     """
-    global RAFT_PREV_FRAME, RAFT_LAST_FLOW, RAFT_LAST_FRAME_IDX
+    global RAFT_MODEL, RAFT_DEVICE, RAFT_PREV_FRAME, RAFT_LAST_FLOW, RAFT_LAST_FRAME_IDX
 
-    model = _get_raft_model()
-    if model is None or frame is None:
+    _init_raft_if_needed()
+    if RAFT_MODEL is None:
         return None
 
-    # frame pertama: belum bisa hitung flow
-    if RAFT_PREV_FRAME is None:
-        RAFT_PREV_FRAME = frame.copy()
+    if frame is None or frame.size == 0:
+        return None
+
+    # konversi BGR → RGB, float32 0..1
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+    # pertama kali: simpan dulu, belum ada flow
+    if RAFT_PREV_FRAME is None or RAFT_PREV_FRAME.shape != rgb.shape:
+        RAFT_PREV_FRAME = rgb
         RAFT_LAST_FLOW = None
-        RAFT_LAST_FRAME_IDX = frame_idx
-        print(f"[face_analyser][RAFT] first frame #{frame_idx}, belum ada flow.")
+        RAFT_LAST_FRAME_IDX = frame_number
         return None
 
-    # cache kalau sudah dihitung di frame ini
-    if RAFT_LAST_FRAME_IDX == frame_idx and RAFT_LAST_FLOW is not None:
+    # kalau sudah dihitung untuk frame ini, langsung pakai
+    if RAFT_LAST_FRAME_IDX == frame_number and RAFT_LAST_FLOW is not None:
         return RAFT_LAST_FLOW
 
     try:
-        img1_t, img2_t = _preprocess_for_raft(RAFT_PREV_FRAME, frame)
+        import torch
 
-        # torchvision RAFT: output = list of flows (iterasi)
-        list_of_flows = model(img1_t, img2_t)
+        img1, img2, h, w = _frames_to_raft_tensors(RAFT_PREV_FRAME, rgb, RAFT_DEVICE)
 
-        if isinstance(list_of_flows, (list, tuple)) and len(list_of_flows) > 0:
-            flow_tensor = list_of_flows[-1][0]  # ambil iterasi terakhir, batch idx 0 → [2,Hf,Wf]
-        else:
-            # fallback kalau versi lain: asumsikan [N,2,H,W]
-            flow_tensor = list_of_flows[0]
+        with torch.no_grad():
+            # torchvision RAFT mengembalikan list of flow, pakai yang terakhir
+            flow_list = RAFT_MODEL(img1, img2)
+            if isinstance(flow_list, (list, tuple)):
+                flow = flow_list[-1]
+            else:
+                flow = flow_list
 
-        flow_tensor = flow_tensor.detach().cpu()  # [2,Hf,Wf]
-        flow_np = flow_tensor.permute(1, 2, 0).numpy().astype(np.float32)  # [Hf,Wf,2]
+        # [1,2,H',W'] -> [H',W',2]
+        flow = flow[0].permute(1, 2, 0).cpu().numpy()
 
-        # resize ke ukuran frame asli kalau perlu
-        h, w = frame.shape[:2]
-        if flow_np.shape[0] != h or flow_np.shape[1] != w:
-            fx = cv2.resize(flow_np[..., 0], (w, h), interpolation=cv2.INTER_LINEAR)
-            fy = cv2.resize(flow_np[..., 1], (w, h), interpolation=cv2.INTER_LINEAR)
-            flow_np = np.stack([fx, fy], axis=-1).astype(np.float32)
+        # crop kembali ke size asli
+        flow = flow[:h, :w, :]
 
-        RAFT_PREV_FRAME = frame.copy()
-        RAFT_LAST_FLOW = flow_np
-        RAFT_LAST_FRAME_IDX = frame_idx
+        RAFT_PREV_FRAME = rgb
+        RAFT_LAST_FLOW = flow
+        RAFT_LAST_FRAME_IDX = frame_number
 
-        # debug ringan
-        # print(f"[face_analyser][RAFT] flow computed for frame {frame_idx}, shape={flow_np.shape}")
-        return flow_np
-
+        return flow
     except Exception as e:
-        print(f"[face_analyser][RAFT] error inference: {e}")
-        RAFT_PREV_FRAME = frame.copy()
+        print(f"[face_analyser][RAFT] error hitung flow: {e}")
+        RAFT_PREV_FRAME = rgb
         RAFT_LAST_FLOW = None
-        RAFT_LAST_FRAME_IDX = frame_idx
+        RAFT_LAST_FRAME_IDX = frame_number
         return None
 
 
-def raft_stabilize_bbox(face: Face, flow: np.ndarray) -> None:
+def raft_stabilize_bbox(face: Face, flow: Optional[np.ndarray]) -> None:
     """
-    Geser bbox mengikuti vektor flow di titik tengah lalu di-blend dengan bbox asli.
+    Stabilkan bbox 1 wajah dengan dense flow dari RAFT.
+    - Ambil vektor gerakan di center bbox (dx,dy)
+    - Geser bbox
+    - Blend dengan bbox sebelumnya pakai RAFT_FLOW_ALPHA
     """
     if flow is None:
         return
@@ -198,26 +229,28 @@ def raft_stabilize_bbox(face: Face, flow: np.ndarray) -> None:
         return
 
     flow_bbox = np.array([x1 + dx, y1 + dy, x2 + dx, y2 + dy], dtype=np.float32)
-    cur_bbox = np.array(face.bbox, dtype=np.float32)
+    current_bbox = np.array(face.bbox, dtype=np.float32)
 
-    alpha = float(RAFT_ALPHA)
+    alpha = float(RAFT_FLOW_ALPHA)
     alpha = max(0.0, min(1.0, alpha))
 
-    blended = alpha * flow_bbox + (1.0 - alpha) * cur_bbox
+    blended = alpha * flow_bbox + (1.0 - alpha) * current_bbox
     face.bbox = blended.astype(np.float32)
+
+
 # =====================================================================
-# FACE ANALYSER (INSIGHTFACE)
+#  MODEL HANDLING
 # =====================================================================
 
 def get_face_analyser() -> Any:
     """
     Lazy init insightface FaceAnalysis (buffalo_l).
+    Sekali saja per proses, thread-safe.
     """
     global FACE_ANALYSER
 
     with THREAD_LOCK:
         if FACE_ANALYSER is None:
-            print("[face_analyser] init insightface buffalo_l...")
             FACE_ANALYSER = insightface.app.FaceAnalysis(
                 name='buffalo_l',
                 providers=roop.globals.execution_providers
@@ -229,11 +262,11 @@ def get_face_analyser() -> Any:
 
 def clear_face_analyser() -> None:
     """
-    Reset analyser & seluruh state tracking + RAFT.
-    Panggil di post_process.
+    Reset analyser & tracking state.
+    Dipanggil saat post_process / cleanup.
     """
     global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
-    global RAFT_PREV_FRAME, RAFT_LAST_FLOW, RAFT_LAST_FRAME_IDX, RAFT_MODEL, RAFT_TRANSFORMS
+    global RAFT_PREV_FRAME, RAFT_LAST_FLOW, RAFT_LAST_FRAME_IDX
 
     with TRACK_LOCK:
         FACE_TRACKING.clear()
@@ -243,29 +276,26 @@ def clear_face_analyser() -> None:
     RAFT_PREV_FRAME = None
     RAFT_LAST_FLOW = None
     RAFT_LAST_FRAME_IDX = -1
-    RAFT_MODEL = None
-    RAFT_TRANSFORMS = None
 
     with THREAD_LOCK:
         FACE_ANALYSER = None
 
-    print("[face_analyser] analyser + tracking + RAFT cleared.")
-
 
 # =====================================================================
-# OCCLUDER ONNX (opsional)
+#  OCCLUDER ONNX (opsional)
 # =====================================================================
 
 def _get_occluder_session() -> Optional[ort.InferenceSession]:
     """
     Lazy init occluder.onnx.
-    Jika tidak ada → akan fallback ke det_score.
+    Kalau file tidak ada / gagal load → return None dan sistem fallback ke det_score.
     """
     global OCCLUDER_SESSION, OCCLUDER_INPUT_NAME
 
     if OCCLUDER_SESSION is not None:
         return OCCLUDER_SESSION
 
+    # Path default bisa kamu ganti via roop.globals.occluder_model_path
     model_rel = getattr(roop.globals, "occluder_model_path", "../models/occluder.onnx")
     model_path = resolve_relative_path(model_rel)
 
@@ -281,7 +311,7 @@ def _get_occluder_session() -> Optional[ort.InferenceSession]:
         OCCLUDER_INPUT_NAME = OCCLUDER_SESSION.get_inputs()[0].name
         print(f"✅ [face_analyser] Loaded occluder model: {model_path}")
     except Exception as e:
-        print(f"❌ [face_analyser] Failed load occluder model: {e}")
+        print(f"[face_analyser] Failed load occluder model: {e}")
         OCCLUDER_SESSION = None
         OCCLUDER_INPUT_NAME = None
 
@@ -291,8 +321,8 @@ def _get_occluder_session() -> Optional[ort.InferenceSession]:
 def _run_occluder_onnx(crop: np.ndarray) -> float:
     """
     Jalankan occluder.onnx di atas crop wajah.
-    Return: rasio area ter-occlude (0–1).
-    Jika error / tidak ada model → return 0.0 (anggap aman).
+    Return: occlusion score 0–1 (semakin besar artinya semakin tertutup).
+    Kalau model tidak tersedia / error → return 0.0 (anggap tidak occluded).
     """
     if crop is None or crop.size == 0:
         return 0.0
@@ -303,57 +333,56 @@ def _run_occluder_onnx(crop: np.ndarray) -> float:
 
     try:
         h, w = crop.shape[:2]
-        inp = cv2.resize(crop, (256, 256))
+        inp = cv2.resize(crop, (224, 224))
         inp = inp.astype('float32') / 255.0
         inp = inp.transpose(2, 0, 1)[None, ...]  # NCHW
 
         outputs = session.run(None, {OCCLUDER_INPUT_NAME: inp})
         pred = outputs[0]
 
-        # asumsi output [1,1,H,W] atau [1,H,W]
+        # asumsi output [1,1,H,W] mask atau heatmap occlusion
         if pred.ndim == 4:
             mask = pred[0, 0]
-        elif pred.ndim == 3:
-            mask = pred[0]
         else:
-            mask = pred
+            mask = pred[0]
 
         mask = cv2.resize(mask, (w, h))
         occl_ratio = float(np.mean(mask > 0.5))
         return occl_ratio
-    except Exception as e:
-        print(f"[face_analyser] occluder error: {e}")
+    except Exception:
         return 0.0
 
 
 # =====================================================================
-# BASIC FACE ACCESSORS
+#  BASIC FACE ACCESSORS
 # =====================================================================
 
 def get_many_faces(frame: Frame) -> Optional[List[Face]]:
     """
-    Deteksi banyak wajah, filter berdasarkan det_score.
+    Deteksi banyak wajah di satu frame.
+    - Pakai buffalo_l
+    - Filter berdasarkan det_score minimal (untuk video dance / gerak cepat)
     """
     try:
         faces = get_face_analyser().get(frame)
         if not faces:
             return []
 
-        faces = [f for f in faces if getattr(f, "det_score", 0.0) >= MIN_DET_SCORE]
-        # debug ringan
-        # print(f"[face_analyser] detected {len(faces)} faces (after threshold).")
+        # filter berdasarkan confidence
+        faces = [face for face in faces if getattr(face, "det_score", 0.0) >= MIN_DET_SCORE]
         return faces
     except ValueError:
         return None
-    except Exception as e:
-        print(f"[face_analyser] error get_many_faces: {e}")
+    except Exception:
+        # kalau ada error aneh dari insightface, jangan matikan pipeline
         return None
 
 
 def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
     """
-    Ambil 1 wajah dari frame.
-    position=0 default, kalau out-of-range pakai wajah terakhir.
+    Ambil 1 wajah dari frame:
+    - default: index 0
+    - kalau index out-of-range → pakai wajah terakhir
     """
     many_faces = get_many_faces(frame)
     if many_faces:
@@ -366,7 +395,8 @@ def get_one_face(frame: Frame, position: int = 0) -> Optional[Face]:
 
 def get_face_pose(face: Face) -> tuple[float, float, float]:
     """
-    Ambil (pitch, yaw, roll) dari objek Face insightface.
+    Ambil pose dari Face (pitch, yaw, roll) dalam derajat.
+    InsightFace menyimpan di face.pose dengan urutan (pitch, yaw, roll).
     """
     pose = getattr(face, "pose", None)
     if pose is None:
@@ -379,50 +409,62 @@ def get_face_pose(face: Face) -> tuple[float, float, float]:
         return pitch, yaw, roll
     except Exception:
         return 0.0, 0.0, 0.0
+
+
 # =====================================================================
-# MOTION & TRACKING
+#  MOTION & TRACKING
 # =====================================================================
 
 def calculate_motion_vector(prev_face: Face, current_face: Face) -> float:
     """
-    Hitung jarak perpindahan center bbox (Euclidean).
+    Hitung pergerakan (jarak Euclidean) antara dua bbox wajah berturutan.
+    Dipakai untuk informasi tambahan tracking (walau saat ini lebih fokus ke embedding).
     """
     if prev_face is None or current_face is None:
         return 0.0
 
     prev_bbox = prev_face.bbox
-    cur_bbox = current_face.bbox
+    current_bbox = current_face.bbox
 
+    # hitung titik tengah
     prev_center = np.array([
-        (prev_bbox[0] + prev_bbox[2]) / 2.0,
-        (prev_bbox[1] + prev_bbox[3]) / 2.0
+        (prev_bbox[0] + prev_bbox[2]) / 2,
+        (prev_bbox[1] + prev_bbox[3]) / 2
     ])
-    cur_center = np.array([
-        (cur_bbox[0] + cur_bbox[2]) / 2.0,
-        (cur_bbox[1] + cur_bbox[3]) / 2.0
+    current_center = np.array([
+        (current_bbox[0] + current_bbox[2]) / 2,
+        (current_bbox[1] + current_bbox[3]) / 2
     ])
 
-    return float(np.linalg.norm(cur_center - prev_center))
+    motion = np.linalg.norm(current_center - prev_center)
+    return float(motion)
 
 
 def _compute_embedding_similarity(current_embedding: np.ndarray,
                                   track_embedding: np.ndarray) -> float:
     """
-    Cosine similarity antara dua embedding (0–1).
+    Hitung similarity embedding (cosine-based).
+    Return 0 kalau terjadi error.
     """
     try:
+        # cosine() dari scipy.spatial.distance mengembalikan *distance*
+        # kita ubah jadi similarity: 1 - distance
         return 1.0 - float(cosine(current_embedding, track_embedding))
     except Exception:
         return 0.0
 
 
 # =====================================================================
-# TEMPORAL BUFFER (STABILITAS TEMPORAL)
+#  TEMPORAL FRAME BUFFER (STABILITAS TEMPORAL)
 # =====================================================================
 
 def push_temporal_frame(faces: List[Face], frame_number: int) -> None:
     """
-    Simpan snapshot bbox + embedding + pose ke buffer.
+    Simpan data wajah dari frame saat ini ke buffer temporal.
+    Disimpan:
+    - bbox
+    - embedding
+    - pose
     """
     if not faces:
         return
@@ -431,6 +473,7 @@ def push_temporal_frame(faces: List[Face], frame_number: int) -> None:
     for f in faces:
         emb = getattr(f, "normed_embedding", None)
         pose = getattr(f, "pose", None)
+
         snapshot.append({
             "bbox": np.array(f.bbox, dtype=np.float32).copy(),
             "embedding": emb.copy() if isinstance(emb, np.ndarray) else emb,
@@ -445,9 +488,9 @@ def push_temporal_frame(faces: List[Face], frame_number: int) -> None:
 
 def smooth_bbox_for_face(face: Face) -> None:
     """
-    Smoothing bbox dengan cara:
-    - cari beberapa bbox di buffer yang centernya paling dekat
-    - rata-ratakan
+    Haluskan bbox 1 wajah berdasarkan data di TEMPORAL_BUFFER.
+    Untuk menghindari wajah bercampur saat multi-face:
+    - kita ambil beberapa bbox dengan center paling dekat.
     """
     if not TEMPORAL_BUFFER:
         return
@@ -458,8 +501,8 @@ def smooth_bbox_for_face(face: Face) -> None:
     except Exception:
         return
 
-    centers = []
-    bboxes = []
+    centers: List[float] = []
+    bboxes: List[np.ndarray] = []
 
     for entry in TEMPORAL_BUFFER:
         for f in entry["faces"]:
@@ -476,6 +519,7 @@ def smooth_bbox_for_face(face: Face) -> None:
     if not bboxes:
         return
 
+    # Pilih maksimum 3 bbox dengan center terdekat
     idx_order = np.argsort(np.array(centers))
     k = min(3, len(idx_order))
     selected = [bboxes[i] for i in idx_order[:k]]
@@ -485,16 +529,17 @@ def smooth_bbox_for_face(face: Face) -> None:
 
 
 # =====================================================================
-# SMART TRACKING (EMBEDDING + TEMPORAL + RAFT)
+#  SMART TRACKING (EMBEDDING + TEMPORAL + RAFT)
 # =====================================================================
 
 def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]:
     """
-    Tracking wajah antar frame:
-    - matching pakai embedding similarity
-    - jaga ID konsisten
-    - smoothing temporal buffer
-    - RAFT optical flow untuk pergerakan halus
+    Smart tracking:
+    - gunakan embedding similarity + sedikit motion
+    - jaga agar ID wajah konsisten antar frame
+    - smoothing bbox pakai TEMPORAL_BUFFER (stabilitas temporal)
+    - stabilisasi tambahan pakai RAFT optical flow (GPU)
+    - thread-safe: di-protect oleh TRACK_LOCK
     """
     global FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
 
@@ -510,11 +555,14 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
             max_similarity = MIN_EMBED_SIMILARITY
             best_match_id = None
 
+            # embedding wajah sekarang
             current_embedding = getattr(face, "normed_embedding", None)
             if current_embedding is None or len(current_embedding) == 0:
                 current_embedding = np.array([])
 
+            # cari track yang paling cocok (snapshot list() → aman dari perubahan size)
             for track_id, track_data in list(FACE_TRACKING.items()):
+                # lupakan track yang terlalu lama tidak terlihat
                 if frame_number - track_data.get('last_seen', -9999) > MAX_TRACK_GAP:
                     continue
 
@@ -526,66 +574,78 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
                 if track_embedding is None:
                     continue
 
-                similarity = _compute_embedding_similarity(current_embedding, track_embedding)
-                if similarity > max_similarity:
-                    max_similarity = similarity
+                embedding_similarity = _compute_embedding_similarity(
+                    current_embedding, track_embedding
+                )
+
+                if embedding_similarity > max_similarity:
+                    max_similarity = embedding_similarity
                     best_match_id = track_id
 
             if best_match_id is not None:
+                # update track yang ada
                 face_id = best_match_id
                 prev_face = FACE_TRACKING[face_id]['last_face']
                 motion = calculate_motion_vector(prev_face, face)
+
                 FACE_TRACKING[face_id].update({
                     'last_face': face,
                     'last_seen': frame_number,
                     'motion': motion
                 })
-                # print(f"[tracking] frame {frame_number}: update track {face_id}, sim={max_similarity:.3f}")
             else:
+                # buat track baru
                 face_id = len(FACE_TRACKING) + 1
                 FACE_TRACKING[face_id] = {
                     'last_face': face,
                     'last_seen': frame_number,
                     'motion': 0.0
                 }
-                # print(f"[tracking] frame {frame_number}: new track {face_id}")
 
-            TRACKING_HISTORY.append({
+            # history lama (optional)
+            face_data = {
                 'bbox': np.array(face.bbox, dtype=np.float32).copy()
-            })
+            }
+            TRACKING_HISTORY.append(face_data)
             tracked_faces.append(face)
 
-        # buang track yang terlalu lama tidak muncul
+        # bersihkan track yang sudah terlalu tua
         FACE_TRACKING = {
             k: v for k, v in list(FACE_TRACKING.items())
             if frame_number - v.get('last_seen', -9999) <= MAX_TRACK_AGE
         }
 
+        # 🔥 Setelah tracking selesai → update temporal buffer & smooth bbox
         if tracked_faces:
-            # simpan ke buffer
             push_temporal_frame(tracked_faces, frame_number)
 
-            # smoothing bbox spatial
             for f in tracked_faces:
                 smooth_bbox_for_face(f)
 
-            # RAFT optical flow (temporal motion)
+            # hitung flow RAFT sekali per frame, lalu apply ke semua bbox
             flow = _get_raft_flow(frame, frame_number)
-            if flow is not None and RAFT_ALPHA > 0.0:
+            if flow is not None and RAFT_FLOW_ALPHA > 0.0:
                 for f in tracked_faces:
                     raft_stabilize_bbox(f, flow)
 
     return tracked_faces
+
+
 # =====================================================================
-# OCCLUSION & SIMILAR FACE
+#  OCCLUSION & SIMILAR FACE
 # =====================================================================
 
 def detect_occlusion(face: Face, frame: Optional[Frame] = None) -> bool:
     """
-    Deteksi wajah terhalang:
-    - kalau occluder.onnx ada → pakai mask model
-    - kalau tidak → fallback ke det_score
+    Deteksi wajah yang ter-occlusion (tertutup tangan, rambut, dsb).
+
+    Prioritas:
+    1. Kalau occluder.onnx tersedia & frame disediakan:
+       - pakai occlusion score dari model
+    2. Kalau tidak:
+       - fallback ke det_score < OCCLUSION_THRESHOLD
     """
+    # fallback paling aman: pakai det_score
     base_flag = getattr(face, "det_score", 1.0) < OCCLUSION_THRESHOLD
 
     if frame is None:
@@ -601,7 +661,7 @@ def detect_occlusion(face: Face, frame: Optional[Frame] = None) -> bool:
         x1 = max(0, min(x1, w - 1))
         x2 = max(0, min(x2, w))
         y1 = max(0, min(y1, h - 1))
-        y2 = max(0, min(y2, h))
+        y2 = max(0, min(y2, h - 1))
 
         if x2 <= x1 or y2 <= y1:
             return base_flag
@@ -612,12 +672,8 @@ def detect_occlusion(face: Face, frame: Optional[Frame] = None) -> bool:
 
         occl_score = _run_occluder_onnx(crop)
         threshold = getattr(roop.globals, "occluder_threshold", 0.20)
-
-        is_occ = occl_score > threshold
-        # print(f"[occlusion] score={occl_score:.3f}, thr={threshold:.3f}, occ={is_occ}")
-        return is_occ
-    except Exception as e:
-        print(f"[face_analyser] detect_occlusion error: {e}")
+        return occl_score > threshold
+    except Exception:
         return base_flag
 
 
@@ -625,9 +681,10 @@ def find_similar_face(frame: Frame,
                       reference_face: Face,
                       use_tracking: bool = True) -> Optional[Face]:
     """
-    Cari wajah paling mirip dengan reference_face pada frame.
-    - kalau use_tracking=True → pakai smart_face_tracking
-    - kalau False → pakai get_many_faces biasa
+    Cari wajah paling mirip di frame terhadap reference_face.
+    - Bisa pakai smart tracking (use_tracking=True)
+    - Atau fallback ke get_many_faces biasa
+    - Menggunakan embedding distance seperti di mod sebelumnya
     """
     if reference_face is None:
         return None
@@ -647,6 +704,7 @@ def find_similar_face(frame: Frame,
     best_face = None
     best_distance = float('inf')
 
+    # threshold diambil dari globals kalau ada, else fallback
     similar_threshold = getattr(roop.globals, 'similar_face_distance', 1.0)
 
     for face in many_faces:
@@ -654,14 +712,12 @@ def find_similar_face(frame: Frame,
             continue
 
         try:
-            dist = np.sum(np.square(face.normed_embedding - ref_emb))
+            distance = np.sum(np.square(face.normed_embedding - ref_emb))
         except Exception:
             continue
 
-        if dist < similar_threshold and dist < best_distance:
-            best_distance = dist
+        if distance < similar_threshold and distance < best_distance:
+            best_distance = distance
             best_face = face
 
-    # if best_face is not None:
-    #     print(f"[similar_face] best dist={best_distance:.4f}")
     return best_face
