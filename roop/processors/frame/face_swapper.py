@@ -1,4 +1,4 @@
-# face-swapper full stable version (temporal + TV-L1 ready)
+#face-swapper full stable version (temporal ready)
 
 from typing import Any, List, Callable
 import cv2
@@ -16,7 +16,7 @@ from roop.face_analyser import (
     smart_face_tracking,
     detect_occlusion,
     get_face_pose,
-    smooth_bbox_for_face  # temporal smoothing (buffer + TV-L1 di face_analyser)
+    smooth_bbox_for_face  # temporal smoothing
 )
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
@@ -125,15 +125,12 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
 
 def smooth_bbox_for_swapper(target_face: Face):
     """
-    Smoothing tahap kedua setelah pose adjustment.
-    Di sini kita panggil smooth_bbox_for_face() yang
-    di dalamnya sudah pakai:
-    - temporal buffer
-    - + Dual TV-L1 optical flow dari face_analyser
+    Smoothing tahap kedua setelah pose adjustment
+    Agar mask swap lebih stabil & anti flicker
     """
     try:
         smooth_bbox_for_face(target_face)
-    except Exception:
+    except:
         pass
 
 
@@ -148,7 +145,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # pose adjust
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
-    # temporal smoothing tahap 2 (buffer + TV-L1)
+    # temporal smoothing tahap 2
     smooth_bbox_for_swapper(target_face)
 
     # swap
@@ -178,7 +175,7 @@ def _select_best_target_by_embedding(faces: List[Face], reference_face: Face):
             continue
         try:
             dist = np.sum((f.normed_embedding - ref_emb) ** 2)
-        except Exception:
+        except:
             continue
 
         if dist < threshold and dist < best_dist:
@@ -302,7 +299,7 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
                 roop.globals.reference_face_position
             )
             set_face_reference(reference_face)
-        except Exception:
+        except:
             set_face_reference(None)
 
     roop.processors.frame.core.process_video(
