@@ -7,6 +7,7 @@ import insightface
 import numpy as np
 import cv2
 import os
+import torch
 
 import roop.globals
 from roop.typing import Frame, Face
@@ -44,172 +45,132 @@ MIN_EMBED_SIMILARITY = 0.70 # cosine similarity minimal untuk dianggap match (0�
 OCCLUDER_SESSION: Optional[ort.InferenceSession] = None
 OCCLUDER_INPUT_NAME: Optional[str] = None
 
+
 # =====================================================================
-#  RAFT LARGE (Recurrent All-Pairs Field Transforms) - OPTICAL FLOW CUDA
+#  RAFT OPTICAL FLOW (GPU / CUDA)
 # =====================================================================
 
-RAFT_MODEL = None
-RAFT_DEVICE = "cpu"
-RAFT_PREV_FRAME: Optional[np.ndarray] = None   # disimpan dalam RGB float32 [0..1]
+# Path model RAFT kamu, misalnya disimpan di folder models
+RAFT_MODEL_REL_PATH = getattr(
+    roop.globals,
+    "raft_model_path",
+    "../models/raft_large_C_T_V2-1bb1363a.pth"
+)
+
+RAFT_MODEL: Optional[torch.nn.Module] = None
+RAFT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+RAFT_PREV_TENSOR: Optional[torch.Tensor] = None
 RAFT_LAST_FLOW: Optional[np.ndarray] = None
-RAFT_LAST_FRAME_IDX: int = -1
+RAFT_LAST_FRAME: int = -1
 
-# seberapa kuat efek optical flow di-blend ke bbox
-RAFT_FLOW_ALPHA: float = 0.7  # 0.0 = mati, 1.0 = full RAFT
-
-RAFT_INIT_LOCK = threading.Lock()
-
-def _get_raft_weights_path() -> str:
-    """
-    Lokasi file weight RAFT.
-    Default: ../models/raft_large_C_T_SKHT_K_V2-b5c70766.pth
-    Bisa dioverride dengan roop.globals.raft_model_path
-    """
-    rel = getattr(
-        roop.globals,
-        "raft_model_path",
-        "../models/raft_large_C_T_SKHT_K_V2-b5c70766.pth"
-    )
-    return resolve_relative_path(rel)
+# seberapa kuat pengaruh RAFT terhadap bbox akhir
+RAFT_FLOW_ALPHA: float = 0.7  # 0 → matikan RAFT, 1 → full RAFT
 
 
 def _init_raft_if_needed() -> None:
     """
-    Lazy init RAFT Large (torchvision) di device CUDA kalau tersedia.
+    Lazy init RAFT (Recurrent All-Pairs Field Transforms).
+    Menggunakan arsitektur raft_large dari torchvision + state_dict lokal.
     """
-    global RAFT_MODEL, RAFT_DEVICE
+    global RAFT_MODEL
 
     if RAFT_MODEL is not None:
         return
 
-    with RAFT_INIT_LOCK:
-        if RAFT_MODEL is not None:
-            return
+    model_path = resolve_relative_path(RAFT_MODEL_REL_PATH)
+    if not os.path.exists(model_path):
+        print(f"[face_analyser][RAFT] model tidak ditemukan di {model_path}, RAFT dimatikan.")
+        RAFT_MODEL = None
+        return
 
-        try:
-            import torch
-            from torchvision.models.optical_flow import raft_large
+    try:
+        # import di sini supaya kalau torchvision belum support optical_flow,
+        # error-nya bisa di-handle dengan baik.
+        from torchvision.models.optical_flow import raft_large
 
-            RAFT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        RAFT_MODEL = raft_large(weights=None)
+        state = torch.load(model_path, map_location="cpu")
+        RAFT_MODEL.load_state_dict(state)
+        RAFT_MODEL.to(RAFT_DEVICE)
+        RAFT_MODEL.eval()
 
-            weights_path = _get_raft_weights_path()
-            if not os.path.exists(weights_path):
-                print(f"[face_analyser][RAFT] weight tidak ditemukan: {weights_path}")
-                RAFT_MODEL = None
-                return
+        for p in RAFT_MODEL.parameters():
+            p.requires_grad_(False)
 
-            print(f"[face_analyser][RAFT] Loading RAFT Large from: {weights_path}")
-            RAFT_MODEL = raft_large(weights=None)
-            state = torch.load(weights_path, map_location=RAFT_DEVICE)
-            RAFT_MODEL.load_state_dict(state)
-            RAFT_MODEL.to(RAFT_DEVICE)
-            RAFT_MODEL.eval()
-            for p in RAFT_MODEL.parameters():
-                p.requires_grad_(False)
-
-            print(f"✅ [face_analyser] RAFT Large siap di device: {RAFT_DEVICE}")
-        except Exception as e:
-            print(f"[face_analyser][RAFT] gagal init RAFT: {e}")
-            RAFT_MODEL = None
+        print(f"✅ [face_analyser] RAFT loaded on {RAFT_DEVICE}: {model_path}")
+    except Exception as e:
+        print(f"[face_analyser][RAFT] gagal init RAFT: {e}")
+        RAFT_MODEL = None
 
 
-def _frames_to_raft_tensors(prev_rgb: np.ndarray, curr_rgb: np.ndarray, device: str):
+def _preprocess_for_raft(frame: Frame) -> Optional[torch.Tensor]:
     """
-    Konversi dua frame RGB [H,W,3] float32(0..1) jadi tensor untuk RAFT.
-    Dipad ke kelipatan 8, lalu nanti hasil flow di-crop kembali.
+    Convert frame BGR (OpenCV) → tensor [1,3,H,W] float32 di device RAFT.
     """
-    import torch
-    import torch.nn.functional as F
+    if frame is None:
+        return None
+    try:
+        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    except Exception:
+        return None
 
-    h, w, _ = curr_rgb.shape
-
-    def to_tensor(img):
-        t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)  # [1,3,H,W]
-        return t
-
-    t1 = to_tensor(prev_rgb)
-    t2 = to_tensor(curr_rgb)
-
-    # pad ke kelipatan 8 (kanan & bawah)
-    pad_h = (8 - h % 8) % 8
-    pad_w = (8 - w % 8) % 8
-    if pad_h or pad_w:
-        pad = (0, pad_w, 0, pad_h)  # (left,right,top,bottom)
-        t1 = F.pad(t1, pad)
-        t2 = F.pad(t2, pad)
-
-    t1 = t1.to(device)
-    t2 = t2.to(device)
-
-    return t1, t2, h, w
+    ten = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0  # [3,H,W]
+    ten = ten.unsqueeze(0).to(RAFT_DEVICE, non_blocking=True)         # [1,3,H,W]
+    return ten
 
 
 def _get_raft_flow(frame: Frame, frame_number: int) -> Optional[np.ndarray]:
     """
-    Hitung dense optical flow pakai RAFT (prev_frame → frame).
-    Flow: ndarray [H,W,2] (dx, dy) dalam koordinat pixel.
+    Hitung optical flow RAFT antara frame sebelumnya → frame sekarang.
+    Satu kali per frame_number, dan hasil dishare untuk semua wajah.
     """
-    global RAFT_MODEL, RAFT_DEVICE, RAFT_PREV_FRAME, RAFT_LAST_FLOW, RAFT_LAST_FRAME_IDX
+    global RAFT_MODEL, RAFT_PREV_TENSOR, RAFT_LAST_FLOW, RAFT_LAST_FRAME
 
     _init_raft_if_needed()
     if RAFT_MODEL is None:
         return None
 
-    if frame is None or frame.size == 0:
+    cur_tensor = _preprocess_for_raft(frame)
+    if cur_tensor is None:
         return None
 
-    # konversi BGR → RGB, float32 0..1
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-
-    # pertama kali: simpan dulu, belum ada flow
-    if RAFT_PREV_FRAME is None or RAFT_PREV_FRAME.shape != rgb.shape:
-        RAFT_PREV_FRAME = rgb
+    # Kalau pertama kali / resolusi berubah: set prev dan skip flow
+    if RAFT_PREV_TENSOR is None or RAFT_PREV_TENSOR.shape != cur_tensor.shape:
+        RAFT_PREV_TENSOR = cur_tensor
         RAFT_LAST_FLOW = None
-        RAFT_LAST_FRAME_IDX = frame_number
+        RAFT_LAST_FRAME = frame_number
         return None
 
-    # kalau sudah dihitung untuk frame ini, langsung pakai
-    if RAFT_LAST_FRAME_IDX == frame_number and RAFT_LAST_FLOW is not None:
+    # Kalau untuk frame ini sudah dihitung, pakai cache
+    if RAFT_LAST_FRAME == frame_number and RAFT_LAST_FLOW is not None:
         return RAFT_LAST_FLOW
 
     try:
-        import torch
-
-        img1, img2, h, w = _frames_to_raft_tensors(RAFT_PREV_FRAME, rgb, RAFT_DEVICE)
-
         with torch.no_grad():
-            # torchvision RAFT mengembalikan list of flow, pakai yang terakhir
-            flow_list = RAFT_MODEL(img1, img2)
-            if isinstance(flow_list, (list, tuple)):
-                flow = flow_list[-1]
-            else:
-                flow = flow_list
-
-        # [1,2,H',W'] -> [H',W',2]
-        flow = flow[0].permute(1, 2, 0).cpu().numpy()
-
-        # crop kembali ke size asli
-        flow = flow[:h, :w, :]
-
-        RAFT_PREV_FRAME = rgb
-        RAFT_LAST_FLOW = flow
-        RAFT_LAST_FRAME_IDX = frame_number
-
-        return flow
+            # RAFT mengembalikan list flow, ambil yang paling akhir
+            flows = RAFT_MODEL(RAFT_PREV_TENSOR, cur_tensor)
+            flow = flows[-1][0]  # [2,H,W]
+        flow_np = flow.permute(1, 2, 0).detach().cpu().numpy()  # [H,W,2], (dx, dy)
     except Exception as e:
-        print(f"[face_analyser][RAFT] error hitung flow: {e}")
-        RAFT_PREV_FRAME = rgb
+        print(f"[face_analyser][RAFT] error infer RAFT: {e}")
+        RAFT_PREV_TENSOR = cur_tensor
         RAFT_LAST_FLOW = None
-        RAFT_LAST_FRAME_IDX = frame_number
+        RAFT_LAST_FRAME = frame_number
         return None
+
+    RAFT_PREV_TENSOR = cur_tensor
+    RAFT_LAST_FLOW = flow_np
+    RAFT_LAST_FRAME = frame_number
+    return flow_np
 
 
 def raft_stabilize_bbox(face: Face, flow: Optional[np.ndarray]) -> None:
     """
-    Stabilkan bbox 1 wajah dengan dense flow dari RAFT.
-    - Ambil vektor gerakan di center bbox (dx,dy)
-    - Geser bbox
-    - Blend dengan bbox sebelumnya pakai RAFT_FLOW_ALPHA
+    Stabilkan bbox 1 wajah dengan optical flow RAFT.
+    - Ambil vektor gerak di center bbox
+    - Geser bbox mengikuti flow
+    - Blend bbox lama + bbox hasil RAFT pakai RAFT_FLOW_ALPHA
     """
     if flow is None:
         return
@@ -219,9 +180,9 @@ def raft_stabilize_bbox(face: Face, flow: Optional[np.ndarray]) -> None:
     except Exception:
         return
 
-    h, w, _ = flow.shape
-    cx = int(max(0, min((x1 + x2) / 2.0, w - 1)))
-    cy = int(max(0, min((y1 + y2) / 2.0, h - 1)))
+    h, w = flow.shape[:2]
+    cx = int(max(0, min((x1 + x2) * 0.5, w - 1)))
+    cy = int(max(0, min((y1 + y2) * 0.5, h - 1)))
 
     try:
         dx, dy = flow[cy, cx]
@@ -266,16 +227,17 @@ def clear_face_analyser() -> None:
     Dipanggil saat post_process / cleanup.
     """
     global FACE_ANALYSER, FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
-    global RAFT_PREV_FRAME, RAFT_LAST_FLOW, RAFT_LAST_FRAME_IDX
+    global RAFT_PREV_TENSOR, RAFT_LAST_FLOW, RAFT_LAST_FRAME
 
     with TRACK_LOCK:
         FACE_TRACKING.clear()
         TRACKING_HISTORY.clear()
         TEMPORAL_BUFFER.clear()
 
-    RAFT_PREV_FRAME = None
+    # reset RAFT state
+    RAFT_PREV_TENSOR = None
     RAFT_LAST_FLOW = None
-    RAFT_LAST_FRAME_IDX = -1
+    RAFT_LAST_FRAME = -1
 
     with THREAD_LOCK:
         FACE_ANALYSER = None
@@ -538,7 +500,7 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
     - gunakan embedding similarity + sedikit motion
     - jaga agar ID wajah konsisten antar frame
     - smoothing bbox pakai TEMPORAL_BUFFER (stabilitas temporal)
-    - stabilisasi tambahan pakai RAFT optical flow (GPU)
+    - stabilisasi tambahan pakai RAFT optical flow (GPU kalau ada)
     - thread-safe: di-protect oleh TRACK_LOCK
     """
     global FACE_TRACKING, TRACKING_HISTORY, TEMPORAL_BUFFER
@@ -602,7 +564,7 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
                     'motion': 0.0
                 }
 
-            # history lama (optional)
+            # history lama (optional, masih disimpan jika ingin dipakai hal lain)
             face_data = {
                 'bbox': np.array(face.bbox, dtype=np.float32).copy()
             }
@@ -617,14 +579,16 @@ def smart_face_tracking(frame: Frame, frame_number: int) -> Optional[List[Face]]
 
         # 🔥 Setelah tracking selesai → update temporal buffer & smooth bbox
         if tracked_faces:
+            # simpan snapshot ke buffer
             push_temporal_frame(tracked_faces, frame_number)
 
+            # smoothing berbasis buffer
             for f in tracked_faces:
                 smooth_bbox_for_face(f)
 
-            # hitung flow RAFT sekali per frame, lalu apply ke semua bbox
+            # 🔥 stabilisasi tambahan dengan RAFT optical flow
             flow = _get_raft_flow(frame, frame_number)
-            if flow is not None and RAFT_FLOW_ALPHA > 0.0:
+            if flow is not None:
                 for f in tracked_faces:
                     raft_stabilize_bbox(f, flow)
 
@@ -661,7 +625,7 @@ def detect_occlusion(face: Face, frame: Optional[Frame] = None) -> bool:
         x1 = max(0, min(x1, w - 1))
         x2 = max(0, min(x2, w))
         y1 = max(0, min(y1, h - 1))
-        y2 = max(0, min(y2, h - 1))
+        y2 = max(0, min(y2, h))
 
         if x2 <= x1 or y2 <= y1:
             return base_flag
