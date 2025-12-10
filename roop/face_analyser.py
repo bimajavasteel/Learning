@@ -303,7 +303,7 @@ def _run_occluder_onnx(crop: np.ndarray) -> float:
 
     try:
         h, w = crop.shape[:2]
-        inp = cv2.resize(crop, (224, 224))
+        inp = cv2.resize(crop, (256, 256))
         inp = inp.astype('float32') / 255.0
         inp = inp.transpose(2, 0, 1)[None, ...]  # NCHW
 
