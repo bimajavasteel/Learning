@@ -1,4 +1,4 @@
-from typing import Any, List, Callable
+from typing import Any, List, Callable, Optional, Dict
 import cv2
 import threading
 import numpy as np
@@ -20,8 +20,8 @@ THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-ENHANCER'
 
-# 🔥 Temporal cache (per process, aman di Kaggle)
-PREV_FACE_CACHE = {}
+# Cache menyimpan: { face_index_or_id: (center_point, enhanced_image) }
+PREV_FACE_CACHE: Dict[int, Any] = {}
 
 
 # ============================================================
@@ -60,10 +60,9 @@ def clear_face_enhancer() -> None:
 # ============================================================
 
 def _adaptive_alpha(det_score: float) -> float:
-    """
-    Confidence-gated alpha
-    """
-    base = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend else 0.65
+    """Confidence-gated alpha"""
+    # Gunakan default 0.5 jika global belum di-set
+    base = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.65
 
     if det_score < 0.4:
         return base * 0.5
@@ -73,36 +72,79 @@ def _adaptive_alpha(det_score: float) -> float:
 
 
 def _temporal_luma_ema(curr: np.ndarray, prev: np.ndarray, alpha: float) -> np.ndarray:
+    """EMA hanya di channel luminance (Y) untuk menjaga detail tapi stabilkan cahaya"""
+    try:
+        curr_ycc = cv2.cvtColor(curr, cv2.COLOR_BGR2YCrCb)
+        prev_ycc = cv2.cvtColor(prev, cv2.COLOR_BGR2YCrCb)
+
+        curr_y = curr_ycc[:, :, 0].astype(np.float32)
+        prev_y = prev_ycc[:, :, 0].astype(np.float32)
+
+        blended_y = alpha * curr_y + (1.0 - alpha) * prev_y
+        curr_ycc[:, :, 0] = np.clip(blended_y, 0, 255).astype(np.uint8)
+
+        return cv2.cvtColor(curr_ycc, cv2.COLOR_YCrCb2BGR)
+    except Exception:
+        return curr
+
+
+def _find_closest_cache(center_current, threshold=50):
     """
-    EMA hanya di channel luminance (Y)
+    Mencari wajah di cache yang posisinya paling dekat dengan wajah sekarang.
+    Ini menggantikan id() yang tidak reliable antar frame.
     """
-    curr_ycc = cv2.cvtColor(curr, cv2.COLOR_BGR2YCrCb)
-    prev_ycc = cv2.cvtColor(prev, cv2.COLOR_BGR2YCrCb)
+    best_id = None
+    min_dist = float('inf')
 
-    curr_y = curr_ycc[:, :, 0].astype(np.float32)
-    prev_y = prev_ycc[:, :, 0].astype(np.float32)
+    for fid, data in PREV_FACE_CACHE.items():
+        center_prev = data['center']
+        dist = np.linalg.norm(np.array(center_current) - np.array(center_prev))
+        
+        if dist < min_dist and dist < threshold:
+            min_dist = dist
+            best_id = fid
+            
+    return best_id
 
-    blended_y = alpha * curr_y + (1.0 - alpha) * prev_y
-    curr_ycc[:, :, 0] = np.clip(blended_y, 0, 255).astype(np.uint8)
 
-    return cv2.cvtColor(curr_ycc, cv2.COLOR_YCrCb2BGR)
-
-
-def _temporal_enhance(face_id: int,
+def _temporal_enhance(target_center: tuple,
                       enhanced: np.ndarray,
                       det_score: float) -> np.ndarray:
-    """
-    EMA + Luminance-only + Confidence gate
-    """
-    alpha = _adaptive_alpha(det_score)
-
-    prev = PREV_FACE_CACHE.get(face_id)
-    if prev is None or prev.shape != enhanced.shape:
-        PREV_FACE_CACHE[face_id] = enhanced.copy()
+    
+    # 1. Cari cache yang cocok berdasarkan posisi
+    face_id = _find_closest_cache(target_center)
+    
+    # 2. Jika tidak ada di cache, buat ID baru
+    if face_id is None:
+        face_id = len(PREV_FACE_CACHE) + 1
+        PREV_FACE_CACHE[face_id] = {
+            'image': enhanced.copy(),
+            'center': target_center
+        }
         return enhanced
 
-    out = _temporal_luma_ema(enhanced, prev, alpha)
-    PREV_FACE_CACHE[face_id] = out.copy()
+    # 3. Ambil data lama
+    prev_data = PREV_FACE_CACHE[face_id]
+    prev_img = prev_data['image']
+
+    # Pastikan dimensi sama (penting jika ukuran crop berubah sedikit)
+    if prev_img.shape != enhanced.shape:
+        prev_img = cv2.resize(prev_img, (enhanced.shape[1], enhanced.shape[0]))
+
+    # 4. Lakukan Blending
+    alpha = _adaptive_alpha(det_score)
+    out = _temporal_luma_ema(enhanced, prev_img, alpha)
+
+    # 5. Update Cache
+    PREV_FACE_CACHE[face_id] = {
+        'image': out.copy(),
+        'center': target_center
+    }
+    
+    # Bersihkan cache jika terlalu besar (opsional garbage collection sederhana)
+    if len(PREV_FACE_CACHE) > 20:
+        PREV_FACE_CACHE.clear()
+
     return out
 
 
@@ -111,7 +153,12 @@ def _temporal_enhance(face_id: int,
 # ============================================================
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    x1, y1, x2, y2 = map(int, target_face['bbox'])
+    # PERBAIKAN 1: Akses atribut menggunakan dot notation, bukan dictionary key
+    try:
+        x1, y1, x2, y2 = map(int, target_face.bbox)
+    except AttributeError:
+        # Fallback jika ternyata objectnya dictionary (jarang terjadi di Roop standard)
+        x1, y1, x2, y2 = map(int, target_face['bbox'])
 
     pad_x = int((x2 - x1) * 0.2)
     pad_y = int((y2 - y1) * 0.2)
@@ -129,11 +176,12 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     with THREAD_SEMAPHORE:
         _, _, enhanced = get_face_enhancer().enhance(crop, paste_back=False)
 
-    # 🔥 temporal stabilize (face_id pakai id() aman per frame)
-    face_id = id(target_face)
-    det_score = float(target_face.get('det_score', 1.0))
+    # PERBAIKAN 2: Gunakan center point untuk matching temporal
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+    det_score = float(getattr(target_face, 'det_score', 1.0))
 
-    enhanced = _temporal_enhance(face_id, enhanced, det_score)
+    enhanced = _temporal_enhance((center_x, center_y), enhanced, det_score)
 
     # color consistency (simple mean match)
     mean_src = np.mean(crop, axis=(0, 1))
@@ -170,9 +218,7 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) ->
     return temp_frame
 
 
-def process_frames(source_path: str,
-                   temp_frame_paths: List[str],
-                   update: Callable[[], None]) -> None:
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
     for frame_path in temp_frame_paths:
         frame = cv2.imread(frame_path)
         result = process_frame(None, None, frame)
@@ -181,16 +227,13 @@ def process_frames(source_path: str,
             update()
 
 
-def process_image(source_path: str,
-                  target_path: str,
-                  output_path: str) -> None:
+def process_image(source_path: str, target_path: str, output_path: str) -> None:
     frame = cv2.imread(target_path)
     result = process_frame(None, None, frame)
     cv2.imwrite(output_path, result)
 
 
-def process_video(source_path: str,
-                  temp_frame_paths: List[str]) -> None:
+def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     roop.processors.frame.core.process_video(
         None,
         temp_frame_paths,
