@@ -117,23 +117,9 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
         return
 
     face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-
-
 # ============================================================
 # TEMPORAL BBOX SMOOTHING (AFTER POSE ADJUST)
 # ============================================================
-
-def smooth_bbox_for_swapper(target_face: Face):
-    """
-    Smoothing tahap kedua setelah pose adjustment
-    Agar mask swap lebih stabil & anti flicker
-    """
-    try:
-        smooth_bbox_for_face(target_face)
-    except:
-        pass
-
-
 # ============================================================
 # SWAP FACE CORE
 # ============================================================
