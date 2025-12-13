@@ -20,12 +20,12 @@ THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
 NAME = 'ROOP.FACE-ENHANCER'
 
-# Cache menyimpan: { face_index_or_id: (center_point, enhanced_image) }
+# Cache menyimpan: { face_index_or_id: { 'center': (x,y), 'image': img_array } }
 PREV_FACE_CACHE: Dict[int, Any] = {}
 
 
 # ============================================================
-# MODEL INIT
+# MODEL INIT & CHECKS (WAJIB ADA)
 # ============================================================
 
 def get_device() -> str:
@@ -55,13 +55,38 @@ def clear_face_enhancer() -> None:
     PREV_FACE_CACHE.clear()
 
 
+def pre_check() -> bool:
+    """
+    Fungsi Wajib: Mengecek ketersediaan model GFPGAN.
+    """
+    download_directory_path = resolve_relative_path('../models')
+    conditional_download(download_directory_path, ['https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'])
+    return True
+
+
+def pre_start() -> bool:
+    """
+    Fungsi Wajib: Mengecek validitas target path.
+    """
+    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
+        update_status('Select an image or video for target path.', NAME)
+        return False
+    return True
+
+
+def post_process() -> None:
+    """
+    Fungsi Wajib: Cleanup setelah proses selesai.
+    """
+    clear_face_enhancer()
+
+
 # ============================================================
-# TEMPORAL ENHANCER CORE
+# TEMPORAL ENHANCER CORE (ANTI-FLICKER)
 # ============================================================
 
 def _adaptive_alpha(det_score: float) -> float:
-    """Confidence-gated alpha"""
-    # Gunakan default 0.5 jika global belum di-set
+    """Confidence-gated alpha: Makin yakin deteksinya, makin kuat blendingnya"""
     base = roop.globals.face_enhancer_blend if roop.globals.face_enhancer_blend is not None else 0.65
 
     if det_score < 0.4:
@@ -72,7 +97,7 @@ def _adaptive_alpha(det_score: float) -> float:
 
 
 def _temporal_luma_ema(curr: np.ndarray, prev: np.ndarray, alpha: float) -> np.ndarray:
-    """EMA hanya di channel luminance (Y) untuk menjaga detail tapi stabilkan cahaya"""
+    """EMA hanya di channel luminance (Y) untuk menjaga detail tapi menstabilkan cahaya"""
     try:
         curr_ycc = cv2.cvtColor(curr, cv2.COLOR_BGR2YCrCb)
         prev_ycc = cv2.cvtColor(prev, cv2.COLOR_BGR2YCrCb)
@@ -80,6 +105,7 @@ def _temporal_luma_ema(curr: np.ndarray, prev: np.ndarray, alpha: float) -> np.n
         curr_y = curr_ycc[:, :, 0].astype(np.float32)
         prev_y = prev_ycc[:, :, 0].astype(np.float32)
 
+        # Blending Temporal
         blended_y = alpha * curr_y + (1.0 - alpha) * prev_y
         curr_ycc[:, :, 0] = np.clip(blended_y, 0, 255).astype(np.uint8)
 
@@ -91,13 +117,14 @@ def _temporal_luma_ema(curr: np.ndarray, prev: np.ndarray, alpha: float) -> np.n
 def _find_closest_cache(center_current, threshold=50):
     """
     Mencari wajah di cache yang posisinya paling dekat dengan wajah sekarang.
-    Ini menggantikan id() yang tidak reliable antar frame.
+    Menggunakan Euclidean Distance karena id() objek wajah selalu berubah.
     """
     best_id = None
     min_dist = float('inf')
 
     for fid, data in PREV_FACE_CACHE.items():
         center_prev = data['center']
+        # Hitung jarak antara center wajah sekarang vs cache
         dist = np.linalg.norm(np.array(center_current) - np.array(center_prev))
         
         if dist < min_dist and dist < threshold:
@@ -114,7 +141,7 @@ def _temporal_enhance(target_center: tuple,
     # 1. Cari cache yang cocok berdasarkan posisi
     face_id = _find_closest_cache(target_center)
     
-    # 2. Jika tidak ada di cache, buat ID baru
+    # 2. Jika tidak ada di cache (wajah baru), simpan dan return
     if face_id is None:
         face_id = len(PREV_FACE_CACHE) + 1
         PREV_FACE_CACHE[face_id] = {
@@ -127,21 +154,21 @@ def _temporal_enhance(target_center: tuple,
     prev_data = PREV_FACE_CACHE[face_id]
     prev_img = prev_data['image']
 
-    # Pastikan dimensi sama (penting jika ukuran crop berubah sedikit)
+    # Resize prev_img jika ukuran crop berubah sedikit (stabilisasi dimensi)
     if prev_img.shape != enhanced.shape:
         prev_img = cv2.resize(prev_img, (enhanced.shape[1], enhanced.shape[0]))
 
-    # 4. Lakukan Blending
+    # 4. Lakukan Blending Temporal
     alpha = _adaptive_alpha(det_score)
     out = _temporal_luma_ema(enhanced, prev_img, alpha)
 
-    # 5. Update Cache
+    # 5. Update Cache dengan hasil blending terbaru
     PREV_FACE_CACHE[face_id] = {
         'image': out.copy(),
         'center': target_center
     }
     
-    # Bersihkan cache jika terlalu besar (opsional garbage collection sederhana)
+    # Garbage collection sederhana (cegah memori bocor)
     if len(PREV_FACE_CACHE) > 20:
         PREV_FACE_CACHE.clear()
 
@@ -153,11 +180,10 @@ def _temporal_enhance(target_center: tuple,
 # ============================================================
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
-    # PERBAIKAN 1: Akses atribut menggunakan dot notation, bukan dictionary key
+    # Handle akses atribut bbox (bisa dictionary atau object)
     try:
         x1, y1, x2, y2 = map(int, target_face.bbox)
     except AttributeError:
-        # Fallback jika ternyata objectnya dictionary (jarang terjadi di Roop standard)
         x1, y1, x2, y2 = map(int, target_face['bbox'])
 
     pad_x = int((x2 - x1) * 0.2)
@@ -173,22 +199,24 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
     if crop.size == 0:
         return temp_frame
 
+    # --- INFERENCE GFPGAN ---
     with THREAD_SEMAPHORE:
         _, _, enhanced = get_face_enhancer().enhance(crop, paste_back=False)
 
-    # PERBAIKAN 2: Gunakan center point untuk matching temporal
+    # --- TEMPORAL STABILIZATION ---
     center_x = (x1 + x2) // 2
     center_y = (y1 + y2) // 2
     det_score = float(getattr(target_face, 'det_score', 1.0))
 
     enhanced = _temporal_enhance((center_x, center_y), enhanced, det_score)
 
-    # color consistency (simple mean match)
+    # --- COLOR CONSISTENCY ---
+    # Menyamakan tone warna hasil enhance dengan crop asli
     mean_src = np.mean(crop, axis=(0, 1))
     mean_dst = np.mean(enhanced, axis=(0, 1))
     enhanced = np.clip(enhanced + (mean_src - mean_dst), 0, 255).astype(np.uint8)
 
-    # soft mask
+    # --- COMPOSITING (PASTE BACK) ---
     mask = np.zeros(crop.shape[:2], dtype=np.float32)
     cv2.ellipse(
         mask,
@@ -205,7 +233,7 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
 
 
 # ============================================================
-# PROCESSORS
+# MAIN PROCESSORS (STANDARD ROOP API)
 # ============================================================
 
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
