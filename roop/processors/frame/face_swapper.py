@@ -16,7 +16,6 @@ from roop.face_analyser import (
     smart_face_tracking,
     detect_occlusion,
     get_face_pose,
-    smooth_bbox_for_face  # temporal smoothing
 )
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
