@@ -1,6 +1,4 @@
-#face-swapper full stable version (temporal ready)
-
-from typing import Any, List, Callable
+from typing import Any, List, Callable, Optional
 import cv2
 import insightface
 import threading
@@ -15,7 +13,7 @@ from roop.face_analyser import (
     find_similar_face,
     smart_face_tracking,
     detect_occlusion,
-    get_face_pose,
+    get_face_pose
 )
 from roop.face_reference import get_face_reference, set_face_reference, clear_face_reference
 from roop.typing import Face, Frame
@@ -83,6 +81,10 @@ def post_process() -> None:
 # ============================================================
 
 def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
+    """
+    Menyesuaikan ukuran bbox berdasarkan pose wajah (yaw/pitch)
+    agar topeng wajah tidak terpotong saat menoleh.
+    """
     pitch, yaw, roll = get_face_pose(face)
     h_frame, w_frame = frame_shape[:2]
 
@@ -94,12 +96,12 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
     pad_y_top = 0.0
     pad_y_bottom = 0.0
 
-    # yaw adjustment
+    # yaw adjustment (menoleh ke samping)
     if abs(yaw) > 25.0:
         extra = min((abs(yaw) - 25.0) * 0.02, 0.12)  # max 12%
         pad_x = w * extra
 
-    # pitch adjustment
+    # pitch adjustment (mendongak/menunduk)
     if pitch < -15.0:
         extra = min((abs(pitch) - 15.0) * 0.02, 0.20)
         pad_y_top = h * extra
@@ -116,9 +118,8 @@ def adapt_bbox_for_pose(face: Face, frame_shape) -> None:
         return
 
     face.bbox = np.array([nx1, ny1, nx2, ny2], dtype=np.float32)
-# ============================================================
-# TEMPORAL BBOX SMOOTHING (AFTER POSE ADJUST)
-# ============================================================
+
+
 # ============================================================
 # SWAP FACE CORE
 # ============================================================
@@ -127,13 +128,13 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if source_face is None or target_face is None:
         return temp_frame
 
-    # pose adjust
+    # 1. Pose Adjust (Penting agar tidak cropping berlebihan saat menoleh)
     adapt_bbox_for_pose(target_face, temp_frame.shape)
 
-    # temporal smoothing tahap 2
-    smooth_bbox_for_swapper(target_face)
+    # 2. Kalman Smoothing sudah dilakukan di face_analyser.smart_face_tracking()
+    # Jadi kita tidak perlu memanggil smooth_bbox_for_face() lagi di sini.
 
-    # swap
+    # 3. Swap
     return get_face_swapper().get(
         temp_frame,
         target_face,
@@ -159,6 +160,8 @@ def _select_best_target_by_embedding(faces: List[Face], reference_face: Face):
         if not hasattr(f, "normed_embedding"):
             continue
         try:
+            # Menggunakan Euclidean distance (sum of squared differences)
+            # Karena Roop standar menggunakan ini.
             dist = np.sum((f.normed_embedding - ref_emb) ** 2)
         except:
             continue
@@ -176,8 +179,9 @@ def _select_best_target_by_embedding(faces: List[Face], reference_face: Face):
 
 def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, frame_number: int = 0) -> Frame:
 
-    # MODE: many faces = swap semua
+    # MODE: many faces = swap semua wajah yang terdeteksi
     if roop.globals.many_faces:
+        # Gunakan smart tracking untuk stabilitas jika diinginkan, atau get_many_faces biasa
         faces = smart_face_tracking(temp_frame, frame_number)
         if not faces:
             faces = get_many_faces(temp_frame)
@@ -186,20 +190,25 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, fr
             return temp_frame
 
         for target_face in faces:
+            # Skip jika wajah tertutup (occluded) parah
             if detect_occlusion(target_face, temp_frame):
                 continue
             temp_frame = swap_face(source_face, target_face, temp_frame)
 
         return temp_frame
 
-    # MODE: single face (pakai reference)
+    # MODE: single face (pakai reference face)
+    # Kita tetap pakai smart_face_tracking agar posisi bbox stabil (anti-jitter)
     tracked = smart_face_tracking(temp_frame, frame_number)
+    
+    # Fallback jika tracking gagal
     if not tracked:
         tracked = get_many_faces(temp_frame)
 
     if not tracked:
         return temp_frame
 
+    # Filter wajah yang tertutup (occluded)
     valid = [f for f in tracked if not detect_occlusion(f, temp_frame)]
     if not valid:
         return temp_frame
@@ -208,6 +217,7 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, fr
     if reference_face is not None:
         best_face = _select_best_target_by_embedding(valid, reference_face)
 
+    # Jika tidak ketemu yang mirip reference, ambil yang pertama (fallback)
     if best_face is None:
         best_face = valid[0]
 
@@ -220,21 +230,19 @@ def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame, fr
 # ============================================================
 
 def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
-
     source_img = cv2.imread(source_path)
     source_face = get_one_face(source_img)
 
     reference_face = None if roop.globals.many_faces else get_face_reference()
 
     for idx, frame_path in enumerate(temp_frame_paths):
-
         temp_frame = cv2.imread(frame_path)
-
+        
         result = process_frame(
             source_face=source_face,
             reference_face=reference_face,
             temp_frame=temp_frame,
-            frame_number=idx
+            frame_number=idx  # Pass frame number ke smart tracking
         )
 
         cv2.imwrite(frame_path, result)
@@ -274,7 +282,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 # ============================================================
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
-
+    # Set reference face di awal jika diperlukan
     if not roop.globals.many_faces and not get_face_reference():
         try:
             ref_idx = roop.globals.reference_frame_number
