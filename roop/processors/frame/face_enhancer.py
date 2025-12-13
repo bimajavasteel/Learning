@@ -138,6 +138,10 @@ def _temporal_enhance(target_center: tuple,
                       enhanced: np.ndarray,
                       det_score: float) -> np.ndarray:
     
+    # Safety Check: Jika enhanced None, return None agar ditangani di fungsi pemanggil
+    if enhanced is None:
+        return None
+
     # 1. Cari cache yang cocok berdasarkan posisi
     face_id = _find_closest_cache(target_center)
     
@@ -201,14 +205,24 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
 
     # --- INFERENCE GFPGAN ---
     with THREAD_SEMAPHORE:
-        _, _, enhanced = get_face_enhancer().enhance(crop, paste_back=False)
+        # FIX: paste_back=True wajib agar return ke-3 (enhanced) berisi gambar, bukan None.
+        # Karena inputnya 'crop', maka outputnya adalah 'enhanced crop'.
+        _, _, enhanced = get_face_enhancer().enhance(crop, paste_back=True)
+
+    # FIX: Safety check jika GFPGAN gagal return image
+    if enhanced is None:
+        return temp_frame
 
     # --- TEMPORAL STABILIZATION ---
     center_x = (x1 + x2) // 2
     center_y = (y1 + y2) // 2
     det_score = float(getattr(target_face, 'det_score', 1.0))
 
-    enhanced = _temporal_enhance((center_x, center_y), enhanced, det_score)
+    enhanced_temporal = _temporal_enhance((center_x, center_y), enhanced, det_score)
+    
+    # Jika temporal blending gagal (jarang terjadi), fallback ke enhanced biasa
+    if enhanced_temporal is not None:
+        enhanced = enhanced_temporal
 
     # --- COLOR CONSISTENCY ---
     # Menyamakan tone warna hasil enhance dengan crop asli
