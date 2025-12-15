@@ -22,7 +22,7 @@ NAME = 'ROOP.FACE-ENHANCER'
 
 # ================= TEMPORAL ENHANCER =================
 TEMPORAL_ENHANCER_CACHE = {}
-BASE_TEMPORAL_ALPHA = 0.7  # default EMA strength (0.65–0.8 optimal)
+BASE_TEMPORAL_ALPHA = 0.7  # 0.65–0.8 recommended
 
 # ============================================================
 # DEVICE & MODEL
@@ -54,28 +54,29 @@ def clear_face_enhancer() -> None:
     FACE_ENHANCER = None
 
 # ============================================================
-# TEMPORAL EMA (ANTI-FLICKER)
+# TEMPORAL EMA (ANTI-FLICKER) — FIXED
 # ============================================================
 
 def temporal_smooth_enhanced(
     face_id: int,
     enhanced_crop: np.ndarray,
-    motion: float = 0.0
+    motion: float
 ) -> np.ndarray:
     """
     Temporal Exponential Moving Average (EMA)
-    + Adaptive Alpha berbasis motion.
+    + Adaptive Alpha (motion-aware)
+    FIXED: motion dijamin float valid
     """
 
     prev = TEMPORAL_ENHANCER_CACHE.get(face_id)
 
-    # adaptive alpha
+    # ===== adaptive alpha (SAFE) =====
     if motion < 4.0:
         alpha = 0.80
     elif motion < 10.0:
         alpha = BASE_TEMPORAL_ALPHA
     else:
-        alpha = 0.55  # gerakan cepat → kurang smoothing
+        alpha = 0.55
 
     if prev is None or prev.shape != enhanced_crop.shape:
         TEMPORAL_ENHANCER_CACHE[face_id] = enhanced_crop
@@ -91,7 +92,7 @@ def temporal_smooth_enhanced(
     return smoothed
 
 # ============================================================
-# BLENDING & COLOR MATCH (ANTI-FLICKER SPATIAL)
+# BLENDING & COLOR MATCH
 # ============================================================
 
 def apply_blend_and_color_match(
@@ -104,13 +105,13 @@ def apply_blend_and_color_match(
         if enhanced_crop.shape[:2] != (h, w):
             enhanced_crop = cv2.resize(enhanced_crop, (w, h))
 
-        # Color mean matching
+        # Color mean matching (anti-flicker spatial)
         orig_mean = np.mean(original_crop, axis=(0, 1))
         enh_mean = np.mean(enhanced_crop, axis=(0, 1))
         corrected = enhanced_crop.astype(np.float32) + (orig_mean - enh_mean)
         corrected = np.clip(corrected, 0, 255).astype(np.uint8)
 
-        # Fidelity blend
+        # Fidelity blending
         blended = cv2.addWeighted(
             corrected, fidelity,
             original_crop, 1.0 - fidelity,
@@ -141,7 +142,7 @@ def apply_blend_and_color_match(
         return original_crop
 
 # ============================================================
-# FACE ENHANCE CORE
+# FACE ENHANCE CORE (FIXED)
 # ============================================================
 
 def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
@@ -179,9 +180,10 @@ def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
             fidelity=blend_amount
         )
 
-        # ================= TEMPORAL EMA =================
+        # ================= TEMPORAL EMA (SAFE) =================
         face_id = id(target_face)
-        motion = getattr(target_face, "motion", 0.0)
+        motion = float(getattr(target_face, "motion", None) or 0.0)
+
         result_face = temporal_smooth_enhanced(
             face_id,
             result_face,
