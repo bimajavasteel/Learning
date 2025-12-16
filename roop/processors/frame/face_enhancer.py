@@ -2,6 +2,8 @@ from typing import Any, List, Callable
 import cv2
 import threading
 import numpy as np
+import os
+import torch
 from gfpgan.utils import GFPGANer
 
 import roop.globals
@@ -12,28 +14,18 @@ from roop.typing import Frame, Face
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
 # ============================================================
-# GLOBALS
+# FORCE GPU 1 FOR ENHANCER
 # ============================================================
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+torch.cuda.set_device(0)  # GPU 1 becomes cuda:0 in this context
 
 FACE_ENHANCER = None
-THREAD_SEMAPHORE = threading.Semaphore()
 THREAD_LOCK = threading.Lock()
+THREAD_SEMAPHORE = threading.Semaphore()
 NAME = 'ROOP.FACE-ENHANCER'
 
-# ================= TEMPORAL ENHANCER =================
 TEMPORAL_ENHANCER_CACHE = {}
-BASE_TEMPORAL_ALPHA = 0.7  # 0.65–0.8 recommended
-
-# ============================================================
-# DEVICE & MODEL
-# ============================================================
-
-def get_device() -> str:
-    if 'CUDAExecutionProvider' in roop.globals.execution_providers:
-        return 'cuda'
-    if 'CoreMLExecutionProvider' in roop.globals.execution_providers:
-        return 'mps'
-    return 'cpu'
+BASE_TEMPORAL_ALPHA = 0.7
 
 
 def get_face_enhancer() -> Any:
@@ -44,7 +36,7 @@ def get_face_enhancer() -> Any:
             FACE_ENHANCER = GFPGANer(
                 model_path=model_path,
                 upscale=1,
-                device=get_device()
+                device='cuda'
             )
     return FACE_ENHANCER
 
@@ -53,173 +45,54 @@ def clear_face_enhancer() -> None:
     global FACE_ENHANCER
     FACE_ENHANCER = None
 
-# ============================================================
-# TEMPORAL EMA (ANTI-FLICKER) — FIXED
-# ============================================================
 
-def temporal_smooth_enhanced(
-    face_id: int,
-    enhanced_crop: np.ndarray,
-    motion: float
-) -> np.ndarray:
-    """
-    Temporal Exponential Moving Average (EMA)
-    + Adaptive Alpha (motion-aware)
-    FIXED: motion dijamin float valid
-    """
-
+def temporal_smooth_enhanced(face_id: int, enhanced: np.ndarray) -> np.ndarray:
     prev = TEMPORAL_ENHANCER_CACHE.get(face_id)
+    if prev is None or prev.shape != enhanced.shape:
+        TEMPORAL_ENHANCER_CACHE[face_id] = enhanced
+        return enhanced
 
-    # ===== adaptive alpha (SAFE) =====
-    if motion < 4.0:
-        alpha = 0.80
-    elif motion < 10.0:
-        alpha = BASE_TEMPORAL_ALPHA
-    else:
-        alpha = 0.55
+    alpha = BASE_TEMPORAL_ALPHA
+    out = alpha * enhanced.astype(np.float32) + (1 - alpha) * prev.astype(np.float32)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    TEMPORAL_ENHANCER_CACHE[face_id] = out
+    return out
 
-    if prev is None or prev.shape != enhanced_crop.shape:
-        TEMPORAL_ENHANCER_CACHE[face_id] = enhanced_crop
-        return enhanced_crop
 
-    smoothed = (
-        alpha * enhanced_crop.astype(np.float32) +
-        (1.0 - alpha) * prev.astype(np.float32)
-    )
-
-    smoothed = np.clip(smoothed, 0, 255).astype(np.uint8)
-    TEMPORAL_ENHANCER_CACHE[face_id] = smoothed
-    return smoothed
-
-# ============================================================
-# BLENDING & COLOR MATCH
-# ============================================================
-
-def apply_blend_and_color_match(
-    enhanced_crop: np.ndarray,
-    original_crop: np.ndarray,
-    fidelity: float
-) -> np.ndarray:
-    try:
-        h, w = original_crop.shape[:2]
-        if enhanced_crop.shape[:2] != (h, w):
-            enhanced_crop = cv2.resize(enhanced_crop, (w, h))
-
-        # Color mean matching (anti-flicker spatial)
-        orig_mean = np.mean(original_crop, axis=(0, 1))
-        enh_mean = np.mean(enhanced_crop, axis=(0, 1))
-        corrected = enhanced_crop.astype(np.float32) + (orig_mean - enh_mean)
-        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
-
-        # Fidelity blending
-        blended = cv2.addWeighted(
-            corrected, fidelity,
-            original_crop, 1.0 - fidelity,
-            0
-        )
-
-        # Soft elliptical mask
-        mask = np.zeros((h, w), dtype=np.float32)
-        center = (w // 2, h // 2)
-        axes = (int(w * 0.45), int(h * 0.45))
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
-
-        blur = int(min(w, h) * 0.1)
-        if blur % 2 == 0:
-            blur += 1
-        mask = cv2.GaussianBlur(mask, (blur, blur), 0)
-        mask_3ch = np.dstack([mask] * 3)
-
-        result = (
-            blended * mask_3ch +
-            original_crop * (1.0 - mask_3ch)
-        ).astype(np.uint8)
-
-        return result
-
-    except Exception as e:
-        update_status(f"[Enhancer] Blend error: {e}", NAME)
-        return original_crop
-
-# ============================================================
-# FACE ENHANCE CORE (FIXED)
-# ============================================================
-
-def enhance_face(target_face: Face, temp_frame: Frame) -> Frame:
+def enhance_face(target_face: Face, frame: Frame) -> Frame:
     try:
         x1, y1, x2, y2 = map(int, target_face['bbox'])
-
-        pad_x = int((x2 - x1) * 0.2)
-        pad_y = int((y2 - y1) * 0.2)
-
-        h, w = temp_frame.shape[:2]
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(w, x2 + pad_x)
-        y2 = min(h, y2 + pad_y)
-
-        face_crop = temp_frame[y1:y2, x1:x2]
+        face_crop = frame[y1:y2, x1:x2]
         if face_crop.size == 0:
-            return temp_frame
+            return frame
 
         with THREAD_SEMAPHORE:
-            _, _, enhanced = get_face_enhancer().enhance(
-                face_crop,
-                paste_back=True
-            )
+            _, _, enhanced = get_face_enhancer().enhance(face_crop, paste_back=True)
 
-        blend_amount = (
-            roop.globals.face_enhancer_blend
-            if roop.globals.face_enhancer_blend is not None
-            else 0.6
-        )
-
-        result_face = apply_blend_and_color_match(
-            enhanced,
-            face_crop,
-            fidelity=blend_amount
-        )
-
-        # ================= TEMPORAL EMA (SAFE) =================
-        face_id = id(target_face)
-        motion = float(getattr(target_face, "motion", None) or 0.0)
-
-        result_face = temporal_smooth_enhanced(
-            face_id,
-            result_face,
-            motion
-        )
-
-        temp_frame[y1:y2, x1:x2] = result_face
-        return temp_frame
+        enhanced = temporal_smooth_enhanced(id(target_face), enhanced)
+        frame[y1:y2, x1:x2] = enhanced
+        return frame
 
     except Exception as e:
-        update_status(f"[Enhancer] Face error: {e}", NAME)
-        return temp_frame
+        update_status(f"[Enhancer] error: {e}", NAME)
+        return frame
 
-# ============================================================
-# FRAME PROCESSING
-# ============================================================
 
-def process_frame(source_face: Face, reference_face: Face, temp_frame: Frame) -> Frame:
-    faces = get_many_faces(temp_frame)
+def process_frame(source_face: Face, reference_face: Face, frame: Frame) -> Frame:
+    faces = get_many_faces(frame)
     if not faces:
-        return temp_frame
+        return frame
 
     for face in faces:
-        temp_frame = enhance_face(face, temp_frame)
-    return temp_frame
+        frame = enhance_face(face, frame)
+    return frame
 
 
-def process_frames(
-    source_path: str,
-    temp_frame_paths: List[str],
-    update: Callable[[], None]
-) -> None:
-    for frame_path in temp_frame_paths:
-        frame = cv2.imread(frame_path)
+def process_frames(source_path: str, temp_frame_paths: List[str], update: Callable[[], None]) -> None:
+    for path in temp_frame_paths:
+        frame = cv2.imread(path)
         result = process_frame(None, None, frame)
-        cv2.imwrite(frame_path, result)
+        cv2.imwrite(path, result)
         if update:
             update()
 
@@ -237,9 +110,6 @@ def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
         process_frames
     )
 
-# ============================================================
-# LIFECYCLE
-# ============================================================
 
 def pre_check() -> bool:
     download_dir = resolve_relative_path('../models')
@@ -251,9 +121,6 @@ def pre_check() -> bool:
 
 
 def pre_start() -> bool:
-    if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status('Select an image or video for target path.', NAME)
-        return False
     return True
 
 
